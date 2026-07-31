@@ -89,6 +89,7 @@ from hf_adapters import (
     hf_gemma3,
     hf_gemma4,
     hf_gemma4_mm,
+    hf_gemma4_moe,
     hf_gpt2,
     hf_gpt_neo,
     hf_gpt_neox,
@@ -219,6 +220,16 @@ def resolve_adapter_module(
         if arch in ARCH_TO_ADAPTER_MODULE_MAPPING:
             assert_spyre_dimensions(model_config, model_name=str(model_name_or_path))
             return ARCH_TO_ADAPTER_MODULE_MAPPING[arch]
+
+    # Gemma 4 shares one config class across dense and MoE checkpoints; the MoE
+    # variant (enable_moe_block=True) needs the dedicated hf_gemma4_moe adapter.
+    if isinstance(model_config, (Gemma4Config, Gemma4TextConfig)) or hasattr(
+        model_config, "text_config"
+    ):
+        text_cfg = getattr(model_config, "text_config", model_config)
+        if getattr(text_cfg, "enable_moe_block", False):
+            assert_spyre_dimensions(model_config, model_name=str(model_name_or_path))
+            return hf_gemma4_moe
 
     if type(model_config) not in mapping:
         raise SpyreNoAdapterError(
