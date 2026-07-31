@@ -133,6 +133,95 @@ def _patch_gemma4_rmsnorm(rmsnorm_cls):
     rmsnorm_cls.forward = _forward_fp16
 
 
+def _gemma4_attention(
+    hidden_states,
+    *,
+    input_ln,
+    post_attn_ln,
+    q_proj,
+    k_proj,
+    v_proj,
+    o_proj,
+    q_norm,
+    k_norm,
+    v_norm,
+    scaling,
+    num_q_heads,
+    num_kv_heads,
+    head_dim,
+    is_kv_eq_v,
+    selected_freqs,
+    attn_mask,
+    key_cache,
+    value_cache,
+    is_filling,
+    token_index,
+    cache_position,
+):
+    """Gemma 4 attention half of the decoder block (shared by dense + MoE).
+
+    Q/K/V RMSNorm before RoPE, unscaled SDPA, and the sandwich post-attention
+    norm applied to the attention output before the residual add. On global
+    ``attention_k_eq_v`` layers (``is_kv_eq_v=True``) V reuses the raw
+    ``k_proj`` output (pre-k_norm, pre-RoPE) through ``v_norm``; see
+    ``_make_compiled_block`` for the full rationale. Returns
+    ``(h, key_cache, value_cache)`` where ``h = residual +
+    post_attn_ln(o_proj(attn_out))``.
+    """
+    residual = hidden_states
+    h = input_ln(hidden_states)
+
+    bsz, seq_len, _ = h.shape
+
+    # Q/K/V projections viewed as [B, L, n_heads, head_dim]; norms are
+    # applied per-head (last dim = head_dim) before the transpose.
+    q = q_proj(h).view(bsz, seq_len, num_q_heads, head_dim)
+    k_lin = k_proj(h).view(bsz, seq_len, num_kv_heads, head_dim)
+
+    if is_kv_eq_v:
+        # V reuses the raw k_proj output (pre-k_norm, pre-RoPE) but still
+        # passes through v_norm: stock HF aliases value_states = key_states
+        # *before* k_norm/RoPE, then applies self.v_norm(value_states)
+        # unconditionally (modeling_gemma4 Gemma4TextAttention.forward). The
+        # norm exists on these layers even though v_proj is None.
+        v = v_norm(k_lin).transpose(1, 2)
+    else:
+        v = v_proj(h).view(bsz, seq_len, num_kv_heads, head_dim)
+        v = v_norm(v).transpose(1, 2)
+
+    q = q_norm(q).transpose(1, 2)
+    k = k_norm(k_lin).transpose(1, 2)
+
+    q = apply_rope_matmul(q, selected_freqs)
+    k = apply_rope_matmul(k, selected_freqs)
+
+    key_cache, value_cache = kv_cache_update(
+        k,
+        v,
+        key_cache,
+        value_cache,
+        is_filling,
+        token_index,
+        cache_position,
+    )
+
+    attn_out = F.scaled_dot_product_attention(
+        q,
+        key_cache,
+        value_cache,
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+        scale=scaling,
+        enable_gqa=True,
+    )
+    attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
+    attn_out = o_proj(attn_out)
+    # Sandwich: norm the attention output BEFORE adding the residual.
+    attn_out = post_attn_ln(attn_out)
+    h = residual + attn_out
+    return h, key_cache, value_cache
+
+
 def _make_compiled_block(layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
     """Compile one Gemma 4 dense decoder layer.
 
@@ -200,57 +289,30 @@ def _make_compiled_block(layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v)
         cache_position,
         layer_scalar,
     ):
-        residual = hidden_states
-        h = input_ln(hidden_states)
-
-        bsz, seq_len, _ = h.shape
-
-        # Q/K/V projections viewed as [B, L, n_heads, head_dim]; norms are
-        # applied per-head (last dim = head_dim) before the transpose.
-        q = q_proj(h).view(bsz, seq_len, num_q_heads, head_dim)
-        k_lin = k_proj(h).view(bsz, seq_len, num_kv_heads, head_dim)
-
-        if is_kv_eq_v:
-            # V reuses the raw k_proj output (pre-k_norm, pre-RoPE) but still
-            # passes through v_norm: stock HF aliases value_states = key_states
-            # *before* k_norm/RoPE, then applies self.v_norm(value_states)
-            # unconditionally (modeling_gemma4 Gemma4TextAttention.forward). The
-            # norm exists on these layers even though v_proj is None.
-            v = v_norm(k_lin).transpose(1, 2)
-        else:
-            v = v_proj(h).view(bsz, seq_len, num_kv_heads, head_dim)
-            v = v_norm(v).transpose(1, 2)
-
-        q = q_norm(q).transpose(1, 2)
-        k = k_norm(k_lin).transpose(1, 2)
-
-        q = apply_rope_matmul(q, selected_freqs)
-        k = apply_rope_matmul(k, selected_freqs)
-
-        key_cache, value_cache = kv_cache_update(
-            k,
-            v,
-            key_cache,
-            value_cache,
-            is_filling,
-            token_index,
-            cache_position,
-        )
-
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            key_cache,
-            value_cache,
+        h, key_cache, value_cache = _gemma4_attention(
+            hidden_states,
+            input_ln=input_ln,
+            post_attn_ln=post_attn_ln,
+            q_proj=q_proj,
+            k_proj=k_proj,
+            v_proj=v_proj,
+            o_proj=o_proj,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            v_norm=v_norm,
+            scaling=scaling,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            is_kv_eq_v=is_kv_eq_v,
+            selected_freqs=selected_freqs,
             attn_mask=attn_mask,
-            dropout_p=0.0,
-            scale=scaling,
-            enable_gqa=True,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            is_filling=is_filling,
+            token_index=token_index,
+            cache_position=cache_position,
         )
-        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
-        attn_out = o_proj(attn_out)
-        # Sandwich: norm the attention output BEFORE adding the residual.
-        attn_out = post_attn_ln(attn_out)
-        h = residual + attn_out
 
         residual = h
         h = pre_ff_ln(h)
