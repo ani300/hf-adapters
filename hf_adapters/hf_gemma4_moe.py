@@ -68,3 +68,58 @@ def _moe_permute(x, idx, K):
     )[sort_perm]
     gathered = x[token_of_row]  # [T*K,H]
     return gathered, token_of_row, row_expert, sort_perm
+
+
+def _grouped_gemm(gathered, Wstack, row_expert):
+    """Option 4A: gather per-row weight, row-batched matmul.
+
+    Args:
+        gathered: Token embeddings sorted by expert [N, in]
+        Wstack: Expert weight matrices [E, out, in]
+        row_expert: Expert ID for each row in gathered [N]
+
+    Returns:
+        out: Result of gather per-row weight @ gathered [N, out]
+    """
+    W_row = Wstack[row_expert]  # index_select on expert dim [N,out,in]
+    out = torch.bmm(
+        gathered.unsqueeze(1), W_row.transpose(1, 2)
+    )  # [N,1,out]
+    return out.squeeze(1)  # [N,out]
+
+
+def _moe_ffn(x, W_router, gate_up_proj, down_proj, per_expert_scale, K):
+    """MoE FFN forward: route, permute, grouped gate_up, gelu_tanh SwiGLU,
+    grouped down, weight by w, scatter_add combine.
+
+    Args:
+        x: Token embeddings [T, H]
+        W_router: Expert router weights [E, H]
+        gate_up_proj: Gate-up projection per expert [E, 2*M, H]
+        down_proj: Down projection per expert [E, H, M]
+        per_expert_scale: Expert scaling factors [E]
+        K: Number of top experts per token
+
+    Returns:
+        out: MoE FFN output [T, H]
+    """
+    T, H = x.shape
+    w, idx = _moe_route(x, W_router, per_expert_scale, K)
+    (
+        gathered,
+        token_of_row,
+        row_expert,
+        sort_perm,
+    ) = _moe_permute(x, idx, K)
+    gate_up = _grouped_gemm(
+        gathered, gate_up_proj, row_expert
+    )  # [N,2M]
+    g, u = gate_up.chunk(2, dim=-1)
+    act = F.gelu(g, approximate="tanh") * u  # [N,M]
+    expert_out = _grouped_gemm(
+        act, down_proj, row_expert
+    )  # [N,H]
+    expert_out = expert_out * w.reshape(-1)[sort_perm].unsqueeze(-1)
+    out = torch.zeros(T, H, dtype=x.dtype, device=x.device)
+    out = out.index_add(0, token_of_row, expert_out)  # scatter_add combine
+    return out
