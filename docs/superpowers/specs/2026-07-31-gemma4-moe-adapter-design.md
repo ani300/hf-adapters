@@ -149,6 +149,32 @@ moe_out        = scattered                                  # [T, H]
 
 Then the layer combines `post_ff_ln_2(moe_out)` with the dense branch as in §1.2.
 
+### 3.5 Device-layout constraint on the indirectly-addressed tensors
+
+Spyre imposes a hard layout requirement on every tensor that is read or written through an indirect
+(gather/scatter) access: **the indirectly-addressed dimension must be the outermost dimension of that
+tensor's on-device (stickified) layout.** In the three-pass restickify pipeline this is enforced by the
+`enforce_indirect_access_layout` pass (`torch_spyre/_inductor/enforce_indirect_access_layout.py`), which
+runs after `insert_restickify`, checks each indirect-access op's value-tensor `dim_order`, and — if the
+indexed dimension is not outermost — either rewrites the producer's output layout in place (when the
+producer is a non-output `ComputedBuffer`) or inserts a `spyre.restickify` copy into the required
+layout.
+
+For this design that means the row (token) dimension being gathered/scattered must be outermost, and
+the hidden dimension stickified innermost, on every indirect participant:
+
+- `x` before the §3.2 token gather — the `[T, H]` layout must have `T` (the indexed dim) outermost.
+- `gathered` `[T*K, H]` produced by the gather — `T*K` outermost.
+- the §3.4 scatter target `[T, H]` and its `out` source `[T*K, H]` — the scattered row dim outermost.
+- in Option 4A, the per-row weight gather `gate_up_proj[row_expert]` — the expert dim indexed there
+  must be outermost in `gate_up_proj`'s device layout.
+
+The adapter should lay these buffers out so the pass finds the constraint already satisfied (row/expert
+dim outermost, `H`/`M` innermost as the stick dimension) rather than relying on inserted restickify
+copies — an unplanned restickify of a `[T*K, H]` tensor is a full HBM round-trip on the hot path.
+Prototype gate §6.3 must confirm the committed layouts match this and that no surprise restickify is
+inserted (check the compile artifacts / restickify insertions).
+
 ---
 
 ## 4. The core open question: expressing the grouped GEMM on Spyre
@@ -208,8 +234,11 @@ Build these tiny repros *first*, on-device, in order. Each gate must pass before
    `out_reuse_dim.size()==1` abort in the attention output-projection path — validate it does *not*
    fire here, or find the tiling/`spyre_hint` that avoids it.
 2. **top-8 routing.** `topk(probs, 8)` returns correct values+indices on-device.
-3. **Permutation ops.** `argsort` + `index_select`/gather + `scatter_add` over `T*K` rows produce
-   correct permute/unpermute round-trips.
+3. **Permutation ops + indirect-access layout.** `argsort` + `index_select`/gather + `scatter_add`
+   over `T*K` rows produce correct permute/unpermute round-trips, **and** the indirectly-addressed
+   tensors get the row/expert dim committed outermost (§3.5) with no surprise `spyre.restickify` copy
+   inserted on the hot path. Inspect the compile artifacts to confirm the layout is satisfied by
+   construction, not by an inserted copy.
 4. **End-to-end single MoE layer** vs a CPU/HF reference on real weights (bit-close, fp16 tol).
 5. **Full 30-layer forward** vs HF reference (token-compare), then generation smoke.
 
