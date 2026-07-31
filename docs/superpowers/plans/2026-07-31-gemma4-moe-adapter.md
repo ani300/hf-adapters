@@ -6,6 +6,8 @@
 
 **Architecture:** Reuse the dense `hf_gemma4.py` attention stack unchanged and add a sparse-MoE FFN branch that runs in parallel with the dense MLP (summed). The MoE forward uses a lossless permute + grouped-GEMM (DeepSeek/DeepGEMM contiguous-layout) formulation — route → sort tokens by expert → single grouped GEMM → unpermute → weighted combine — with the expert compute tiled across Spyre cores via `spyre_hint`. No worst-case capacity padding, no token dropping.
 
+**Device/host split (empirically forced — see spec §2.1):** on the current torch-spyre backend the routing/permute ops (`topk`, `argsort`/`sort`, 1-D index arithmetic, `index_add`/`scatter_add`) do **not** lower — only plain gather and `bmm` do. So the MoE forward is partitioned: the **device** (`torch.compile`) does the router `Linear`, the `x[token_of_row]` token gather, and the expert grouped GEMM; the **host** (plain eager PyTorch on small routing tensors) does softmax/topk/renormalize/`per_expert_scale`, `argsort` + `token_of_row` index arithmetic, and the weighted `index_add` combine. The three host↔device hand-offs are `.cpu()`/`.to("spyre")` on `[T,E]`/`[T,K]`/`[T*K]`/`[T*K,H]` tensors. `top_k_experts` is pinned to **K=4** for bring-up (host-side, so not backend-constrained — a host↔device-traffic bound / parity target with a future on-device version); the model wants 8, revisited when torch-spyre lifts the topk/argsort/index_add limits. This is a bring-up formulation; moving routing on-device + raising K is a tracked follow-up, not a blocker to a correct adapter.
+
 **Tech Stack:** Python, PyTorch, `torch.compile(dynamic=False)`, torch-spyre inductor backend, HuggingFace `transformers` `gemma4` modeling code. Tests via pytest against the model registry.
 
 ## Global Constraints
@@ -16,9 +18,11 @@
 - **Test ordering:** always run the HF reference forward BEFORE `prepare_for_spyre` — the RMSNorm patch is global.
 - **Recompile rule:** per-layer scalars/values that differ across layers must be passed as **tensor arguments** to the compiled block, never captured as Python floats (see the `layer_scalar` note in `hf_gemma4.py`).
 - **head_dim:** both `head_dim` (256) and `global_head_dim` (512) already satisfy `head_dim/2 >= 64`; no head padding needed.
-- **On-device gates:** Tasks 1–2 require a Spyre pod (see `hf-adapters/CLAUDE.md` "Spyre Pod"). They are compile/numeric gates, not unit tests. Do not proceed past a failed gate — revisit the formulation instead of shipping wrong output.
-- **Assumptions to validate, not trust:** `torch.topk` at k=8 and `index_select`/gather/`scatter_add` are assumed working on the current backend (per design decision). Tasks 1–2 verify them explicitly so a regression surfaces as a failed gate, not silent wrong output.
-- **Indirect-access layout:** every tensor read/written via gather/scatter must have its indexed (row/expert) dimension **outermost** in the on-device layout, feature dim innermost as the stick dim (enforced by `enforce_indirect_access_layout`; an inserted `spyre.restickify` on a `[T*K, H]` tensor is a full HBM round-trip). Lay buffers out to satisfy this by construction.
+- **On-device gates:** Tasks 1–2 run on the Spyre card directly reachable on this host (no pod indirection). They are compile/numeric gates, not unit tests. Do not proceed past a failed gate — revisit the formulation instead of shipping wrong output.
+- **Verified op support (spec §2.1):** on-device, only plain gather (`x[idx]`) and `bmm` lower and are numerically correct. `topk` (SIGABRTs even at k=4), `argsort`/`sort` (`aten::sort.values_stable` not implemented), 1-D index arithmetic on the permutation, and `index_add`/`scatter_add` do **not** lower. Therefore all routing/permute/combine math runs **host-side** in eager PyTorch (Tasks 4/5 functions are host code); only the router matmul, token gather, and expert GEMM run on-device. Do not put `topk`/`argsort`/`index_add` inside a `torch.compile` region targeting spyre.
+- **Indirect-access layout:** every tensor read via the on-device gather must have its indexed (row/expert) dimension **outermost** in the on-device layout, feature dim innermost as the stick dim (enforced by `enforce_indirect_access_layout`; an inserted `spyre.restickify` on a `[T*K, H]` tensor is a full HBM round-trip). Lay buffers out to satisfy this by construction.
+- **`top_k_experts` = 4 (bring-up):** the router uses K=4 (host-side); the model config wants 8. Revisit when torch-spyre lifts the topk/argsort/index_add limits (spec §2.1, §9).
+- **Teardown crash:** a `corrupted double-linked list` SIGABRT on process exit after a successful compute is a known torch-spyre lifetime issue — ignore it; it does not indicate a compute failure.
 
 **Reference spec:** `docs/superpowers/specs/2026-07-31-gemma4-moe-adapter-design.md` (read §1.2, §3, §3.5, §4 before starting).
 
@@ -88,59 +92,113 @@ git commit -m "test: gate 1 — expert-dim grouped/batched matmul on Spyre"
 
 ---
 
-### Task 2: On-device gate — top-8 routing + permute/unpermute round-trip with correct layout
+### Task 2: On-device gate — device/host-split route → permute → GEMM → combine round-trip
 
 **Files:**
 - Create: `repros/gemma4_moe/gate2_route_permute.py`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: confirmation that `topk(probs, 8)`, `argsort`, `index_select`/gather, and `scatter_add` over `T*K` rows compile on Spyre, produce a correct permute→unpermute identity, and that the indirectly-addressed `[T*K, H]` buffer commits with the row dim outermost (no surprise `spyre.restickify`).
+- Produces: confirmation that the §2.1 device/host split composes end-to-end (K=4): a device `torch.compile` region for the router `Linear`; host `softmax`/`topk`/renormalize + `argsort` + `token_of_row`; a device `torch.compile` region for the `x[token_of_row]` gather + expert GEMM; host weighted `index_add` combine — and that the recombined output matches a pure-CPU MoE reference within fp16 tolerance, with the device gather's `[T*K, H]` buffer committing row-dim-outermost (no surprise `spyre.restickify`).
 
-- [ ] **Step 1: Write the round-trip repro**
+**Why this shape:** the routing ops (`topk`, `argsort`, index-arith, `index_add`) do **not** lower on the current backend (Global Constraints / spec §2.1). This gate proves the host/device split is a working substitute: the unsupported ops run in eager CPU on the small routing tensors, and only the matmul + gather cross to the device.
+
+- [ ] **Step 1: Write the split round-trip repro**
 
 ```python
 # repros/gemma4_moe/gate2_route_permute.py — Apache header omitted here
+import os
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+import torch_spyre
+torch_spyre._autoload()
 import torch
+import torch.nn.functional as F
 
-H, E, T, K = 2816, 128, 64, 8
+H, E, T, K, M = 2816, 128, 64, 4, 704  # K=4 bring-up; M=moe_intermediate_size
 
-def route_permute_unpermute(x, logits):
-    probs = torch.softmax(logits, dim=-1)          # [T,E]
-    w, idx = torch.topk(probs, K, dim=-1)          # [T,K],[T,K]
-    w = w / w.sum(-1, keepdim=True)
-    flat_expert = idx.reshape(-1)                  # [T*K]
-    sort_perm = torch.argsort(flat_expert)         # [T*K]
-    token_of_row = (torch.arange(T * K) // K)[sort_perm]
-    gathered = x[token_of_row]                     # [T*K,H] gather
-    # identity expert (no weights): scatter straight back, weighted by 1.0 sum over K
-    out = torch.zeros_like(x)
-    out = out.index_add(0, token_of_row, gathered) # scatter_add
-    return out, gathered, token_of_row
+# --- device regions (compiled, spyre) ---
+def device_router(x, W_router):          # [T,H] x [E,H] -> [T,E]
+    return F.linear(x, W_router)
 
-def ref_sum_over_k(x):
-    return x * K  # each token gathered K times, summed
+def device_expert(gathered, token_of_row, gate_up_row, down_row):
+    # gathered token rows + per-row expert weights already selected on host side
+    g_u = torch.bmm(gathered.unsqueeze(1), gate_up_row.transpose(1, 2)).squeeze(1)  # [N,2M]
+    g, u = g_u.chunk(2, dim=-1)
+    act = F.gelu(g, approximate="tanh") * u                                         # [N,M]
+    return torch.bmm(act.unsqueeze(1), down_row.transpose(1, 2)).squeeze(1)         # [N,H]
+
+def device_gather(x, token_of_row):      # the indirect-access op under test
+    return x[token_of_row]               # [T*K,H]
+
+# --- pure-CPU reference (dense: compute all experts, select top-K) ---
+def ref_moe(x, W_router, gate_up, down, scale, K):
+    probs = torch.softmax(F.linear(x, W_router).float(), dim=-1)
+    w, idx = torch.topk(probs, K, dim=-1)
+    w = (w / w.sum(-1, keepdim=True)) * scale[idx]
+    out = torch.zeros_like(x, dtype=torch.float32)
+    for t in range(x.shape[0]):
+        for k in range(K):
+            e = idx[t, k].item()
+            g, u = F.linear(x[t].float(), gate_up[e].float()).chunk(2, dim=-1)
+            h = F.linear(F.gelu(g, approximate="tanh") * u, down[e].float())
+            out[t] += w[t, k] * h
+    return out
 
 if __name__ == "__main__":
+    torch.manual_seed(0)
     x = torch.randn(T, H, dtype=torch.float16)
-    logits = torch.randn(T, E, dtype=torch.float16)
-    ref, _, _ = route_permute_unpermute(x, logits)
-    cfn = torch.compile(route_permute_unpermute, dynamic=False)
-    got, _, _ = cfn(x.to("spyre"), logits.to("spyre"))
-    torch.testing.assert_close(got.cpu(), ref, atol=1e-2, rtol=1e-2)
-    print("OK route/permute/unpermute round-trip")
+    W_router = torch.randn(E, H, dtype=torch.float16)
+    gate_up = torch.randn(E, 2 * M, H, dtype=torch.float16) * 0.02
+    down = torch.randn(E, H, M, dtype=torch.float16) * 0.02
+    scale = (torch.rand(E) + 0.5).half()
+
+    ref = ref_moe(x, W_router, gate_up, down, scale, K)
+
+    crouter = torch.compile(device_router, dynamic=False)
+    cexpert = torch.compile(device_expert, dynamic=False)
+    cgather = torch.compile(device_gather, dynamic=False)
+
+    # 1) device: router logits
+    logits = crouter(x.to("spyre"), W_router.to("spyre")).cpu().float()   # -> host
+    # 2) host: softmax/topk/renorm/scale/argsort/token_of_row (unsupported on device)
+    probs = torch.softmax(logits, dim=-1)
+    w, idx = torch.topk(probs, K, dim=-1)
+    w = (w / w.sum(-1, keepdim=True)) * scale[idx].float()
+    flat_expert = idx.reshape(-1)                                          # [T*K]
+    sort_perm = torch.argsort(flat_expert)
+    row_expert = flat_expert[sort_perm]
+    token_of_row = (torch.arange(T * K) // K)[sort_perm].to(torch.int32)
+    # 3) device: gather token rows
+    gathered = cgather(x.to("spyre"), token_of_row.to("spyre")).cpu()      # [T*K,H]
+    # host: select per-row expert weights (gather on expert dim — done on host here
+    # to keep the gate focused on the token gather + GEMM; Task 5 does it on device)
+    gate_up_row = gate_up[row_expert]                                      # [N,2M,H]
+    down_row = down[row_expert]                                            # [N,H,M]
+    # 4) device: expert GEMM
+    expert_out = cexpert(gathered.to("spyre"), token_of_row.to("spyre"),
+                         gate_up_row.to("spyre"), down_row.to("spyre")).cpu().float()
+    # 5) host: weighted index_add combine
+    row_w = w.reshape(-1)[sort_perm].unsqueeze(-1).float()
+    out = torch.zeros(T, H, dtype=torch.float32)
+    out = out.index_add(0, token_of_row.long(), expert_out * row_w)
+
+    denom = ref.abs().clamp_min(1.0)
+    rel = (out - ref).abs() / denom
+    print(f"mean_rel={rel.mean():.4%} max_rel={rel.max():.4f}")
+    assert rel.mean() < 0.02 and rel.max() < 0.5, "split MoE round-trip diverged"
+    print("OK device/host-split route/permute/GEMM/combine round-trip")
 ```
 
-- [ ] **Step 2: Run on the pod with compile artifacts enabled**
+- [ ] **Step 2: Run on the card with compile artifacts enabled**
 
 Run: `TORCH_COMPILE_DEBUG=1 python3 repros/gemma4_moe/gate2_route_permute.py`
-Expected: prints `OK`. Then inspect the dumped artifacts / restickify insertions to confirm the `[T*K, H]` gather/scatter buffers have the row dim outermost with **no** inserted `spyre.restickify` on the hot path (§3.5). Record findings in the docstring. If topk k=8 raises `Unsupported` or gather/scatter diverge, STOP and escalate (the design assumption has regressed).
+Expected: prints `mean_rel=...` then `OK ...`. A `corrupted double-linked list` SIGABRT *after* the `OK` line is the known teardown issue — ignore it (Global Constraints). Then inspect the dumped artifacts / restickify insertions to confirm the `device_gather` `[T*K, H]` buffer has the row dim outermost with **no** inserted `spyre.restickify` on the hot path (§3.5). Record findings in the docstring. If any device region fails to lower or the round-trip diverges, STOP and escalate.
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add repros/gemma4_moe/gate2_route_permute.py
-git commit -m "test: gate 2 — top-8 route + permute/unpermute + layout on Spyre"
+git commit -m "test: gate 2 — device/host-split route/permute/GEMM/combine on Spyre"
 ```
 
 ---
@@ -269,8 +327,8 @@ git commit -m "feat: gemma4 MoE router + expert permutation (CPU-tested)"
 **Interfaces:**
 - Consumes: `_moe_route`, `_moe_permute` from Task 4.
 - Produces:
-  - `_grouped_gemm(gathered, Wstack, row_expert) -> out` : for each row `r`, `gathered[r] @ Wstack[row_expert[r]].T`. Option 4A implementation (index_select the per-row weight, row-batched bmm). `Wstack [E, out, in]`, `gathered [N,in]`, returns `[N,out]`.
-  - `_moe_ffn(x, W_router, gate_up_proj, down_proj, per_expert_scale, K) -> [T,H]` : the full §3 forward (route → permute → grouped gate_up → gelu_tanh SwiGLU → grouped down → weight by `w` → scatter_add combine).
+  - `_grouped_gemm(gathered, Wstack, row_expert) -> out` : for each row `r`, `gathered[r] @ Wstack[row_expert[r]].T`. Option 4A implementation (gather the per-row weight, row-batched bmm). `Wstack [E, out, in]`, `gathered [N,in]`, returns `[N,out]`. This is the piece that runs **on-device** in Task 6 (gather + bmm are the two ops that lower); on CPU here it is plain eager.
+  - `_moe_ffn(x, W_router, gate_up_proj, down_proj, per_expert_scale, K) -> [T,H]` : the full §3 forward (route → permute → grouped gate_up → gelu_tanh SwiGLU → grouped down → weight by `w` → scatter_add combine). Pure CPU/eager reference here; **Task 6 splits it** so route/permute/combine stay host-eager and the gather+GEMM run in a compiled device region. Keep it as a single readable eager function so it doubles as the host reference for the §6 gate-4 parity.
 
 - [ ] **Step 1: Write failing parity test vs a plain reference**
 
@@ -356,15 +414,17 @@ git commit -m "feat: gemma4 MoE grouped GEMM + combine, parity vs reference (4A)
 - Test: import + structural sanity (`python3 -c "import hf_adapters.hf_gemma4_moe"`)
 
 **Interfaces:**
-- Consumes: `_gemma4_attention` (Task 3), `_moe_ffn` (Task 5), and from `hf_gemma4.py`: `_patch_gemma4_rmsnorm`, `_gemma4_backbone`, `_build_layer_masks`, RoPE/KV-shape setup.
+- Consumes: `_gemma4_attention` (Task 3), `_moe_route`/`_moe_permute` (Task 4), `_grouped_gemm` (Task 5), and from `hf_gemma4.py`: `_patch_gemma4_rmsnorm`, `_gemma4_backbone`, `_build_layer_masks`, RoPE/KV-shape setup.
 - Produces:
-  - `_make_compiled_moe_block(layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v)` → compiled block matching the dense block's call signature plus the MoE weights, implementing §1.2: attention (shared helper) → parallel `dense_mlp` and `_moe_ffn` off the pre-MLP residual, each with its own norms, summed, `post_ff_ln`, residual add, `* layer_scalar`.
-  - `prepare_for_spyre(model)` — asserts (no PLE, no KV-share, `enable_moe_block=True`); patches RMSNorm; builds per-type RoPE + KV shapes (reuse `hf_gemma4.prepare_text_decoder_for_spyre` logic); `pad_lm_head`; registers the 3D packed expert weights + router + `per_expert_scale` as buffers so `.to("spyre")` moves them; lays expert weights out expert-dim-outermost (§3.5); compiles blocks.
-  - `_run_forward(...)` / `_run_backbone_forward(...)` — same signatures as `hf_gemma4._run_forward` (delegate to the shared `_run_blocks_over_embeds` machinery, swapping in the MoE compiled blocks), plus the final logit softcap.
+  - `_compiled_moe_device(gathered, gate_up_row, down_row) -> [N,H]` — the **device** portion of the FFN: the two grouped GEMMs + gelu_tanh SwiGLU (from `_grouped_gemm`), wrapped in `torch.compile(dynamic=False)`. `gathered [N,H]`, `gate_up_row [N,2M,H]`, `down_row [N,H,M]`. (The token gather `x[token_of_row]` and per-row weight gather `Wstack[row_expert]` may live in this region too, or be done as separate compiled gathers — implementer's choice, but they must be on-device gather ops, not host indexing, on the hot path.)
+  - `_moe_ffn_split(x_dev, W_router_dev, gate_up_dev, down_dev, per_expert_scale_host, K)` — host orchestrator implementing the §2.1 split: device router `Linear` → `.cpu()` → host softmax/`_moe_route`/`_moe_permute` (topk/argsort/index-arith) → move `token_of_row`/`row_expert` to device → `_compiled_moe_device` → `.cpu()` → host weighted `index_add` combine → return `[T,H]` (on the device, moved back for the block sum). Router weights, expert weights stay resident on-device across calls; only the small routing tensors and the `[T*K,H]` gathered/expert-out buffers cross the boundary.
+  - `_make_moe_block(layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v)` → a block callable (NOT a single `torch.compile` of the whole block — the FFN's routing is host-side). It runs the **compiled** attention (shared helper) and **compiled** dense MLP, calls `_moe_ffn_split` for the sparse branch, and combines per §1.2. Matches the dense block's call signature plus the MoE weights.
+  - `prepare_for_spyre(model)` — asserts (no PLE, no KV-share, `enable_moe_block=True`, `top_k_experts` coerced/asserted to K=4 for bring-up); patches RMSNorm; builds per-type RoPE + KV shapes (reuse `hf_gemma4.prepare_text_decoder_for_spyre` logic); `pad_lm_head`; registers the 3D packed expert weights + router + `per_expert_scale` as buffers and moves them to `spyre` so they stay resident; lays expert weights out expert-dim-outermost (§3.5); compiles the attention/dense-MLP/device-FFN regions.
+  - `_run_forward(...)` / `_run_backbone_forward(...)` — same signatures as `hf_gemma4._run_forward` (delegate to the shared `_run_blocks_over_embeds` machinery, swapping in the MoE blocks), plus the final logit softcap.
 
-- [ ] **Step 1: Implement the block, `prepare_for_spyre`, and `_run_forward`**
+- [ ] **Step 1: Implement the block, the split FFN, `prepare_for_spyre`, and `_run_forward`**
 
-Model the norm wiring on the spec §1.2 exactly: `h_dense = post_ff_ln_1(dense_mlp(pre_ff_ln(h)))`, `h_moe = post_ff_ln_2(_moe_ffn(pre_ff_ln_2(residual), ...))`, `h = post_ff_ln(h_dense + h_moe)`, `h = residual + h`, `h = h * layer_scalar`. Pass `layer_scalar` as a tensor arg (Global Constraints). Reuse `hf_gemma4.prepare_text_decoder_for_spyre` for the attention-side prep (RoPE, KV shapes, RMSNorm patch, pad_lm_head) and add the expert-weight registration on top. Flatten `[B,S,H]`→`[T,H]` for `_moe_ffn` and reshape back inside the block.
+Model the norm wiring on the spec §1.2 exactly: `h_dense = post_ff_ln_1(dense_mlp(pre_ff_ln(h)))`, `h_moe = post_ff_ln_2(_moe_ffn_split(pre_ff_ln_2(residual), ...))`, `h = post_ff_ln(h_dense + h_moe)`, `h = residual + h`, `h = h * layer_scalar`. Pass `layer_scalar` as a tensor arg (Global Constraints). Reuse `hf_gemma4.prepare_text_decoder_for_spyre` for the attention-side prep (RoPE, KV shapes, RMSNorm patch, pad_lm_head) and add the expert-weight registration on top. Flatten `[B,S,H]`→`[T,H]` for the FFN and reshape back inside the block. Do **not** place `topk`/`argsort`/`index_add` inside any `torch.compile(...)` targeting spyre (Global Constraints, spec §2.1) — those stay in eager host code inside `_moe_ffn_split`. The per-token norms (`pre_ff_ln_2`, `post_ff_ln_2`) apply on-device on the `[T,H]` tensor before/after the split, so the host only ever sees the small routing tensors plus the `[T*K,H]` gathered/expert-out buffers.
 
 - [ ] **Step 2: Import + config-shape sanity (CPU, no weights)**
 
@@ -400,7 +460,7 @@ from hf_adapters import auto_spyre_model as asm
 
 def test_moe_config_routes_to_moe_adapter(monkeypatch):
     from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
-    cfg = Gemma4TextConfig(enable_moe_block=True, num_experts=8, top_k_experts=2,
+    cfg = Gemma4TextConfig(enable_moe_block=True, num_experts=8, top_k_experts=4,
                            moe_intermediate_size=8)
     cfg.architectures = ["Gemma4ForConditionalGeneration"]
     monkeypatch.setattr(asm.AutoConfig, "from_pretrained",
@@ -478,7 +538,7 @@ git commit -m "feat: route gemma4 enable_moe_block checkpoints to hf_gemma4_moe 
 
 - [ ] **Step 1: Single MoE layer parity on real weights (pod)**
 
-Write `gate4_single_layer.py`: load layer 0 of the real 26B-A4B (weights at `/mnt/models/hf_cache/hub` per the test-host memory; use `HF_HUB_OFFLINE`), run the reference layer forward on CPU (before `prepare_for_spyre`), then the compiled MoE block on Spyre, assert max-abs error within fp16 tol (match the tolerance used in `docs/spyre-numerical-findings.md`).
+Write `gate4_single_layer.py`: load layer 0 of the real 26B-A4B (weights at `/mnt/models/hf_cache/hub` per the test-host memory; use `HF_HUB_OFFLINE`), run the reference layer forward on CPU (before `prepare_for_spyre`), then the split MoE block (compiled attention/dense-MLP/device-FFN + host routing per Task 6) on Spyre, assert max-abs error within fp16 tol (match the tolerance used in `docs/spyre-numerical-findings.md`). Note the config's `top_k_experts` is coerced to K=4 for bring-up, so the CPU reference must also use K=4 for an apples-to-apples compare (the divergence from the true-8 model is expected and tracked, spec §9).
 
 Run (pod): `python3 repros/gemma4_moe/gate4_single_layer.py`
 Expected: prints PASS within tolerance. If the parallel-branch sum or the router renorm/`per_expert_scale` diverge, fix ordering per spec §1.2 / §7 before proceeding.
@@ -557,6 +617,7 @@ git commit -m "docs: add Gemma 4 MoE (26B-A4B) to coverage tables + badge"
 
 ## Self-Review Notes
 
-- **Spec coverage:** §1.1 config asserts → Task 6 asserts. §1.2 parallel dense+MoE + norms → Task 6 block. §2 formulation (no upstream loop) → Tasks 4–5. §3 routing/permute/grouped-gemm/combine → Tasks 4–5. §3.5 layout → Global Constraints + Tasks 2, 6. §4 4A vs 4B → Task 5 (4A) + Task 9 (4B). §6 gates → Tasks 1, 2, 8. §7 numeric plan → Task 8. §8 DoD → Tasks 6–10. §9 open items → resolved in Tasks 5/8/9.
-- **Type consistency:** `_moe_route`/`_moe_permute`/`_grouped_gemm`/`_moe_ffn` signatures are defined in Task 4/5 and consumed unchanged in Task 6. `_gemma4_attention` defined in Task 3, consumed in Task 6.
-- **Ordering:** Tasks 1–2 are on-device gates first (de-risk). Task 3 refactor is independent and could run anytime before Task 6. Tasks 4–5 are CPU-only TDD. Task 6 assembles. Task 7 wires dispatch. Task 8 validates on-device. Tasks 9–10 are follow-ups.
+- **Device/host split (spec §2.1):** the routing ops don't lower, so the FFN is partitioned — device does router `Linear` + token gather + expert GEMM, host does softmax/topk/argsort/index-arith/index_add. K pinned to 4 for bring-up. Reflected in Global Constraints, Task 2 (split gate), Task 6 (`_moe_ffn_split`, non-monolithic block), Task 7 (K=4), Task 8 (K=4 reference).
+- **Spec coverage:** §1.1 config asserts → Task 6 asserts. §1.2 parallel dense+MoE + norms → Task 6 block. §2 formulation (no upstream loop) → Tasks 4–5. §2.1 device/host split → Global Constraints + Task 2 gate + Task 6 split. §3 routing/permute/grouped-gemm/combine → Tasks 4–5 (host math) + Task 6 (device gather+GEMM). §3.5 layout → Global Constraints + Tasks 2, 6. §4 4A vs 4B → Task 5 (4A) + Task 9 (4B). §6 gates → Tasks 1 (done), 2 (split), 8. §7 numeric plan → Task 8. §8 DoD → Tasks 6–10. §9 open items (K→8, on-device routing, round-trip cost) → tracked follow-ups.
+- **Type consistency:** `_moe_route`/`_moe_permute`/`_grouped_gemm`/`_moe_ffn` signatures are defined in Task 4/5 and consumed in Task 6 (`_moe_ffn` becomes the CPU reference; `_moe_ffn_split` is the on-device orchestrator built from the same `_moe_route`/`_moe_permute`/`_grouped_gemm` pieces). `_gemma4_attention` defined in Task 3, consumed in Task 6.
+- **Ordering:** Tasks 1–2 are on-device gates first (de-risk). Task 3 refactor is independent and could run anytime before Task 6. Tasks 4–5 are CPU-only TDD (also the host reference). Task 6 assembles the split. Task 7 wires dispatch. Task 8 validates on-device. Tasks 9–10 are follow-ups.

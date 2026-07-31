@@ -89,36 +89,77 @@ GEMM → unpermute → weighted combine.** The variant we target is the **lossle
 grouped GEMM** (DeepSeek/DeepGEMM `m_grouped_gemm_contiguous`), which needs **no worst-case per-expert
 capacity padding** and drops no tokens.
 
-*Assumptions carried from the design discussion (per user):* `torch.topk` at k=8, and
-`index_select`/`gather`/scatter, compile and run correctly on the current Spyre backend. This spec is
-written against those assumptions; §6 lists them as explicit prototype gates so a regression surfaces
-immediately rather than as silent wrong output.
+### 2.1 Empirical op-support result (gate outcome, 2026-07-31) — device/host split
+
+The §6 gates were run on the card *before* writing adapter code. The design originally assumed (per the
+discussion) that `topk` at k=8, `argsort`, `gather`, and scatter (`index_add`) all compiled on the
+current backend. **That assumption did not hold.** Isolated op-by-op on the card:
+
+| op | on-device status |
+|---|---|
+| `bmm` `[T*K,1,H]×[T*K,H,F]` and `[E,T,H]×[E,H,F]` | ✅ works, numerically correct (gate 1) |
+| `x[token_of_row]` plain gather | ✅ works |
+| `topk(k=4)` (with softmax) | ❌ `dxp_standalone` SIGABRT |
+| `topk(k>4)` | ❌ `Unsupported` (hard `k>4` guard in `spyre_topk`) |
+| `argsort` / `sort` | ❌ `aten::sort.values_stable` not implemented for spyre |
+| `(arange//K)[perm]` index arithmetic | ❌ multi-arg pointwise, no supported layout on the 1-D index |
+| `index_add` (scatter combine) | ❌ `KeyError: indirect0` |
+
+**Decision (per user):** keep the permute + grouped-GEMM formulation, but run the unsupported routing
+ops (`topk`, `argsort`, the index arithmetic, and `index_add`) as **CPU/host fallbacks**, while the
+matmul-heavy work (router `Linear`, the `[T*K,H]` gather, and the expert grouped GEMM) stays on-device.
+The routing tensors are small — `[T,E]` logits, `[T,K]` weights/ids, `[T*K]` permutations — so the host
+round-trip is cheap relative to the expert compute. This composes cleanly: separate `torch.compile`
+regions for the device pieces with plain host PyTorch between them (verified on the card — device router
+→ host route → device gather+GEMM → host combine round-trips successfully).
+
+**Top-k value:** the model config specifies `top_k_experts=8`, but `topk` on the current backend is
+capped at (and in fact crashes at) k>4. For bring-up we therefore run with **K=4** (a tracked deviation
+from the real model) and revisit K=8 once torch-spyre lifts the cap / fixes the `topk` crash. Because
+`topk` runs on the **host** in this formulation, K is not actually constrained by the backend guard;
+K=4 is a bring-up choice to keep parity with what a future all-on-device version could support, and to
+bound the host↔device traffic. The router weight renormalization and `per_expert_scale` still apply over
+the K selected experts regardless of K's value.
+
+*Known-issue note:* a `corrupted double-linked list` SIGABRT can fire on **process teardown** after a
+successful device run; per the user this is a known torch-spyre lifetime issue unrelated to compute
+correctness and is ignored for this work.
 
 ---
 
 ## 3. The MoE forward — target formulation (lossless grouped GEMM)
 
-Let `T` = number of tokens in the block (batch·seqlen, flattened), `E=128`, `K=8`, `H=2816`,
-`M=704`. The MoE branch input is `x = pre_feedforward_layernorm_2(residual)`, shape `[T, H]`.
+Let `T` = number of tokens in the block (batch·seqlen, flattened), `E=128`, `K=4` (bring-up value;
+the model config wants `top_k_experts=8` — see §2.1), `H=2816`, `M=704`. The MoE branch input is
+`x = pre_feedforward_layernorm_2(residual)`, shape `[T, H]`.
 
-### 3.1 Routing (all static shapes)
+**Device/host partition (§2.1):** each step below is annotated `[device]` or `[host]`. The compiled
+regions are the `[device]` pieces; the `[host]` pieces are plain PyTorch on the small routing tensors,
+run between the compiled regions.
+
+### 3.1 Routing
 
 ```
-logits   = x @ W_router.T                      # [T, E]   (router is a plain Linear)
-probs    = softmax(logits, dim=-1)             # [T, E]
-w, idx   = topk(probs, K, dim=-1)              # [T, K], [T, K]
-w        = w / w.sum(-1, keepdim=True)         # renormalize (Gemma4 does this)
-w        = w * per_expert_scale[idx]           # learned per-expert scale
+logits   = x @ W_router.T   # [T, E]  [device] — router is a plain Linear (matmul, supported)
+probs    = softmax(logits, dim=-1)             # [T, E]   [host]  (moved to cpu after the router)
+w, idx   = topk(probs, K, dim=-1)              # [T, K], [T, K]   [host]  (topk unsupported on device)
+w        = w / w.sum(-1, keepdim=True)         # renormalize (Gemma4 does this)   [host]
+w        = w * per_expert_scale[idx]           # learned per-expert scale   [host]
 ```
+
+`per_expert_scale` is a host tensor for this indexing; `W_router` stays a device weight for the matmul.
 
 ### 3.2 Permutation into expert-contiguous order
 
-Flatten the `T*K` (token, expert) assignments and sort by expert id. This produces:
-- `sort_perm`  : `[T*K]` — permutation that orders the pairs by expert id (via `argsort(idx.flatten())`).
-- `token_of_row = (arange(T*K) // K)[sort_perm]` : which source token each sorted row came from.
-- `gathered   = x[token_of_row]`                : `[T*K, H]` — tokens gathered into expert-contiguous order.
-- `counts     = bincount(idx.flatten(), E)`     : `[E]` — tokens per expert.
-- `group_off  = cumsum(counts)`                 : `[E]` — segment boundaries (prefix sum).
+Flatten the `T*K` (token, expert) assignments and sort by expert id. The sort/index bookkeeping is
+`[host]` (argsort + index arithmetic are unsupported on device); only the `gathered = x[token_of_row]`
+gather is `[device]` (gather is the one indirect-access op that works on the current backend). This
+produces:
+- `sort_perm`  : `[T*K]` — permutation ordering pairs by expert id (`argsort(idx.flatten())`) `[host]`.
+- `token_of_row = (arange(T*K) // K)[sort_perm]` : source token per sorted row `[host]`.
+- `gathered   = x[token_of_row]`                : `[T*K, H]` — tokens gathered into expert-contiguous order `[device]` (x is a device tensor; `token_of_row` is moved to device as int32).
+- `counts     = bincount(idx.flatten(), E)`     : `[E]` — tokens per expert `[host]`.
+- `group_off  = cumsum(counts)`                 : `[E]` — segment boundaries (prefix sum) `[host]`.
 
 Total rows are exactly `T*K` — **fixed and static**. Only the *segment boundaries* (`group_off`) are
 data-dependent; the buffer size is not. This is precisely the property that makes the DeepGEMM
@@ -179,25 +220,31 @@ inserted (check the compile artifacts / restickify insertions).
 
 ## 4. The core open question: expressing the grouped GEMM on Spyre
 
-The segment boundaries `group_off` are runtime values, but Spyre wants static tiling. Two candidate
-lowerings, to be chosen during prototyping (§6):
+This is the piece that **stays on-device** under the §2.1 split — the routing/permutation indices
+(`row_expert`, `sort_perm`, `token_of_row`) arrive from the host as plain `int32` tensors, and the
+device computes the actual expert matmuls. The segment boundaries `group_off` are host-computed values,
+but Spyre still wants static tiling on the device side. Two candidate lowerings, to be chosen during
+prototyping (§6):
 
-**Option 4A — index_select the per-row weight, then row-wise GEMM.**
-Materialize a per-row expert id `row_expert = repeat_interleave over counts` (equivalently
-`idx.flatten()[sort_perm]`), then `W_row = gate_up_proj[row_expert]` (`index_select`, assumed working)
-giving `[T*K, 2M, H]`, and do a batched `[T*K,1,H] × [T*K,H,2M]` matmul. Simple to express; heavy on
-weight gather bandwidth (materializes a weight per row). Good for a first correct version.
+**Option 4A — gather the per-row weight, then row-wise GEMM.**
+The host supplies a per-row expert id `row_expert` (`= idx.flatten()[sort_perm]`, computed on the host);
+the device does `W_row = gate_up_proj[row_expert]` (a plain device gather — the only indirect-access op
+verified working on-card, §2.1) giving `[T*K, 2M, H]`, and a batched `[T*K,1,H] × [T*K,H,2M]` matmul
+(verified correct on-card, §6 gate 1). Simple to express; heavy on weight gather bandwidth (materializes
+a weight per row). This is the **bring-up path** — correct grouped result on-device with only the one
+device indirect-access primitive that works today.
 
 **Option 4B — tiled contiguous grouped GEMM via `spyre_hint` (the DeepGEMM analogue).**
 Keep `gathered` contiguous and tile the M (row) dimension into fixed tiles; each tile reads a single
-expert's weight slab selected by `group_off`. Express with `spyre_hint(tiles={...})` /
+expert's weight slab selected by host-supplied `group_off`. Express with `spyre_hint(tiles={...})` /
 `named_dims=[...]` so the compiler schedules one expert-weight load per tile across the 32 cores —
 structurally the same as a Triton grouped-GEMM `group_id` loop. This is the performant target: expert
 weights are loaded once per tile, not once per row. It depends on hints propagating through the
 gather/segment structure (an area with known fragility — see risks).
 
 Recommendation: implement **4A first** to get a correct grouped result on-device, then move the hot
-path to **4B**. Both share all of §3.1–3.2 and §3.4; only §3.3's kernel differs.
+path to **4B**. Both share the host-side routing (§3.1) and permutation-index computation (§3.2) and the
+host-side combine (§3.4); only §3.3's device kernel differs.
 
 ---
 
@@ -227,23 +274,34 @@ New file: `hf_adapters/hf_gemma4_moe.py`. It **reuses** the dense attention mach
 
 ## 6. Prototype gates (de-risk before full adapter)
 
-Build these tiny repros *first*, on-device, in order. Each gate must pass before proceeding:
+Build these tiny repros *first*, on-device, in order. Each gate must pass before proceeding. Under the
+§2.1 device/host split, the gates de-risk the **device** pieces (matmul, gather, weighted combine) and
+that the **host↔device composition** runs; the routing/permute *math* (softmax/topk/argsort/index-add)
+runs in plain host PyTorch and is correct by construction.
 
-1. **Expert-dim batched matmul compiles & is correct.** `[E,T,H] @ [E,H,F]` (and the row-batched
-   `[T*K,1,H] × [T*K,H,F]` of 4A). This is the geometry that has previously hit the
-   `out_reuse_dim.size()==1` abort in the attention output-projection path — validate it does *not*
-   fire here, or find the tiling/`spyre_hint` that avoids it.
-2. **top-8 routing.** `topk(probs, 8)` returns correct values+indices on-device.
-3. **Permutation ops + indirect-access layout.** `argsort` + `index_select`/gather + `scatter_add`
-   over `T*K` rows produce correct permute/unpermute round-trips, **and** the indirectly-addressed
-   tensors get the row/expert dim committed outermost (§3.5) with no surprise `spyre.restickify` copy
-   inserted on the hot path. Inspect the compile artifacts to confirm the layout is satisfied by
-   construction, not by an inserted copy.
-4. **End-to-end single MoE layer** vs a CPU/HF reference on real weights (bit-close, fp16 tol).
+1. **Expert-dim batched matmul compiles & is correct.** ✅ **DONE** (`gate1_grouped_gemm.py`). Both the
+   row-batched `[T*K,1,H] × [T*K,H,F]` (Option 4A) and dense expert-batched `[E,T,H] × [E,H,F]`
+   geometries compile with no `out_reuse_dim.size()==1` abort and match fp32 ground truth at
+   mean-rel ~0.7%. The abort that fires in the attention output-projection path does **not** fire here.
+2. **Device/host split composes for the full route→permute→GEMM→combine round-trip.**
+   (`gate2_route_permute.py`, K=4.) A device `torch.compile` region for the router `Linear`; host
+   `softmax`/`topk(K)`/renormalize + `argsort` + `token_of_row` index arithmetic; a device `torch.compile`
+   region for the `x[token_of_row]` gather + expert GEMM; host weighted `index_add` combine. Verify the
+   three host↔device hand-offs run without error and the recombined output matches a pure-CPU MoE
+   reference within fp16 tolerance. This gate exists because the routing ops (`topk`, `argsort`,
+   index-arithmetic, `index_add`) do **not** lower on the current backend (§2.1) — the gate proves the
+   split is a working substitute.
+3. **Device indirect-access layout is satisfied by construction.** For the device gather region of
+   gate 2, confirm the gathered/scattered token buffers get the row dim committed **outermost** (§3.5)
+   with no surprise `spyre.restickify` copy inserted on the hot path. Inspect the compile artifacts to
+   confirm the layout is satisfied by construction, not by an inserted copy.
+4. **End-to-end single MoE layer** vs a CPU/HF reference on real weights (bit-close, fp16 tol), using
+   the device/host split for the FFN.
 5. **Full 30-layer forward** vs HF reference (token-compare), then generation smoke.
 
-If gate 1 or 3 regresses the assumptions from §2, stop and revisit the formulation (e.g. fall back to a
-dense-masked expert compute for the affected step) rather than shipping wrong output.
+If gate 2 or 3 regresses the assumptions from §2/§2.1, stop and revisit the formulation (e.g. move more
+of the FFN to the host, or fall back to a dense-masked expert compute for the affected step) rather than
+shipping wrong output.
 
 ---
 
@@ -272,10 +330,16 @@ dense-masked expert compute for the affected step) rather than shipping wrong ou
 
 ## 9. Open items for prototyping (not blockers to the plan)
 
-- **4A vs 4B choice** — decided by gate 1 + perf on-device.
+- **4A vs 4B choice** — decided by gate 1 (done) + perf on-device.
 - **`per_expert_scale` exact application point** — confirm against `transformers` source at
-  implementation time (multiply into `w` before or after renormalize).
-- **Scatter-add vs. gather-combine for §3.4** — pick whichever compiles cleaner for the unpermute.
+  implementation time (multiply into `w` before or after renormalize). Applied host-side under §2.1.
+- **`K` back to 8, routing back on-device** — the current split runs routing on the host and uses `K=4`
+  only as a host↔device-traffic bound (§2.1); `K` is not backend-constrained while topk is host-side.
+  When torch-spyre lifts the topk/argsort/index_add limits, revisit moving routing on-device and raising
+  `K` to the model's 8. Tracked as a follow-up, not a blocker to a correct adapter.
 - **Grouped-GEMM tile size / stick alignment** for 4B — DeepGEMM aligns each group's M to a small tile
   (e.g. 128); map that to Spyre's 64-element stick.
+- **Host↔device round-trip cost** — the split adds three transfers per MoE layer (logits down, indices
+  up, expert-out down). Measure in §6 gate 4/5; if it dominates, that motivates the on-device routing
+  follow-up above.
 ```
