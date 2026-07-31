@@ -213,8 +213,8 @@ def _moe_ffn_split(
     router,
     compiled_gather,
     compiled_expert,
-    gate_up_dev_t,
-    down_dev_t,
+    gate_up_host_t,
+    down_host_t,
     K,
 ):
     """Device/host-split MoE FFN (spec §2.1; gate-2 host-orchestration template).
@@ -230,10 +230,12 @@ def _moe_ffn_split(
       * ``x_expert`` ``[T,H]`` — the ``pre_feedforward_layernorm_2``-normed
         residual. The token gather (expert FFN input) reads THIS tensor.
 
-    Both are **on the device**. Router weights and the pre-transposed expert
-    weights (``gate_up_dev_t`` ``[E,H,2M]``, ``down_dev_t`` ``[E,M,H]``) stay
-    resident on-device across calls; only the small routing tensors and the
-    ``[T*K,H]`` gathered / expert-out buffers cross the host boundary.
+    Both are **on the device**. Router weights are device-resident; the
+    pre-transposed expert weights (``gate_up_host_t`` ``[E,H,2M]``,
+    ``down_host_t`` ``[E,M,H]``) stay resident on the **HOST (CPU)** and are
+    indexed there. Only the small per-row ``[N,·]`` expert slices, the routing
+    tensors, and the ``[T*K,H]`` gathered / expert-out buffers cross the
+    host/device boundary.
 
     Ordering (matches gate 2):
       device: router projection (on x_router) → cpu
@@ -276,14 +278,17 @@ def _moe_ffn_split(
     # --- device: gather token rows from the EXPERT input ([N,H])
     gathered = compiled_gather(x_expert, token_of_row.to(x_expert.device))
 
-    # --- host: select + PRE-TRANSPOSE per-row expert weights.
-    # gate_up_dev_t / down_dev_t are already expert-outermost, pre-transposed
-    # ([E,H,2M] / [E,M,H]); indexing on the expert dim keeps that layout, so
-    # the compiled expert region sees no in-kernel transpose (shape rule 2).
-    # The per-row index_select happens on the device tensors directly.
-    row_expert_dev = row_expert.to(gate_up_dev_t.device)
-    gate_up_row_t = gate_up_dev_t[row_expert_dev]  # [N,H,2M]
-    down_row_t = down_dev_t[row_expert_dev]  # [N,M,H]
+    # --- host: select per-row expert weights, then move the slice to device.
+    # gate_up_host_t / down_host_t are the pre-transposed, expert-outermost
+    # stacks ([E,H,2M] / [E,M,H]) kept on the HOST (prepare_for_spyre does not
+    # move them to the device). The per-row select ``stack[row_expert]`` is an
+    # eager ``aten::index.Tensor`` — NOT lowerable on the spyre backend — so it
+    # runs on CPU here (gate 2's validated flow). Indexing on the expert dim
+    # preserves the pre-transposed layout, so the compiled expert region sees no
+    # in-kernel transpose (shape rule 2). Only the resulting small ``[N,·]``
+    # slices cross to the device for the grouped GEMM.
+    gate_up_row_t = gate_up_host_t[row_expert].to(x_expert.device)  # [N,H,2M]
+    down_row_t = down_host_t[row_expert].to(x_expert.device)  # [N,M,H]
 
     # --- device: expert grouped GEMM (rows as [N,1,H], stay 3D)
     expert_out = compiled_expert(
@@ -350,11 +355,14 @@ def _make_moe_block(layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
     post_ff_ln_1 = layer.post_feedforward_layernorm_1  # dense-branch post-norm
     pre_ff_ln_2 = layer.pre_feedforward_layernorm_2  # MoE pre-norm (on residual)
     post_ff_ln_2 = layer.post_feedforward_layernorm_2  # MoE post-norm
-    # Pre-transposed, device-resident expert weights laid down by
-    # prepare_for_spyre (shape rule 2 + expert-dim-outermost, spec §3.5).
-    gate_up_dev_t = layer._spyre_gate_up_t  # [E,H,2M]
-    down_dev_t = layer._spyre_down_t  # [E,M,H]
     K = layer._spyre_moe_k
+    # The pre-transposed expert-weight stacks (``_spyre_gate_up_t`` [E,H,2M],
+    # ``_spyre_down_t`` [E,M,H]) are laid down by ``prepare_for_spyre`` (shape
+    # rule 2 + expert-dim-outermost, spec §3.5) as PLAIN CPU ATTRIBUTES that the
+    # spyre move deliberately leaves on the host (the per-row select is an eager
+    # index, unsupported on-device — see _moe_ffn_split). They are NOT captured
+    # here: read fresh from ``layer`` at call time, the same call-time-read rule
+    # the dense block uses for ``layer_scalar``.
 
     # Compiled device regions (shared per layer; router.proj/gather/expert). The
     # dense MLP is compiled as its own region too so the dense branch lowers.
@@ -412,14 +420,18 @@ def _make_moe_block(layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
         # the router input is not double-normalized.
         flat = residual.reshape(-1, hidden)  # [T,H] RAW -> router
         x_moe = pre_ff_ln_2(flat)  # [T,H] normed -> experts
+        # Read the host-resident expert stacks fresh from ``layer`` (see the
+        # factory note: they are plain CPU attributes set by prepare_for_spyre,
+        # not captured here — _moe_ffn_split selects per-row on CPU then moves
+        # the [N,·] slice to the device for the compiled GEMM).
         moe_out = _moe_ffn_split(
             flat,
             x_moe,
             router,
             compiled_gather,
             compiled_expert,
-            gate_up_dev_t,
-            down_dev_t,
+            layer._spyre_gate_up_t,
+            layer._spyre_down_t,
             K,
         )  # [T,H]
         moe_out = moe_out.reshape(bsz, seq_len, hidden)
@@ -445,9 +457,9 @@ def prepare_for_spyre(model):
         (K pinned for bring-up, Global Constraints);
       * lay each layer's packed expert weights **expert-dim-outermost and
         pre-transposed** (``gate_up`` ``[E,2M,H]`` -> ``[E,H,2M]``, ``down``
-        ``[E,H,M]`` -> ``[E,M,H]``; shape rule 2 + spec §3.5), register them as
-        buffers, and move the whole model (router + experts + scales) to
-        ``spyre`` so they stay resident;
+        ``[E,H,M]`` -> ``[E,M,H]``; shape rule 2 + spec §3.5), store them as
+        plain CPU attributes (not buffers) so they stay resident on the **HOST**
+        after ``model.to("spyre")``, and delete the original parameters;
       * build ``model._spyre_compiled_blocks`` from the MoE block factory.
     """
     backbone = _gemma4_backbone(model)
@@ -471,15 +483,37 @@ def prepare_for_spyre(model):
 
     # Lay out expert weights: expert-dim-outermost (already, [E,...]) and
     # PRE-TRANSPOSED so the compiled expert region needs no in-kernel transpose
-    # of a large weight (shape rule 2). Registered as buffers on the layer so
-    # they move to spyre with model.to("spyre") and stay resident across calls.
+    # of a large weight (shape rule 2).
+    #
+    # The pre-transposed expert stacks are kept on the HOST (CPU), NOT moved to
+    # the device, for two reasons that both surfaced on-card at 26B:
+    #
+    #   1. The per-row weight select ``gate_up_t[row_expert]`` is an eager
+    #      ``aten::index.Tensor`` — unsupported on the spyre backend
+    #      (``NotImplementedError``). Only plain ``gather``/``bmm`` lower
+    #      (spec §2.1); fancy indexing must run on CPU. Gate 2 selects on host
+    #      for exactly this reason, then moves the ``[N,·]`` slice to the device.
+    #   2. Even if the select lowered, keeping all 128 experts × 30 layers
+    #      resident is ~46 GB fp16; the [N,H,2M]/[N,M,H] per-row gathers plus
+    #      the rest of the model exhaust the card (FlexAllocator OOM).
+    #
+    # They are stored as PLAIN ATTRIBUTES (not ``register_buffer``) so
+    # ``_move_to_spyre_with_layout``'s ``named_buffers()`` sweep never moves them
+    # to the device — they stay on CPU. ``_moe_ffn_split`` selects the per-row
+    # weights here on the host and moves only the small ``[N,·]`` slices to the
+    # device for the compiled expert GEMM. The ORIGINAL ``gate_up_proj`` /
+    # ``down_proj`` parameters are deleted (the stock ``Gemma4TextExperts.forward``
+    # never runs; the split FFN uses only the transposed CPU stacks), so the
+    # experts are not paid for twice on the host either.
     for layer in backbone.layers:
         experts = layer.experts
         # gate_up_proj: [E, 2M, H] -> [E, H, 2M]; down_proj: [E, H, M] -> [E, M, H]
         gate_up_t = experts.gate_up_proj.data.transpose(1, 2).contiguous()
         down_t = experts.down_proj.data.transpose(1, 2).contiguous()
-        layer.register_buffer("_spyre_gate_up_t", gate_up_t, persistent=False)
-        layer.register_buffer("_spyre_down_t", down_t, persistent=False)
+        del experts.gate_up_proj  # drop originals; only the transposed CPU
+        del experts.down_proj  # stacks below are kept, and only on the host
+        layer._spyre_gate_up_t = gate_up_t.cpu()  # [E,H,2M] host-resident
+        layer._spyre_down_t = down_t.cpu()  # [E,M,H] host-resident
         layer._spyre_moe_k = _MOE_BRINGUP_K
 
     model._spyre_compiled_blocks = [
