@@ -67,6 +67,25 @@ from hf_adapters.hf_gemma4 import (
 # is a later-task concern.
 _MOE_BRINGUP_K = 4
 
+# Grouped-GEMM lowering selector (spec §4, Task 9 "Option 4B").
+#
+#   False (default) -> Option 4A: per-row expert-weight gather + row-batched
+#       bmm. This is the SHIPPED, on-card-validated bring-up path (Tasks 2/6/8).
+#   True            -> Option 4B: keep ``gathered`` contiguous (rows already
+#       sorted by expert) and walk the expert segments given by
+#       ``group_off = cumsum(bincount(row_expert, E))``, doing one slab GEMM per
+#       segment (one weight load per expert instead of per row).
+#
+# 4B is EXPERIMENTAL and OFF by default: on the current backend the
+# ``spyre_hint(tiles=...)`` vocabulary cannot express a per-tile operand switch
+# (see ``_grouped_gemm_4b`` docstring), so the on-device weight-load reduction
+# 4B targets is not achievable through the hint API today. 4B is retained as a
+# numerically-identical CPU-reference variant (verified by
+# ``tests/test_gemma4_moe_ffn.py::test_grouped_gemm_4a_4b_agree``) and as the
+# scaffold for a future backend that grows a grouped-GEMM primitive. Flip this
+# flag only after validating 4B end-to-end on-card.
+_MOE_GEMM_4B = False
+
 
 def _moe_route(x, W_router, per_expert_scale, K):
     """Route tokens to top-K experts with softmax and per-expert scaling.
@@ -115,7 +134,7 @@ def _moe_permute(x, idx, K):
     return gathered, token_of_row, row_expert, sort_perm
 
 
-def _grouped_gemm(gathered, Wstack, row_expert):
+def _grouped_gemm_4a(gathered, Wstack, row_expert):
     """Option 4A: gather per-row weight, row-batched matmul.
 
     Args:
@@ -131,6 +150,97 @@ def _grouped_gemm(gathered, Wstack, row_expert):
         gathered.unsqueeze(1), W_row.transpose(1, 2)
     )  # [N,1,out]
     return out.squeeze(1)  # [N,out]
+
+
+def _group_offsets(row_expert, E):
+    """Segment boundaries of a by-expert-sorted row block.
+
+    ``group_off[e]:group_off[e+1]`` is the contiguous row range assigned to
+    expert ``e`` (empty when the expert got no rows). Equivalent to the
+    DeepGEMM ``group_off = cumsum(bincount(row_expert, E))`` prefix sum used to
+    drive a contiguous grouped GEMM.
+
+    Args:
+        row_expert: Expert ID per sorted row [N] (non-decreasing)
+        E: Number of experts
+
+    Returns:
+        group_off: Prefix-sum segment boundaries [E+1] (int64), on
+            ``row_expert``'s device.
+    """
+    counts = torch.bincount(row_expert, minlength=E)  # [E]
+    group_off = torch.zeros(E + 1, dtype=torch.long, device=row_expert.device)
+    group_off[1:] = torch.cumsum(counts, 0)
+    return group_off
+
+
+def _grouped_gemm_4b(gathered, Wstack, row_expert):
+    """Option 4B: contiguous grouped GEMM over per-expert row segments.
+
+    ``gathered`` is already sorted by expert (``_moe_permute``), so each
+    expert owns one contiguous row range ``group_off[e]:group_off[e+1]``. This
+    walks those ranges and does ONE slab matmul per expert
+    (``seg @ Wstack[e].T``) instead of materializing a weight per row (4A) —
+    the DeepGEMM contiguous-layout formulation. Numerically identical to 4A
+    (verified by ``test_grouped_gemm_4a_4b_agree``); only the weight-load
+    schedule differs.
+
+    NOTE (on-device limitation, Task 9): the perf win 4B targets is "one expert
+    weight load per tile, scheduled across cores via ``spyre_hint``". The
+    torch-spyre ``spyre_hint(tiles={name: n})`` API tiles a *named dimension of
+    a single op's own iteration space* (see
+    ``torch_spyre/_inductor/propagate_hints.py`` + the flash-SDPA use in
+    ``decompositions.py``); it has NO kwarg to switch the *weight operand* per
+    tile from a host-supplied ``group_off``. A grouped GEMM whose weight slab
+    changes per tile is a distinct backend primitive (the Triton ``group_id``
+    pointer-arithmetic loop has no Spyre-hint equivalent today). This Python
+    ``for``-over-experts form is therefore the faithful, numerically-correct
+    reference; expressing it as a single fused device kernel needs a backend
+    grouped-GEMM op, tracked as the Task 9 follow-up. Kept behind
+    ``_MOE_GEMM_4B`` (OFF) so the shipped 4A device path is unaffected.
+
+    Args:
+        gathered: Token embeddings sorted by expert [N, in]
+        Wstack: Expert weight matrices [E, out, in]
+        row_expert: Expert ID for each row in gathered [N] (non-decreasing)
+
+    Returns:
+        out: Grouped ``gathered @ Wstack[expert].T`` [N, out]
+    """
+    E = Wstack.shape[0]
+    out_dim = Wstack.shape[1]
+    group_off = _group_offsets(row_expert, E)
+    out = torch.empty(
+        gathered.shape[0], out_dim, dtype=gathered.dtype, device=gathered.device
+    )
+    for e in range(E):
+        lo = int(group_off[e])
+        hi = int(group_off[e + 1])
+        if hi > lo:
+            # One contiguous slab load of expert e's weight for its whole
+            # row segment (vs. 4A's per-row gather).
+            out[lo:hi] = gathered[lo:hi] @ Wstack[e].transpose(0, 1)
+    return out
+
+
+def _grouped_gemm(gathered, Wstack, row_expert):
+    """Grouped GEMM dispatcher (Option 4A default, 4B behind ``_MOE_GEMM_4B``).
+
+    Both variants return the identical result: for each row ``r``,
+    ``gathered[r] @ Wstack[row_expert[r]].T``. See ``_MOE_GEMM_4B`` and the
+    per-variant docstrings for the schedule trade-off.
+
+    Args:
+        gathered: Token embeddings sorted by expert [N, in]
+        Wstack: Expert weight matrices [E, out, in]
+        row_expert: Expert ID for each row in gathered [N]
+
+    Returns:
+        out: Result [N, out]
+    """
+    if _MOE_GEMM_4B:
+        return _grouped_gemm_4b(gathered, Wstack, row_expert)
+    return _grouped_gemm_4a(gathered, Wstack, row_expert)
 
 
 def _moe_ffn(x, W_router, gate_up_proj, down_proj, per_expert_scale, K):

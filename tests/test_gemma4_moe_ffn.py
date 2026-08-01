@@ -14,7 +14,14 @@
 
 import torch
 import torch.nn.functional as F
-from hf_adapters.hf_gemma4_moe import _moe_route, _moe_permute, _moe_ffn
+from hf_adapters import hf_gemma4_moe
+from hf_adapters.hf_gemma4_moe import (
+    _grouped_gemm_4a,
+    _grouped_gemm_4b,
+    _moe_ffn,
+    _moe_permute,
+    _moe_route,
+)
 
 
 def test_route_shapes_and_renorm():
@@ -66,6 +73,49 @@ def _ref_moe(x, W_router, gate_up, down, scale, K):
 
 
 def test_moe_ffn_matches_reference():
+    T, H, E, K, M = 4, 16, 8, 2, 5
+    x = torch.randn(T, H)
+    W_router = torch.randn(E, H)
+    gate_up = torch.randn(E, 2 * M, H)
+    down = torch.randn(E, H, M)
+    scale = torch.rand(E) + 0.5
+    ref = _ref_moe(x, W_router, gate_up, down, scale, K)
+    got = _moe_ffn(x, W_router, gate_up, down, scale, K)
+    torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+
+def test_grouped_gemm_4a_4b_agree():
+    # Option 4B (contiguous per-expert-segment slab GEMM) must be numerically
+    # identical to the shipped 4A (per-row weight gather). Rows must be sorted
+    # by expert (the _moe_permute invariant 4B relies on).
+    torch.manual_seed(0)
+    N, IN, OUT, E = 11, 6, 5, 4
+    gathered = torch.randn(N, IN)
+    Wstack = torch.randn(E, OUT, IN)
+    row_expert = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2, 3, 3, 3])
+    out_4a = _grouped_gemm_4a(gathered, Wstack, row_expert)
+    out_4b = _grouped_gemm_4b(gathered, Wstack, row_expert)
+    torch.testing.assert_close(out_4a, out_4b, atol=1e-5, rtol=1e-5)
+
+
+def test_grouped_gemm_4b_handles_empty_experts():
+    # Experts that receive no rows leave an empty segment; 4B must skip them
+    # and still match 4A.
+    torch.manual_seed(1)
+    N, IN, OUT, E = 6, 4, 3, 5
+    gathered = torch.randn(N, IN)
+    Wstack = torch.randn(E, OUT, IN)
+    # experts 1 and 3 get no rows
+    row_expert = torch.tensor([0, 0, 2, 2, 4, 4])
+    out_4a = _grouped_gemm_4a(gathered, Wstack, row_expert)
+    out_4b = _grouped_gemm_4b(gathered, Wstack, row_expert)
+    torch.testing.assert_close(out_4a, out_4b, atol=1e-5, rtol=1e-5)
+
+
+def test_moe_ffn_matches_reference_under_4b_flag(monkeypatch):
+    # The full FFN under the 4B flag must match the dense reference exactly as
+    # the 4A path does (same numerics, different weight-load schedule).
+    monkeypatch.setattr(hf_gemma4_moe, "_MOE_GEMM_4B", True)
     T, H, E, K, M = 4, 16, 8, 2, 5
     x = torch.randn(T, H)
     W_router = torch.randn(E, H)
