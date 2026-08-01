@@ -586,6 +586,14 @@ def prepare_for_spyre(model):
         f"MoE bring-up pins top_k_experts to {_MOE_BRINGUP_K}; "
         f"got {cfg.top_k_experts}."
     )
+    # The expert SwiGLU hardcodes gelu(approximate="tanh") to match this
+    # checkpoint's hidden_activation. Guard so a variant with a different
+    # activation fails loudly instead of computing silently-wrong output.
+    act_fn = getattr(cfg, "hidden_activation", None)
+    assert act_fn == "gelu_pytorch_tanh", (
+        "hf_gemma4_moe expert SwiGLU is fixed to gelu(approximate='tanh'); "
+        f"config hidden_activation={act_fn!r} is unsupported."
+    )
 
     num_q_heads, kv_shapes, is_kv_eq_v_per_layer = _setup_gemma4_text_decoder(
         model, allow_moe=True
