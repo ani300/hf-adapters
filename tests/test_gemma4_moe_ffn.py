@@ -20,6 +20,7 @@ from hf_adapters.hf_gemma4_moe import (
     _grouped_gemm_4a,
     _grouped_gemm_4b,
     _moe_ffn,
+    _moe_ffn_loop,
     _moe_ffn_loop_ref,
     _moe_permute,
     _moe_route,
@@ -184,3 +185,43 @@ def test_compiled_moe_loop_region_matches_reference_eager():
         x, W_router, gate_up_t, down_t, per_expert_scale, K, x_router=x_normed
     )
     assert torch.allclose(combined, ref, atol=1e-4, rtol=1e-4)
+
+
+def test_moe_ffn_loop_orchestrator_matches_reference():
+    """_moe_ffn_loop (host combine + region) equals _moe_ffn_loop_ref on CPU."""
+    import types
+    torch.manual_seed(2)
+    T, H, E, M, K = 6, 16, 8, 12, 4
+    x = torch.randn(T, H)
+    W_router = torch.randn(E, H)
+    gate_up_t = torch.randn(E, H, 2 * M)
+    down_t = torch.randn(E, M, H)
+    per_expert_scale = torch.rand(E) + 0.5
+
+    # Minimal router stub with the PREFLIGHT-CORRECTED Gemma4TextRouter surface:
+    # norm has NO .weight (scale-free); scale is an [H] vector Parameter;
+    # scalar_root_size is a float. Neutral values (scale=ones, root_size=1.0)
+    # so the orchestrator's router preprocessing reduces to a plain scale-free
+    # RMSNorm, matched below via _moe_ffn_loop_ref's x_router seam.
+    router = types.SimpleNamespace(
+        scale=torch.ones(H),
+        scalar_root_size=1.0,
+        proj=types.SimpleNamespace(weight=W_router),
+        per_expert_scale=per_expert_scale,
+    )
+
+    def compiled_loop(*args):
+        return _compiled_moe_loop_region(*args)
+
+    got = _moe_ffn_loop(
+        x, x, router, compiled_loop, gate_up_t, down_t, K, tile=4, eps=1e-6
+    )
+    # Feed the reference the SAME router-preprocessed input the region computes
+    # (scale-free RMSNorm; scale=ones and root_size=1.0 add nothing) so routing
+    # is identical and only the expert FFN math is under test.
+    var = x.pow(2).mean(-1, keepdim=True)
+    x_normed = x * torch.rsqrt(var + 1e-6)
+    ref = _moe_ffn_loop_ref(
+        x, W_router, gate_up_t, down_t, per_expert_scale, K, x_router=x_normed
+    )
+    assert torch.allclose(got, ref, atol=1e-4, rtol=1e-4)

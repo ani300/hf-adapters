@@ -91,6 +91,14 @@ _MOE_GEMM_4B = False
 # loops over ceil(N/_MOE_TILE) tiles; a tuning knob (scratchpad window size).
 _MOE_TILE = 32
 
+# Device-FFN formulation selector (spec Approach A).
+#   False (default) -> shipped host-split path (_moe_ffn_split): experts
+#       host-resident, per-row weight select on CPU, [N,.] slices to device.
+#   True            -> loop-on-topk path (_moe_ffn_loop): experts HBM-resident
+#       on device, on-device index_select under a row-tiled spyre_hint.
+# Flip to True only after gateA_loop_on_topk.py passes on-card.
+_MOE_LOOP_ON_TOPK = False
+
 
 def _moe_route(x, W_router, per_expert_scale, K):
     """Route tokens to top-K experts with softmax and per-expert scaling.
@@ -531,6 +539,46 @@ def _moe_ffn_split(
     return out.to(dtype=x_expert.dtype, device=x_expert.device)
 
 
+def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_up_dev,
+                  down_dev, K, tile, eps):
+    """Loop-on-topk MoE FFN orchestrator (spec Approach A).
+
+    Unpacks the router's tensors, calls the compiled loop region (router +
+    gather + on-device expert-weight index_select + bmms, row-tiled), then does
+    the host index_add scatter-combine (scatter does not lower on device). The
+    expert stacks are DEVICE-resident here (unlike _moe_ffn_split's host-
+    resident stacks) -- the whole point of Approach A is the on-device select.
+
+    Router surface (preflight-corrected): router.norm has NO .weight; the
+    region applies a scale-free RMSNorm (eps INSIDE sqrt) then the [H]
+    router.scale vector and the router.scalar_root_size float. Pass
+    eps=config.rms_norm_eps.
+
+    Returns the combined [T,H] MoE output on x_expert's device.
+    """
+    T, H = x_expert.shape
+    token_ids = torch.arange(T, device=x_expert.device, dtype=torch.int32)
+    row_out, token_of_row = compiled_loop(
+        x_router,
+        x_expert,
+        router.proj.weight,
+        router.scale,
+        router.scalar_root_size,
+        router.per_expert_scale,
+        gate_up_dev,
+        down_dev,
+        token_ids,
+        K,
+        tile,
+        eps,
+    )
+    row_out = row_out.cpu().float()
+    token_of_row = token_of_row.cpu().long()
+    out = torch.zeros(T, H, dtype=torch.float32)
+    out = out.index_add(0, token_of_row, row_out)
+    return out.to(dtype=x_expert.dtype, device=x_expert.device)
+
+
 def _make_moe_block(layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
     """Build one Gemma 4 **MoE** decoder-layer block callable.
 
@@ -584,6 +632,7 @@ def _make_moe_block(layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
     pre_ff_ln_2 = layer.pre_feedforward_layernorm_2  # MoE pre-norm (on residual)
     post_ff_ln_2 = layer.post_feedforward_layernorm_2  # MoE post-norm
     K = layer._spyre_moe_k
+    moe_rms_eps = pre_ff_ln_2.variance_epsilon  # == config.rms_norm_eps
     # The pre-transposed expert-weight stacks (``_spyre_gate_up_t`` [E,H,2M],
     # ``_spyre_down_t`` [E,M,H]) are laid down by ``prepare_for_spyre`` (shape
     # rule 2 + expert-dim-outermost, spec §3.5) as PLAIN CPU ATTRIBUTES that the
@@ -597,6 +646,7 @@ def _make_moe_block(layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
     compiled_mlp = torch.compile(mlp, dynamic=False)
     compiled_gather = torch.compile(_compiled_device_gather, dynamic=False)
     compiled_expert = torch.compile(_compiled_moe_device_region, dynamic=False)
+    compiled_loop = torch.compile(_compiled_moe_loop_region, dynamic=False)
     compiled_attn = torch.compile(_gemma4_attention, dynamic=False)
 
     def block_forward(
@@ -652,16 +702,29 @@ def _make_moe_block(layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
         # factory note: they are plain CPU attributes set by prepare_for_spyre,
         # not captured here — _moe_ffn_split selects per-row on CPU then moves
         # the [N,·] slice to the device for the compiled GEMM).
-        moe_out = _moe_ffn_split(
-            flat,
-            x_moe,
-            router,
-            compiled_gather,
-            compiled_expert,
-            layer._spyre_gate_up_t,
-            layer._spyre_down_t,
-            K,
-        )  # [T,H]
+        if _MOE_LOOP_ON_TOPK:
+            moe_out = _moe_ffn_loop(
+                flat,
+                x_moe,
+                router,
+                compiled_loop,
+                layer._spyre_gate_up_dev,
+                layer._spyre_down_dev,
+                K,
+                _MOE_TILE,
+                moe_rms_eps,
+            )  # [T,H]
+        else:
+            moe_out = _moe_ffn_split(
+                flat,
+                x_moe,
+                router,
+                compiled_gather,
+                compiled_expert,
+                layer._spyre_gate_up_t,
+                layer._spyre_down_t,
+                K,
+            )  # [T,H]
         moe_out = moe_out.reshape(bsz, seq_len, hidden)
         h_moe = post_ff_ln_2(moe_out)
 
@@ -743,13 +806,23 @@ def prepare_for_spyre(model):
     # experts are not paid for twice on the host either.
     for layer in backbone.layers:
         experts = layer.experts
-        # gate_up_proj: [E, 2M, H] -> [E, H, 2M]; down_proj: [E, H, M] -> [E, M, H]
+        # gate_up_proj: [E,2M,H] -> [E,H,2M]; down_proj: [E,H,M] -> [E,M,H].
         gate_up_t = experts.gate_up_proj.data.transpose(1, 2).contiguous()
         down_t = experts.down_proj.data.transpose(1, 2).contiguous()
-        del experts.gate_up_proj  # drop originals; only the transposed CPU
-        del experts.down_proj  # stacks below are kept, and only on the host
-        layer._spyre_gate_up_t = gate_up_t.cpu()  # [E,H,2M] host-resident
-        layer._spyre_down_t = down_t.cpu()  # [E,M,H] host-resident
+        del experts.gate_up_proj
+        del experts.down_proj
+        if _MOE_LOOP_ON_TOPK:
+            # Approach A: experts HBM-RESIDENT on device, E outermost. Row-major
+            # [E,H,2M]/[E,M,H] is E-outermost (enforce_indirect_access: indexed
+            # dim at device position 0) AND stick-correct for the bmm weight
+            # operand (2M / H is the generated dim on the stick) -> zero
+            # restickify. Move explicitly (plain attrs are not in the buffer
+            # sweep).
+            layer._spyre_gate_up_dev = gate_up_t.to("spyre")  # [E,H,2M]
+            layer._spyre_down_dev = down_t.to("spyre")  # [E,M,H]
+        else:
+            layer._spyre_gate_up_t = gate_up_t.cpu()  # [E,H,2M] host-resident
+            layer._spyre_down_t = down_t.cpu()  # [E,M,H] host-resident
         layer._spyre_moe_k = _MOE_BRINGUP_K
 
     model._spyre_compiled_blocks = [
