@@ -37,17 +37,88 @@ soon as the primitive is available.
 
 ## B-Stage 1 — grouping on host CPU
 
-Reuses the existing (working) `_moe_permute` / `_group_offsets`:
-- `argsort(expert_of_row) → sort_perm`; `gathered_sorted = gathered[sort_perm]`;
-  `row_expert_sorted` non-decreasing.
-- `group_off = cumsum(bincount(expert_of_row, E)) → [E+1]` segment boundaries.
-- **Fixed-tile contract:** trip count must be a compile-time constant. Since
-  per-expert segment sizes are data-dependent, Stage 1 defines a
-  **capacity/padding scheme**: pad each expert's segment up to a multiple of
-  `TILE` (segments TILE-aligned) so the loop is `N_TILES = N_pad/TILE` static
-  iterations and **each tile belongs to exactly one expert**. The offset
-  table (`group_off` plus per-tile `tile_expert [N_TILES]`) is the
-  host→device side-channel.
+### What "grouping" means, from scratch
+
+The router has already run. For each of the `T` tokens it picked `K` experts,
+so there are `N = T·K` **(token, expert) pairs** to compute. Two flat arrays
+describe them, both length `N`, in the same order:
+
+- `token_of_row[i]` — which token the `i`-th pair belongs to (values in `0..T-1`,
+  each appearing exactly `K` times).
+- `expert_of_row[i]` — which expert the `i`-th pair routes to (values in
+  `0..E-1`, `E = 128`; arbitrary, data-dependent, in no particular order).
+
+Approach A computes these `N` pairs in their natural (per-token) order, and so
+must fetch a fresh expert weight slab for **every row** — even when two adjacent
+rows happen to use the same expert. Grouping removes that waste by physically
+**reordering the rows so that all rows routed to the same expert sit next to
+each other**. Once the rows are expert-contiguous, a tile of consecutive rows is
+guaranteed to share one expert, so the program fetches that expert's weight slab
+**once per tile** instead of once per row.
+
+Grouping is three plain array operations — no model knowledge, just sorting a
+list of integers and recording where the runs begin and end:
+
+1. **Sort the pairs by expert.** Compute the permutation that would sort
+   `expert_of_row` into non-decreasing order — i.e. for each output position,
+   which input row lands there. Call it `sort_perm [N]`. (In PyTorch this is
+   `sort_perm = argsort(expert_of_row)`.) Applying `sort_perm` to the row arrays
+   gives the reordered views:
+   - `expert_sorted = expert_of_row[sort_perm]` — now non-decreasing, e.g.
+     `[0,0,0,2,2,5,5,5,5,…]`: all of expert 0's rows, then all of expert 2's,
+     and so on. Experts that got no rows simply don't appear.
+   - `gathered_sorted = activations[sort_perm]` — the token activations
+     reordered to match, so row `i` of `gathered_sorted` is the input for the
+     expert named in `expert_sorted[i]`.
+   - `token_of_row_sorted = token_of_row[sort_perm]` — kept so the final result
+     can be scattered back to the right token.
+
+2. **Count how many rows each expert got.** Tally the sorted expert list into a
+   length-`E` histogram: `counts[e]` = number of rows routed to expert `e`
+   (`counts = bincount(expert_sorted, minlength=E)`). With top-8 over 128
+   experts and a typical prompt, most counts are small and some are zero.
+
+3. **Turn counts into segment boundaries.** Take the running (prefix) sum of the
+   counts, prepended with a leading `0`, giving `group_off [E+1]`
+   (`group_off[0]=0`; `group_off[1:] = cumsum(counts)`). Then expert `e` owns
+   exactly the contiguous row range `group_off[e] : group_off[e+1]` of the
+   sorted arrays — that half-open interval is expert `e`'s **segment**. An
+   expert with `counts[e]==0` has `group_off[e]==group_off[e+1]` (an empty
+   segment).
+
+Worked micro-example (`T=3`, `K=2`, so `N=6`, and suppose `E=6`):
+
+```
+expert_of_row      = [2, 0, 2, 5, 0, 2]      # token0→{2,0}, token1→{2,5}, token2→{0,2}
+sort_perm          = [1, 4, 0, 2, 5, 3]      # positions of experts 0,0,2,2,2,5
+expert_sorted      = [0, 0, 2, 2, 2, 5]      # non-decreasing after the sort
+counts (E=6)       = [2, 0, 3, 0, 0, 1]      # expert0:2 rows, expert2:3, expert5:1
+group_off (E+1=7)  = [0, 2, 2, 5, 5, 5, 6]   # expert2 owns 2:5, expert5 owns 5:6
+```
+
+So expert 2's segment is `group_off[2]:group_off[3] = 2:5` — rows 2, 3, 4 of the
+sorted block, all of which need expert 2's weights fetched exactly once.
+
+(The adapter already ships these three steps as `_moe_permute` (step 1) and
+`_group_offsets` (steps 2–3); the algorithm above is the whole of what they do —
+you do not need to read that code to implement or review this spec.)
+
+### From variable-size segments to a fixed-trip static loop
+
+- **Fixed-tile contract:** the device loop's trip count must be a compile-time
+  constant, but per-expert segment sizes are data-dependent (they change with
+  every prompt). Stage 1 bridges this with a **capacity/padding scheme**: round
+  each expert's segment size **up to a multiple of `TILE`** rows, inserting
+  padding rows so that every segment is `TILE`-aligned and **no tile ever
+  straddles two experts**. After padding, the block has `N_pad` rows and the
+  loop is exactly `N_TILES = N_pad / TILE` static iterations — one expert per
+  tile, known at compile time.
+- **The host→device side-channel.** Two small integer tables travel from host
+  to device alongside the reordered activations: `group_off [E+1]` (the segment
+  boundaries above) and `tile_expert [N_TILES]` (for each padded tile, the
+  single expert id it belongs to). The device program reads `tile_expert[tile]`
+  to know which weight slab to fetch for the current tile; padding rows
+  contribute nothing to the scatter-combine.
 
 Device static program (single program, hint-looped over `N_TILES`):
 
@@ -61,7 +132,8 @@ with spyre_hint(tiles={"row": TILE}):
 
 Win vs. Approach A: **one weight slab per tile** (expert constant within a
 tile) plus `per_tile_fixed` marks it loop-invariant (loaded once — see
-deliverable #3 below).
+deliverable #3 below). Approach A fetches a slab per row; grouping fetches a
+slab per `TILE` rows.
 
 ## B-Stage 2 — grouping on the RISC-V CPU inside Spyre
 
