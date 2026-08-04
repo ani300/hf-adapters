@@ -22,6 +22,21 @@
 - **Every source file** carries the Apache 2.0 header already present in the repo. **Line length ≤ 88 chars.**
 - **The existing shipped path** (`_moe_ffn_split`, host-resident experts, per-row select) is retained behind a flag until the loop path passes its on-card gate; do not delete it in the same task that adds the new path.
 
+- **VERIFIED router attribute surface + math (preflight-checked against transformers 5.12.1 `modeling_gemma4.py`, both a probe and an independent skeptic agreeing — this CORRECTS the design spec's shorthand).** The stock `Gemma4TextRouter` on a decoder layer:
+  - **`layer.router.norm` is `Gemma4RMSNorm(H, with_scale=False)` — it has NO `.weight` attribute.** Do NOT read `layer.router.norm.weight` (AttributeError). The norm is pure scale-free RMSNorm with **eps INSIDE the sqrt** (Gemma variant): `x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)` in fp32, `eps = config.rms_norm_eps`. **No `+1` gain.**
+  - **`layer.router.scale` is an `nn.Parameter` of shape `[H]` (a per-channel vector), NOT a scalar** — applied elementwise AFTER the norm.
+  - **`layer.router.scalar_root_size` is a Python float** `= hidden_size ** -0.5`.
+  - **Exact router order:** `normed = rmsnorm_scalefree(x); normed = normed * scale[H] * scalar_root_size; logits = proj(normed); probs = softmax(logits,-1); w,idx = topk(probs, K); w = w / w.sum(-1,keepdim=True); w = w * per_expert_scale[idx]`.
+  - `layer.router.proj.weight` is `[E,H]`; `layer.router.per_expert_scale` is `[E]`. (These match the spec.)
+  - `layer.router.forward` returns a **3-tuple** `(router_probabilities, top_k_weights, top_k_index)` — a 2-value unpack breaks. (We inline the math, so we don't call it, but any code that does must unpack 3.)
+- **VERIFIED experts layout:** `layer.experts.gate_up_proj` is **fused** `[E,2M,H]` (chunk into `(gate,up)` AFTER the linear, `chunk(2,dim=-1)`); `layer.experts.down_proj` is `[E,H,M]`. Our pre-transpose (`prepare_for_spyre`) turns these into `[E,H,2M]`/`[E,M,H]`; the fused-then-chunk order is preserved by chunking the `2M` output of the gate/up bmm.
+- **VERIFIED on-device-gather guardrails (preflight UNCERTAIN — the very assumptions the on-card gate exists to settle):**
+  - The on-device fancy-index `Wstack[ids]` gather is **compiled-only** (eager `aten::index.Tensor` raises `NotImplementedError`) — it MUST sit inside the compiled region, never run eager on device tensors. (It already does, inside the `spyre_hint` region.)
+  - **Never a single-row (P=1) index** — `test_advanced_indexing_single_row` SIGABRTs in dxp_standalone (`layoutDimOrder_.empty()`). The row tile must be P>1 (`_MOE_TILE ≥ 2`; default 32 is fine). The gate at K=4 with T≥16 gives N=T·K≥64 rows, tiled ≥2 per tile — compliant.
+  - On-device gather **correctness** at our shapes is NOT proven by the torch-spyre suite (every indirect-gather e2e test is `expect_close=None` → `xfail` on divergence; `test_moe` is skipped for output-span overflow). This is the "assume it works" assumption; **the on-card gate (Task 4) is the sole oracle. If it diverges or aborts, STOP and report — do not add a host fallback.**
+- **VERIFIED residency mechanism:** a plain (non-Parameter, non-buffer) attribute holding a `.to("spyre")` tensor IS left device-resident by `hf_common._move_to_spyre_with_layout` (it sweeps only `named_parameters()`/`named_buffers()`), and a device tensor is a valid `bmm` operand. So `layer._spyre_gate_up_dev = t.to("spyre")` is sound plumbing. (Capacity caveat: all 128×30 experts resident ≈46 GB fp16 — the single-layer gate touches one layer, so it fits; full-model residency is a separate scaling concern, out of scope for the gate.)
+- **VERIFIED layout hazard:** the real restickify risk is an **in-graph `.transpose`** of a weight (forces a huge-offset restickify → `L3_ADDEARIMM` "immediate out of boundary" abort), NOT the E-outermost property per se. Mitigation: supply weights **pre-transposed** by construction (`prepare_for_spyre`), never transpose in-graph. E-outermost + stick-on-generated-dim are compatible on the row-major layout; "zero restickify" is expected but not fully proven — the gate's compile artifacts confirm it.
+
 ---
 
 ### Task 1: CPU reference for the loop-on-topk FFN math
@@ -32,9 +47,9 @@
 
 **Interfaces:**
 - Consumes: existing `_moe_route(x, W_router, per_expert_scale, K) -> (w[T,K], idx[T,K])` (line 90).
-- Produces: `_moe_ffn_loop_ref(x, W_router, gate_up_t, down_t, per_expert_scale, K) -> [T,H]` — a pure-CPU fp32 reference that computes the MoE FFN in the **loop-on-topk row order** (NO expert sorting/grouping), so it is the numeric oracle for the new device region. `gate_up_t` is `[E,H,2M]`, `down_t` is `[E,M,H]` (pre-transposed, matching the device layout).
+- Produces: `_moe_ffn_loop_ref(x, W_router, gate_up_t, down_t, per_expert_scale, K, x_router=None) -> [T,H]` — a pure-CPU fp32 reference that computes the MoE FFN in the **loop-on-topk row order** (NO expert sorting/grouping), so it is the numeric oracle for the new device region. `gate_up_t` is `[E,H,2M]`, `down_t` is `[E,M,H]` (pre-transposed, matching the device layout). `x_router` is the **already-preprocessed router input** (scale-free RMSNorm → `*scale[H]*root_size`); when `None` it defaults to `x` (so the plain `test_moe_ffn_loop_ref_matches_dense_reference` test routes on raw `x`). The expert FFN always reads `x`, never `x_router` — routing and expert input are threaded separately (the double-normalization rule).
 
-This reference deliberately mirrors the device dataflow (per-row weight select in topk order, no argsort) so Task 2's region and Task 4's gate compare against identical math.
+This reference deliberately mirrors the device dataflow (per-row weight select in topk order, no argsort) so Task 2's region and Task 4's gate compare against identical math. The `x_router` seam exists so Task 2's region test and Task 4's gate can feed the reference the SAME router-preprocessed input the device region computes, making router math cancel out of the comparison.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -77,7 +92,9 @@ Expected: FAIL with `NameError`/`AttributeError` — `_moe_ffn_loop_ref` not def
 Add to `hf_adapters/hf_gemma4_moe.py`:
 
 ```python
-def _moe_ffn_loop_ref(x, W_router, gate_up_t, down_t, per_expert_scale, K):
+def _moe_ffn_loop_ref(
+    x, W_router, gate_up_t, down_t, per_expert_scale, K, x_router=None
+):
     """CPU fp32 reference for the loop-on-topk MoE FFN (no expert grouping).
 
     Mirrors the on-device dataflow: route to top-K, flatten the [T,K] result to
@@ -86,18 +103,24 @@ def _moe_ffn_loop_ref(x, W_router, gate_up_t, down_t, per_expert_scale, K):
     scatter-add back to [T,H]. The numeric oracle for _compiled_moe_loop_region.
 
     Args:
-        x: Token embeddings [T, H]
-        W_router: Router weights [E, H]
-        gate_up_t: Pre-transposed gate_up per expert [E, H, 2M]
-        down_t: Pre-transposed down per expert [E, M, H]
-        per_expert_scale: Per-expert scale [E]
-        K: Top-K experts per token
+        x: Expert-FFN input token embeddings [T, H] (fed to the experts).
+        W_router: Router projection weights [E, H].
+        gate_up_t: Pre-transposed gate_up per expert [E, H, 2M].
+        down_t: Pre-transposed down per expert [E, M, H].
+        per_expert_scale: Per-expert scale [E].
+        K: Top-K experts per token.
+        x_router: Router input [T, H] (already RMSNorm/scale-preprocessed). When
+            None, defaults to x. Routing uses x_router; the experts always read
+            x -- router and expert inputs are threaded separately (the double-
+            normalization rule from the design spec).
 
     Returns:
-        out: MoE FFN output [T, H]
+        out: MoE FFN output [T, H].
     """
     T, H = x.shape
-    w, idx = _moe_route(x, W_router, per_expert_scale, K)  # [T,K],[T,K]
+    if x_router is None:
+        x_router = x
+    w, idx = _moe_route(x_router, W_router, per_expert_scale, K)  # [T,K],[T,K]
     expert_of_row = idx.reshape(-1)  # [N] N=T*K, topk order (NOT sorted)
     token_of_row = (torch.arange(T * K, device=x.device) // K)  # [N]
     row_w = w.reshape(-1, 1)  # [N,1]
@@ -143,9 +166,10 @@ git commit -m "feat: gemma4 MoE loop-on-topk CPU reference (_moe_ffn_loop_ref)"
 
 **Interfaces:**
 - Consumes: nothing from other tasks (self-contained device fn).
-- Produces: `_compiled_moe_loop_region(x_router, x_expert, router_proj_w, router_norm_weight, router_scale, router_scalar_root_size, per_expert_scale, gate_up_dev, down_dev, token_ids, K, tile) -> row_out[N,H]` — the compiled region computing router→topk→gather→index_select→bmm→gelu→bmm→row-weight, tiled on the row axis. Returns per-row weighted expert outputs `[N,H]` **and** `token_of_row[N]` so the host can scatter-combine. Signature returns `(row_out, token_of_row)`.
+- Produces: `_compiled_moe_loop_region(x_router, x_expert, router_proj_w, router_scale, router_scalar_root_size, per_expert_scale, gate_up_dev, down_dev, token_ids, K, tile, eps) -> (row_out[N,H], token_of_row[N])` — the compiled region computing router→topk→gather→index_select→bmm→gelu→bmm→row-weight, tiled on the row axis. Returns per-row weighted expert outputs `[N,H]` **and** `token_of_row[N]` so the host can scatter-combine.
+  - **NOTE (preflight-corrected):** there is NO `router_norm_weight` parameter — the stock `Gemma4TextRouter.norm` is `with_scale=False` and has no `.weight`. The router norm is scale-free RMSNorm (eps INSIDE sqrt); the learnable gain is `router_scale`, an `[H]` vector applied AFTER the norm; `router_scalar_root_size` is a float. `eps` is passed in (`config.rms_norm_eps`) rather than hardcoded.
 
-This region is written as **single tiled ops under one `spyre_hint(tiles={"row": tile})`** — there is NO Python `for` loop over tiles (the hint generates the loop; `coarse_tile._apply_plan` + `scheduler.py:677 LoopSpec`). The router math is inlined (not via `router` module) so the whole region is one compilable function of plain tensors.
+This region is written as **single tiled ops under one `spyre_hint(tiles={"row": tile})`** — there is NO Python `for` loop over tiles (the hint generates the loop; `coarse_tile._apply_plan` + `scheduler.py:677 LoopSpec`). The router math is inlined (not via `router` module) so the whole region is one compilable function of plain tensors. **The `spyre_hint` CPU-eager no-op behavior is preflight-verified** (`is_compiling()` is False in eager → the Dynamo path is skipped → ordinary aten ops run untouched), so Step 1's CPU-eager equivalence test is valid.
 
 - [ ] **Step 1: Write the failing test (CPU-eager equivalence to the reference)**
 
@@ -163,17 +187,23 @@ def test_compiled_moe_loop_region_matches_reference_eager():
     per_expert_scale = torch.rand(E) + 0.5
     token_ids = torch.arange(T)
 
-    # Region uses raw router math with an identity norm (norm handled by caller
-    # in the real block); pass norm_weight=ones, scale=1, root_size=1 so the
-    # region's inlined router equals _moe_route's F.linear(x, W_router).
+    # The region and the reference share the SAME router math. To make them
+    # agree, drive the region with scale=ones(H), root_size=1.0, eps=1e-6, and
+    # give _moe_ffn_loop_ref the SAME router preprocessing via its x_router arg
+    # (the reference applies F.linear to x_router, so pass the region's normed
+    # input). Both then route identically; only the expert FFN math is compared.
     row_out, token_of_row = _compiled_moe_loop_region(
         x, x, W_router,
-        torch.ones(H), 1.0, 1.0,
-        per_expert_scale, gate_up_t, down_t, token_ids, K, tile=4,
+        torch.ones(H), 1.0,
+        per_expert_scale, gate_up_t, down_t, token_ids, K, tile=4, eps=1e-6,
     )
     combined = torch.zeros(T, H).index_add(0, token_of_row.long(), row_out)
 
-    ref = _moe_ffn_loop_ref(x, W_router, gate_up_t, down_t, per_expert_scale, K)
+    var = x.pow(2).mean(-1, keepdim=True)
+    x_normed = x * torch.rsqrt(var + 1e-6)  # == region's scale-free RMSNorm
+    ref = _moe_ffn_loop_ref(
+        x, W_router, gate_up_t, down_t, per_expert_scale, K, x_router=x_normed
+    )
     assert torch.allclose(combined, ref, atol=1e-4, rtol=1e-4)
 ```
 
@@ -200,7 +230,6 @@ def _compiled_moe_loop_region(
     x_router,
     x_expert,
     router_proj_w,
-    router_norm_weight,
     router_scale,
     router_scalar_root_size,
     per_expert_scale,
@@ -209,18 +238,26 @@ def _compiled_moe_loop_region(
     token_ids,
     K,
     tile,
+    eps,
 ):
     """Whole MoE FFN on-device except the scatter-combine (spec Approach A).
 
-    Router (inlined scale-free RMSNorm on the RAW residual x_router, * scale *
-    root_size, then proj) -> softmax -> topk(K) -> renorm -> per_expert_scale;
-    then, under a single spyre_hint(tiles={"row": tile}) that tiles the N=T*K
-    row axis (the hint IS the loop -- no Python for), gather the expert-input
-    rows from x_expert, index_select the per-row expert weights from the
-    HBM-resident E-outermost stacks, two bmms (3D [*,1,*] throughout) with a
-    gelu-tanh SwiGLU, and weight by the router weight.
+    Router (inlined SCALE-FREE RMSNorm on the RAW residual x_router with eps
+    INSIDE the sqrt, then * router_scale[H] * router_scalar_root_size, then
+    proj) -> softmax -> topk(K) -> renorm -> per_expert_scale; then, under a
+    single spyre_hint(tiles={"row": tile}) that tiles the N=T*K row axis (the
+    hint IS the loop -- no Python for), gather the expert-input rows from
+    x_expert, index_select the per-row expert weights from the HBM-resident
+    E-outermost stacks, two bmms (3D [*,1,*] throughout) with a gelu-tanh
+    SwiGLU, and weight by the router weight.
+
+    Preflight-corrected router surface: the stock router.norm has NO .weight
+    (Gemma4RMSNorm with_scale=False); the learnable gain is router_scale, an
+    [H] vector applied AFTER the scale-free norm. router_scalar_root_size is a
+    Python float (hidden_size ** -0.5). eps is config.rms_norm_eps.
 
     gate_up_dev: [E,H,2M] (stick=2M), down_dev: [E,M,H] (stick=H), E outermost.
+    tile must be >= 2 (single-row P=1 gather SIGABRTs in dxp_standalone).
     Returns (row_out[N,H], token_of_row[N]) for the host index_add combine.
     """
     from torch_spyre._inductor.propagate_hints import spyre_hint
@@ -228,11 +265,11 @@ def _compiled_moe_loop_region(
     T, H = x_expert.shape
     N = T * K
 
-    # --- router (all device-lowerable): scale-free RMSNorm on the RAW residual
+    # --- router (all device-lowerable): SCALE-FREE RMSNorm (eps inside sqrt)
+    # on the RAW residual, then the [H] scale vector and the root-size scalar.
     var = x_router.pow(2).mean(-1, keepdim=True)
-    normed = x_router * torch.rsqrt(var + 1e-6)
-    normed = normed * router_norm_weight
-    normed = normed * router_scale * router_scalar_root_size
+    normed = x_router * torch.rsqrt(var + eps)  # scale-free (no gain in norm)
+    normed = normed * router_scale * router_scalar_root_size  # scale is [H]
     logits = F.linear(normed, router_proj_w)  # [T,E]
     probs = torch.softmax(logits, dim=-1)
     w, idx = torch.topk(probs, K, dim=-1)  # [T,K],[T,K]  ASSUMED to lower
@@ -280,8 +317,8 @@ git commit -m "feat: gemma4 MoE loop-on-topk compiled device region (row-tiled)"
 - Test: `tests/test_gemma4_moe_ffn.py`
 
 **Interfaces:**
-- Consumes: `_compiled_moe_loop_region(...)` (Task 2); existing `_make_moe_block` (line 416), `prepare_for_spyre` (line 559), the `layer.router` submodule attributes (`router.norm.weight`, `router.scale`, `router.scalar_root_size`, `router.proj.weight`, `router.per_expert_scale`).
-- Produces: `_moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_up_dev, down_dev, K, tile) -> [T,H]` — host orchestrator that calls the compiled loop region (passing the router's unpacked tensors + device-resident expert stacks) and does the host `index_add` combine. Sets, when `_MOE_LOOP_ON_TOPK` is True, `layer._spyre_gate_up_dev`/`layer._spyre_down_dev` as **device-resident** pre-transposed stacks.
+- Consumes: `_compiled_moe_loop_region(...)` (Task 2); existing `_make_moe_block` (line 416), `prepare_for_spyre` (line 559), the `layer.router` submodule attributes (**preflight-corrected surface** — `router.proj.weight` `[E,H]`, `router.scale` `[H]` nn.Parameter, `router.scalar_root_size` float, `router.per_expert_scale` `[E]`, and `config.rms_norm_eps` for the norm eps). **There is NO `router.norm.weight`** (`Gemma4RMSNorm` is `with_scale=False`); do not read it.
+- Produces: `_moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_up_dev, down_dev, K, tile, eps) -> [T,H]` — host orchestrator that calls the compiled loop region (passing the router's unpacked tensors + device-resident expert stacks + `eps`) and does the host `index_add` combine. Sets, when `_MOE_LOOP_ON_TOPK` is True, `layer._spyre_gate_up_dev`/`layer._spyre_down_dev` as **device-resident** pre-transposed stacks.
 
 **Note:** the flag defaults **False** so the shipped host-split path is unchanged until the on-card gate (Task 4) validates the loop path. This task adds the loop path in parallel; it does not remove `_moe_ffn_split`.
 
@@ -301,10 +338,13 @@ def test_moe_ffn_loop_orchestrator_matches_reference():
     down_t = torch.randn(E, M, H)
     per_expert_scale = torch.rand(E) + 0.5
 
-    # Minimal router stub with the stock Gemma4TextRouter attribute surface.
+    # Minimal router stub with the PREFLIGHT-CORRECTED Gemma4TextRouter surface:
+    # norm has NO .weight (scale-free); scale is an [H] vector Parameter;
+    # scalar_root_size is a float. Neutral values (scale=ones, root_size=1.0)
+    # so the orchestrator's router preprocessing reduces to a plain scale-free
+    # RMSNorm, matched below via _moe_ffn_loop_ref's x_router seam.
     router = types.SimpleNamespace(
-        norm=types.SimpleNamespace(weight=torch.ones(H)),
-        scale=1.0,
+        scale=torch.ones(H),
         scalar_root_size=1.0,
         proj=types.SimpleNamespace(weight=W_router),
         per_expert_scale=per_expert_scale,
@@ -313,8 +353,17 @@ def test_moe_ffn_loop_orchestrator_matches_reference():
     def compiled_loop(*args):
         return _compiled_moe_loop_region(*args)
 
-    got = _moe_ffn_loop(x, x, router, compiled_loop, gate_up_t, down_t, K, tile=4)
-    ref = _moe_ffn_loop_ref(x, W_router, gate_up_t, down_t, per_expert_scale, K)
+    got = _moe_ffn_loop(
+        x, x, router, compiled_loop, gate_up_t, down_t, K, tile=4, eps=1e-6
+    )
+    # Feed the reference the SAME router-preprocessed input the region computes
+    # (scale-free RMSNorm; scale=ones and root_size=1.0 add nothing) so routing
+    # is identical and only the expert FFN math is under test.
+    var = x.pow(2).mean(-1, keepdim=True)
+    x_normed = x * torch.rsqrt(var + 1e-6)
+    ref = _moe_ffn_loop_ref(
+        x, W_router, gate_up_t, down_t, per_expert_scale, K, x_router=x_normed
+    )
     assert torch.allclose(got, ref, atol=1e-4, rtol=1e-4)
 ```
 
@@ -341,7 +390,7 @@ Add the orchestrator after `_moe_ffn_split`:
 
 ```python
 def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_up_dev,
-                  down_dev, K, tile):
+                  down_dev, K, tile, eps):
     """Loop-on-topk MoE FFN orchestrator (spec Approach A).
 
     Unpacks the router's tensors, calls the compiled loop region (router +
@@ -349,6 +398,10 @@ def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_up_dev,
     the host index_add scatter-combine (scatter does not lower on device). The
     expert stacks are DEVICE-resident here (unlike _moe_ffn_split's host-
     resident stacks) -- the whole point of Approach A is the on-device select.
+
+    Router surface (preflight-corrected): router.norm has NO .weight; the region
+    applies a scale-free RMSNorm (eps INSIDE sqrt) then the [H] router.scale
+    vector and the router.scalar_root_size float. Pass eps=config.rms_norm_eps.
 
     Returns the combined [T,H] MoE output on x_expert's device.
     """
@@ -358,7 +411,6 @@ def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_up_dev,
         x_router,
         x_expert,
         router.proj.weight,
-        router.norm.weight,
         router.scale,
         router.scalar_root_size,
         router.per_expert_scale,
@@ -367,6 +419,7 @@ def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_up_dev,
         token_ids,
         K,
         tile,
+        eps,
     )
     row_out = row_out.cpu().float()
     token_of_row = token_of_row.cpu().long()
@@ -375,10 +428,16 @@ def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_up_dev,
     return out.to(dtype=x_expert.dtype, device=x_expert.device)
 ```
 
-In `_make_moe_block`, after the existing `compiled_expert = torch.compile(...)` line (~481), add a compiled loop region and branch the sparse call:
+In `_make_moe_block`, after the existing `compiled_expert = torch.compile(...)` line (~481), add a compiled loop region:
 
 ```python
     compiled_loop = torch.compile(_compiled_moe_loop_region, dynamic=False)
+```
+
+The loop region needs the RMSNorm eps (`config.rms_norm_eps`). Capture it from the `pre_ff_ln_2` RMSNorm instance already bound in the factory (it is a `Gemma4RMSNorm`, so it carries `variance_epsilon == config.rms_norm_eps` — the same eps the scale-free router norm uses). Add near the other captured norms (~467):
+
+```python
+    moe_rms_eps = pre_ff_ln_2.variance_epsilon  # == config.rms_norm_eps
 ```
 
 and in `block_forward`, replace the single `moe_out = _moe_ffn_split(...)` call (~537-546) with a flag branch:
@@ -394,6 +453,7 @@ and in `block_forward`, replace the single `moe_out = _moe_ffn_split(...)` call 
                 layer._spyre_down_dev,
                 K,
                 _MOE_TILE,
+                moe_rms_eps,
             )  # [T,H]
         else:
             moe_out = _moe_ffn_split(
@@ -502,17 +562,31 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float16)
     layer = model.model.layers[0]
 
-    # fp32 CPU ground truth on a fixed random expert input, BEFORE prepare (the
-    # RMSNorm patch is global; capture the reference first).
+    # fp32 CPU ground truth on a fixed random input, BEFORE prepare (the RMSNorm
+    # patch is global; capture the reference first). K=4, N=T*K=256 (>1, tiled).
     torch.manual_seed(0)
-    T = cfg.text_config.hidden_size and 64  # small token count
+    T = 64  # small token count; N = T*K = 256 rows
     H = cfg.text_config.hidden_size
+    eps = cfg.text_config.rms_norm_eps
     x = torch.randn(T, H, dtype=torch.float32)
+
+    # Router preprocessing must match the device region EXACTLY: scale-free
+    # RMSNorm (eps inside sqrt) -> * scale[H] -> * scalar_root_size, THEN proj.
+    # Feed that preprocessed input to the reference via its x_router seam so the
+    # gate compares the expert FFN + on-device machinery, not router-math skew.
     W_router = layer.router.proj.weight.data.float()
+    router_scale = layer.router.scale.data.float()  # [H] vector, NOT scalar
+    root_size = float(layer.router.scalar_root_size)  # hidden_size ** -0.5
+    var = x.pow(2).mean(-1, keepdim=True)
+    x_router = x * torch.rsqrt(var + eps)  # scale-free RMSNorm
+    x_router = x_router * router_scale * root_size
+    # gate_up_proj is FUSED [E,2M,H]; transpose to [E,H,2M] (chunk stays post-bmm).
     gate_up_t = layer.experts.gate_up_proj.data.transpose(1, 2).contiguous().float()
     down_t = layer.experts.down_proj.data.transpose(1, 2).contiguous().float()
     per_expert_scale = layer.router.per_expert_scale.data.float()
-    ref = _moe_ffn_loop_ref(x, W_router, gate_up_t, down_t, per_expert_scale, K)
+    ref = _moe_ffn_loop_ref(
+        x, W_router, gate_up_t, down_t, per_expert_scale, K, x_router=x_router
+    )
 
     # Device path: force the loop-on-topk formulation, prepare, run the region.
     moe._MOE_LOOP_ON_TOPK = True
@@ -522,7 +596,7 @@ def main():
     x_dev = x.to(torch.float16).to("spyre")
     got = moe._moe_ffn_loop(
         x_dev, x_dev, router, compiled_loop,
-        layer._spyre_gate_up_dev, layer._spyre_down_dev, K, moe._MOE_TILE,
+        layer._spyre_gate_up_dev, layer._spyre_down_dev, K, moe._MOE_TILE, eps,
     )
     got = got.cpu().float()
 
