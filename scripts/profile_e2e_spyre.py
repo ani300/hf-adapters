@@ -24,26 +24,50 @@ Runs the same load + generate path as the e2e smoke test twice:
 
 Usage (on the Spyre pod, with the project root on PYTHONPATH)::
 
-    python scripts/profile_e2e_spyre.py --model ministral3
+    python scripts/profile_e2e_spyre.py --model ministral3 \\
+        --hf-home /mnt/models/hf_cache
+
+The HF hub cache lives at ``<HF_HOME>/hub``; pass ``--hf-home`` (or set the
+``HF_HOME`` env var) to point at a shared cache instead of the default.
 
 Open the resulting trace in https://ui.perfetto.dev/ or chrome://tracing.
 """
 
 import argparse
+import os
+import sys
 import time
 
-import torch
-from torch.profiler import ProfilerActivity, profile
-from transformers import AutoTokenizer
 
-from hf_adapters import AutoSpyreModelForCausalLM
+def _apply_hf_home(argv: "list[str] | None") -> None:
+    """Set HF_HOME before any HF import so the hub cache path takes effect.
 
-try:
-    import torch_spyre  # noqa: F401  (registers the "spyre" device)
-except ImportError:
-    # Allowed only off-pod for --help / arg parsing; the profiled run
-    # (Task 2) needs the real device and will fail loudly without it.
-    torch_spyre = None
+    ``huggingface_hub`` computes ``HF_HUB_CACHE`` (``<HF_HOME>/hub``) at import
+    time, so the env var must be set before ``transformers``/``hf_adapters``
+    are imported below. We peek at ``--hf-home`` here rather than in the main
+    argparse pass (which runs after those imports). Precedence: explicit
+    ``--hf-home`` > an ``HF_HOME`` already in the environment > unset (HF's
+    own default, typically ``~/.cache/huggingface``).
+    """
+    argv = sys.argv[1:] if argv is None else argv
+    hf_home = None
+    for i, tok in enumerate(argv):
+        if tok == "--hf-home" and i + 1 < len(argv):
+            hf_home = argv[i + 1]
+        elif tok.startswith("--hf-home="):
+            hf_home = tok.split("=", 1)[1]
+    if hf_home:
+        os.environ["HF_HOME"] = hf_home
+
+
+# Bootstrap the cache path from --hf-home / HF_HOME before the HF imports run.
+_apply_hf_home(None)
+
+import torch  # noqa: E402
+from torch.profiler import ProfilerActivity, profile  # noqa: E402
+from transformers import AutoTokenizer  # noqa: E402
+
+from hf_adapters import AutoSpyreModelForCausalLM  # noqa: E402
 
 # Registry key -> (HF path, Spyre-safe dtype). Kept inline so this script has
 # no dependency on the tests/ package. Ministral 3 uses bfloat16 (see
@@ -78,6 +102,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--prompt",
         default=DEFAULT_PROMPT,
         help=f"Prompt to generate from (default: {DEFAULT_PROMPT!r}).",
+    )
+    parser.add_argument(
+        "--hf-home",
+        default=os.environ.get("HF_HOME"),
+        help=(
+            "HF_HOME dir; the hub cache is <HF_HOME>/hub (e.g. "
+            "/mnt/models/hf_cache -> /mnt/models/hf_cache/hub). Applied before "
+            "the HF imports. Defaults to $HF_HOME, else HF's own default."
+        ),
     )
     return parser
 
@@ -129,6 +162,13 @@ def run_profile(
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.hf_home:
+        # Normally already applied by _apply_hf_home() at import time; re-set
+        # for the programmatic main(argv=[...]) path where import ran first.
+        os.environ["HF_HOME"] = args.hf_home
+    from huggingface_hub import constants
+
+    print(f"  HF hub cache: {constants.HF_HUB_CACHE}")
     path, dtype = MODELS[args.model]
     out = args.out or f"{args.model}_trace.json"
     run_profile(
