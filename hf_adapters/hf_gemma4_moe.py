@@ -280,6 +280,53 @@ def _moe_ffn(x, W_router, gate_up_proj, down_proj, per_expert_scale, K):
     return out
 
 
+def _moe_ffn_loop_ref(
+    x, W_router, gate_up_t, down_t, per_expert_scale, K, x_router=None
+):
+    """CPU fp32 reference for the loop-on-topk MoE FFN (no expert grouping).
+
+    Mirrors the on-device dataflow: route to top-K, flatten the [T,K] result to
+    N=T*K rows in topk order (NO argsort), per-row select the expert weight,
+    two bmms with a gelu-tanh SwiGLU between, weight by the router weight, and
+    scatter-add back to [T,H]. The numeric oracle for _compiled_moe_loop_region.
+
+    Args:
+        x: Expert-FFN input token embeddings [T, H] (fed to the experts).
+        W_router: Router projection weights [E, H].
+        gate_up_t: Pre-transposed gate_up per expert [E, H, 2M].
+        down_t: Pre-transposed down per expert [E, M, H].
+        per_expert_scale: Per-expert scale [E].
+        K: Top-K experts per token.
+        x_router: Router input [T, H] (already RMSNorm/scale-preprocessed). When
+            None, defaults to x. Routing uses x_router; the experts always read
+            x -- router and expert inputs are threaded separately (the double-
+            normalization rule from the design spec).
+
+    Returns:
+        out: MoE FFN output [T, H].
+    """
+    T, H = x.shape
+    if x_router is None:
+        x_router = x
+    w, idx = _moe_route(x_router, W_router, per_expert_scale, K)  # [T,K],[T,K]
+    expert_of_row = idx.reshape(-1)  # [N] N=T*K, topk order (NOT sorted)
+    token_of_row = (torch.arange(T * K, device=x.device) // K)  # [N]
+    row_w = w.reshape(-1, 1)  # [N,1]
+
+    gathered = x[token_of_row]  # [N,H]
+    gu = torch.bmm(
+        gathered.unsqueeze(1), gate_up_t[expert_of_row]
+    )  # [N,1,2M]
+    g, u = gu.chunk(2, dim=-1)  # [N,1,M]
+    act = F.gelu(g, approximate="tanh") * u  # [N,1,M]
+    row_out = torch.bmm(act, down_t[expert_of_row]).squeeze(1)  # [N,H]
+    row_out = row_out * row_w  # [N,1] broadcast
+
+    out = torch.zeros(T, H, dtype=x.dtype, device=x.device)
+    out = out.index_add(0, token_of_row.long(), row_out)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Device (compiled, spyre) FFN region + host orchestrator + decoder block.
 # ---------------------------------------------------------------------------

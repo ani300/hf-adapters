@@ -19,6 +19,7 @@ from hf_adapters.hf_gemma4_moe import (
     _grouped_gemm_4a,
     _grouped_gemm_4b,
     _moe_ffn,
+    _moe_ffn_loop_ref,
     _moe_permute,
     _moe_route,
 )
@@ -82,6 +83,32 @@ def test_moe_ffn_matches_reference():
     ref = _ref_moe(x, W_router, gate_up, down, scale, K)
     got = _moe_ffn(x, W_router, gate_up, down, scale, K)
     torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+
+def test_moe_ffn_loop_ref_matches_dense_reference():
+    """Loop-on-topk FFN (no grouping) equals the dense per-token top-K sum."""
+    torch.manual_seed(0)
+    T, H, E, M, K = 6, 16, 8, 12, 4
+    x = torch.randn(T, H)
+    W_router = torch.randn(E, H)
+    # Pre-transposed expert weights, matching the device layout.
+    gate_up_t = torch.randn(E, H, 2 * M)  # [E,H,2M]
+    down_t = torch.randn(E, M, H)          # [E,M,H]
+    per_expert_scale = torch.rand(E) + 0.5
+
+    got = _moe_ffn_loop_ref(x, W_router, gate_up_t, down_t, per_expert_scale, K)
+
+    # Independent dense reference: route, then for each token sum its K experts.
+    w, idx = _moe_route(x, W_router, per_expert_scale, K)  # [T,K],[T,K]
+    ref = torch.zeros(T, H)
+    for t in range(T):
+        for j in range(K):
+            e = int(idx[t, j])
+            gu = x[t] @ gate_up_t[e]            # [2M]
+            g, u = gu.chunk(2, dim=-1)          # [M],[M]
+            act = torch.nn.functional.gelu(g, approximate="tanh") * u
+            ref[t] += w[t, j] * (act @ down_t[e])  # [H]
+    assert torch.allclose(got, ref, atol=1e-4, rtol=1e-4)
 
 
 def test_grouped_gemm_4a_4b_agree():
