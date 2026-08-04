@@ -434,10 +434,10 @@ In `_make_moe_block`, after the existing `compiled_expert = torch.compile(...)` 
     compiled_loop = torch.compile(_compiled_moe_loop_region, dynamic=False)
 ```
 
-The loop region needs the RMSNorm eps (`config.rms_norm_eps`). Capture it from the `pre_ff_ln_2` RMSNorm instance already bound in the factory (it is a `Gemma4RMSNorm`, so it carries `variance_epsilon == config.rms_norm_eps` — the same eps the scale-free router norm uses). Add near the other captured norms (~467):
+The loop region needs the RMSNorm eps (`config.rms_norm_eps`). Capture it from the `pre_ff_ln_2` RMSNorm instance already bound in the factory (it is a `Gemma4RMSNorm`, which stores its epsilon on `.eps == config.rms_norm_eps` — NOT `.variance_epsilon`, which is the generic HF-patched name; the same eps the scale-free router norm uses). Add near the other captured norms (~467):
 
 ```python
-    moe_rms_eps = pre_ff_ln_2.variance_epsilon  # == config.rms_norm_eps
+    moe_rms_eps = pre_ff_ln_2.eps  # Gemma4RMSNorm uses .eps (== config.rms_norm_eps)
 ```
 
 and in `block_forward`, replace the single `moe_out = _moe_ffn_split(...)` call (~537-546) with a flag branch:
@@ -550,6 +550,7 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import hf_adapters.hf_gemma4_moe as moe
+from hf_adapters.hf_gemma4 import _gemma4_backbone
 from hf_adapters.hf_gemma4_moe import _moe_ffn_loop_ref
 
 MODEL = "google/gemma-4-26B-A4B-it"
@@ -560,7 +561,9 @@ def main():
     moe._MOE_BRINGUP_K = K  # apples-to-apples with the reference
     cfg = AutoConfig.from_pretrained(MODEL)
     model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float16)
-    layer = model.model.layers[0]
+    # gemma-4-26B loads as multimodal Gemma4ForConditionalGeneration; the decoder
+    # stack lives at the text backbone (Gemma4TextModel), NOT model.model.layers.
+    layer = _gemma4_backbone(model).layers[0]
 
     # fp32 CPU ground truth on a fixed random input, BEFORE prepare (the RMSNorm
     # patch is global; capture the reference first). K=4, N=T*K=256 (>1, tiled).

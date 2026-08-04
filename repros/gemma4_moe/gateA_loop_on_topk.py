@@ -31,6 +31,7 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import hf_adapters.hf_gemma4_moe as moe
+from hf_adapters.hf_gemma4 import _gemma4_backbone
 from hf_adapters.hf_gemma4_moe import _moe_ffn_loop_ref
 
 MODEL = "google/gemma-4-26B-A4B-it"
@@ -41,7 +42,9 @@ def main():
     moe._MOE_BRINGUP_K = K  # apples-to-apples with the reference
     cfg = AutoConfig.from_pretrained(MODEL)
     model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float16)
-    layer = model.model.layers[0]
+    # gemma-4-26B loads as multimodal Gemma4ForConditionalGeneration; the decoder
+    # stack lives at the text backbone (Gemma4TextModel), NOT model.model.layers.
+    layer = _gemma4_backbone(model).layers[0]
 
     # fp32 CPU ground truth on a fixed random input, BEFORE prepare (the RMSNorm
     # patch is global; capture the reference first). K=4, N=T*K=256 (>1, tiled).

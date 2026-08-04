@@ -632,7 +632,7 @@ def _make_moe_block(layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
     pre_ff_ln_2 = layer.pre_feedforward_layernorm_2  # MoE pre-norm (on residual)
     post_ff_ln_2 = layer.post_feedforward_layernorm_2  # MoE post-norm
     K = layer._spyre_moe_k
-    moe_rms_eps = pre_ff_ln_2.variance_epsilon  # == config.rms_norm_eps
+    moe_rms_eps = pre_ff_ln_2.eps  # Gemma4RMSNorm uses .eps (== config.rms_norm_eps)
     # The pre-transposed expert-weight stacks (``_spyre_gate_up_t`` [E,H,2M],
     # ``_spyre_down_t`` [E,M,H]) are laid down by ``prepare_for_spyre`` (shape
     # rule 2 + expert-dim-outermost, spec §3.5) as PLAIN CPU ATTRIBUTES that the
