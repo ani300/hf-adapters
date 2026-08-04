@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from hf_adapters import hf_gemma4_moe
 from hf_adapters.hf_gemma4_moe import (
+    _compiled_moe_loop_region,
     _grouped_gemm_4a,
     _grouped_gemm_4b,
     _moe_ffn,
@@ -152,3 +153,34 @@ def test_moe_ffn_matches_reference_under_4b_flag(monkeypatch):
     ref = _ref_moe(x, W_router, gate_up, down, scale, K)
     got = _moe_ffn(x, W_router, gate_up, down, scale, K)
     torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+
+def test_compiled_moe_loop_region_matches_reference_eager():
+    """The device-region fn, run eager on CPU, matches _moe_ffn_loop_ref."""
+    torch.manual_seed(1)
+    T, H, E, M, K = 6, 16, 8, 12, 4
+    x = torch.randn(T, H)
+    W_router = torch.randn(E, H)
+    gate_up_t = torch.randn(E, H, 2 * M)
+    down_t = torch.randn(E, M, H)
+    per_expert_scale = torch.rand(E) + 0.5
+    token_ids = torch.arange(T)
+
+    # The region and the reference share the SAME router math. To make them
+    # agree, drive the region with scale=ones(H), root_size=1.0, eps=1e-6, and
+    # give _moe_ffn_loop_ref the SAME router preprocessing via its x_router arg
+    # (the reference applies F.linear to x_router, so pass the region's normed
+    # input). Both then route identically; only the expert FFN math is compared.
+    row_out, token_of_row = _compiled_moe_loop_region(
+        x, x, W_router,
+        torch.ones(H), 1.0,
+        per_expert_scale, gate_up_t, down_t, token_ids, K, tile=4, eps=1e-6,
+    )
+    combined = torch.zeros(T, H).index_add(0, token_of_row.long(), row_out)
+
+    var = x.pow(2).mean(-1, keepdim=True)
+    x_normed = x * torch.rsqrt(var + 1e-6)  # == region's scale-free RMSNorm
+    ref = _moe_ffn_loop_ref(
+        x, W_router, gate_up_t, down_t, per_expert_scale, K, x_router=x_normed
+    )
+    assert torch.allclose(combined, ref, atol=1e-4, rtol=1e-4)

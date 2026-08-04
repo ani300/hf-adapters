@@ -86,6 +86,11 @@ _MOE_BRINGUP_K = 4
 # flag only after validating 4B end-to-end on-card.
 _MOE_GEMM_4B = False
 
+# Row-tile size for the loop-on-topk device region (spec Approach A). The
+# spyre_hint(tiles={"row": _MOE_TILE}) tiles the N=T*K row axis so the backend
+# loops over ceil(N/_MOE_TILE) tiles; a tuning knob (scratchpad window size).
+_MOE_TILE = 32
+
 
 def _moe_route(x, W_router, per_expert_scale, K):
     """Route tokens to top-K experts with softmax and per-expert scaling.
@@ -351,6 +356,72 @@ def _compiled_moe_device_region(gathered3d, gate_up_row_t, down_row_t):
     g, u = gu.chunk(2, dim=-1)  # [N,1,M] each
     act = F.gelu(g, approximate="tanh") * u  # [N,1,M]
     return torch.bmm(act, down_row_t).squeeze(1)  # [N,H]
+
+
+def _compiled_moe_loop_region(
+    x_router,
+    x_expert,
+    router_proj_w,
+    router_scale,
+    router_scalar_root_size,
+    per_expert_scale,
+    gate_up_dev,
+    down_dev,
+    token_ids,
+    K,
+    tile,
+    eps,
+):
+    """Whole MoE FFN on-device except the scatter-combine (spec Approach A).
+
+    Router (inlined SCALE-FREE RMSNorm on the RAW residual x_router with eps
+    INSIDE the sqrt, then * router_scale[H] * router_scalar_root_size, then
+    proj) -> softmax -> topk(K) -> renorm -> per_expert_scale; then, under a
+    single spyre_hint(tiles={"row": tile}) that tiles the N=T*K row axis (the
+    hint IS the loop -- no Python for), gather the expert-input rows from
+    x_expert, index_select the per-row expert weights from the HBM-resident
+    E-outermost stacks, two bmms (3D [*,1,*] throughout) with a gelu-tanh
+    SwiGLU, and weight by the router weight.
+
+    Preflight-corrected router surface: the stock router.norm has NO .weight
+    (Gemma4RMSNorm with_scale=False); the learnable gain is router_scale, an
+    [H] vector applied AFTER the scale-free norm. router_scalar_root_size is a
+    Python float (hidden_size ** -0.5). eps is config.rms_norm_eps.
+
+    gate_up_dev: [E,H,2M] (stick=2M), down_dev: [E,M,H] (stick=H), E outermost.
+    tile must be >= 2 (single-row P=1 gather SIGABRTs in dxp_standalone).
+    Returns (row_out[N,H], token_of_row[N]) for the host index_add combine.
+    """
+    from torch_spyre._inductor.propagate_hints import spyre_hint
+
+    T, H = x_expert.shape
+    N = T * K
+
+    # --- router (all device-lowerable): SCALE-FREE RMSNorm (eps inside sqrt)
+    # on the RAW residual, then the [H] scale vector and the root-size scalar.
+    var = x_router.pow(2).mean(-1, keepdim=True)
+    normed = x_router * torch.rsqrt(var + eps)  # scale-free (no gain in norm)
+    normed = normed * router_scale * router_scalar_root_size  # scale is [H]
+    logits = F.linear(normed, router_proj_w)  # [T,E]
+    probs = torch.softmax(logits, dim=-1)
+    w, idx = torch.topk(probs, K, dim=-1)  # [T,K],[T,K]  ASSUMED to lower
+    w = w / w.sum(-1, keepdim=True)
+    w = w * per_expert_scale[idx]  # [T,K]
+
+    expert_of_row = idx.reshape(N)  # [N] topk order (no sort)
+    token_of_row = (token_ids.reshape(T, 1).expand(T, K)).reshape(N)  # [N]
+    row_w = w.reshape(N, 1)  # [N,1]
+
+    with spyre_hint(tiles={"row": tile}):
+        gathered = x_expert[token_of_row]  # [N,H]
+        W_gu = gate_up_dev[expert_of_row]  # [N,H,2M] on-device index_select
+        W_dn = down_dev[expert_of_row]  # [N,M,H]
+        gu = torch.bmm(gathered.unsqueeze(1), W_gu)  # [N,1,2M] 3D throughout
+        g, u = gu.chunk(2, dim=-1)  # [N,1,M]
+        act = F.gelu(g, approximate="tanh") * u  # [N,1,M]
+        row_out = torch.bmm(act, W_dn).squeeze(1)  # [N,H]
+        row_out = row_out * row_w  # [N,1] broadcast
+    return row_out, token_of_row
 
 
 def _compiled_device_gather(x, token_of_row):
