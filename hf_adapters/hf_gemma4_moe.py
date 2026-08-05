@@ -412,7 +412,11 @@ def _compiled_moe_loop_region(
     normed = normed * router_scale * router_scalar_root_size  # scale is [H]
     logits = F.linear(normed, router_proj_w)  # [T,E]
     probs = torch.softmax(logits, dim=-1)
-    w, idx = torch.topk(probs, K, dim=-1)  # [T,K],[T,K]  ASSUMED to lower
+    # topk returns int64 indices (the Spyre spyre_topk decomp converts the
+    # fp16-encoded positions the dxp kernel writes to int64), so idx is ready
+    # to feed the three indirect gathers below (per_expert_scale[idx],
+    # gate_up_dev[expert_of_row], down_dev[...]) with no adapter-side cast.
+    w, idx = torch.topk(probs, K, dim=-1)  # [T,K],[T,K] int64  ASSUMED to lower
     w = w / w.sum(-1, keepdim=True)
     w = w * per_expert_scale[idx]  # [T,K]
 
@@ -558,6 +562,9 @@ def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_up_dev,
     """
     T, H = x_expert.shape
     token_ids = torch.arange(T, device=x_expert.device, dtype=torch.int32)
+    # The router's proj.weight / scale / per_expert_scale are moved onto the
+    # device in prepare_for_spyre (Approach-A flag branch) so they are already
+    # device-resident here -- pass them straight through as region inputs.
     row_out, token_of_row = compiled_loop(
         x_router,
         x_expert,
@@ -820,6 +827,25 @@ def prepare_for_spyre(model):
             # sweep).
             layer._spyre_gate_up_dev = gate_up_t.to("spyre")  # [E,H,2M]
             layer._spyre_down_dev = down_t.to("spyre")  # [E,M,H]
+            # The whole router runs on-device in the loop region (scale-free
+            # norm + [H] scale + proj + topk + per_expert_scale gather), so its
+            # weights must be device-resident too. Move them here rather than
+            # rely on a model.to("spyre") sweep -- standalone callers (the gate)
+            # never sweep the model, and the region's normed activation is
+            # device-side. Reassign the Parameter object (a cross-backend
+            # ``param.data = ...`` set_data raises on the type change); the
+            # spyre move stickifies proj.weight [E,H] like any 2D matmul weight.
+            # router.scalar_root_size is a Python float (no move).
+            router = layer.router
+            router.proj.weight = torch.nn.Parameter(
+                router.proj.weight.data.to("spyre"), requires_grad=False
+            )
+            router.scale = torch.nn.Parameter(
+                router.scale.data.to("spyre"), requires_grad=False
+            )
+            router.per_expert_scale = torch.nn.Parameter(
+                router.per_expert_scale.data.to("spyre"), requires_grad=False
+            )
         else:
             layer._spyre_gate_up_t = gate_up_t.cpu()  # [E,H,2M] host-resident
             layer._spyre_down_t = down_t.cpu()  # [E,M,H] host-resident
