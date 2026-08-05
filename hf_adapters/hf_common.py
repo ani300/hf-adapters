@@ -23,6 +23,7 @@ compiled block functions.
 
 import math
 import time
+import warnings
 from typing import Callable, Optional
 
 import torch
@@ -1108,11 +1109,12 @@ def _patch_torch_empty():
 
 
 def _embedding_param_ids(model):
-    """Data-pointers of weights that must keep the default (column-major) layout.
+    """Data-pointers of ``nn.Embedding`` weights (gather-indexed, not matmul).
 
-    Gather-only embedding weights (used via ``nn.Embedding``, not matmul) must not
-    receive a row-major SpyreTensorLayout. Returns the set of ``data_ptr()``
-    values for all such weights.
+    Gather-only embedding weights (used via ``nn.Embedding``, not matmul) must
+    not receive the row-major matmul SpyreTensorLayout; they take a
+    gather-optimal layout instead (see ``_embedding_layout``). Returns the set
+    of ``data_ptr()`` values for all such 2-D weights.
 
     Found by walking ``named_modules`` for ``nn.Embedding`` rather than matching
     known attribute names. The name-matching version missed ModernBERT's
@@ -1162,8 +1164,9 @@ def get_model_dtype(model: nn.Module) -> torch.dtype:
 
 
 def _move_to_spyre_with_layout(model, dtype):
-    """Move all parameters and buffers to Spyre with row-major layout for 2D
-    matmul weights, except embedding weights which keep the default layout.
+    """Move all parameters and buffers to Spyre, choosing a device layout per
+    weight: a gather-optimal layout for embedding tables, a row-major layout for
+    2D matmul weights, and the default layout for everything else.
     """
     # Propagate dtype to the precomputed RoPE module(s) so the freq cache
     # matches the chosen weight dtype (avoids fp16/bf16 mismatch in
@@ -1185,18 +1188,56 @@ def _move_to_spyre_with_layout(model, dtype):
     # device_layout kwarg fail kwarg validation before dispatch.
     torch.empty(1, device=DEVICE)
 
-    from torch_spyre._C import SpyreTensorLayout  # type: ignore[import-not-found]
+    from torch_spyre._C import (  # type: ignore[import-not-found]
+        SpyreTensorLayout,
+        get_device_dtype,
+    )
 
-    skip_layout_ptrs = _embedding_param_ids(model)
+    embedding_ptrs = _embedding_param_ids(model)
+
+    def _embedding_layout(t: torch.Tensor):
+        """Gather-optimal "indirect access" layout for an embedding table.
+
+        An ``nn.Embedding`` weight is read as a gather (indexed by token id
+        along the vocab/leading dim), not a matmul, so it wants a different
+        device layout than the row-major matmul weights: the vocab dim
+        outermost and the hidden dim split into ``BLOCK_SIZE``-element sticks,
+        i.e. device dims ``[rows, D // BLOCK_SIZE, BLOCK_SIZE]``. This uses the
+        3-arg device-dims ``SpyreTensorLayout`` overload with the *device*
+        dtype (``get_device_dtype``), not the host torch.dtype.
+
+        Requires ``D % BLOCK_SIZE == 0``; otherwise the sticks don't tile the
+        hidden dim, so we warn and fall back to the default layout (``None``),
+        which still loads and runs, just without the gather optimization.
+        """
+        rows, d = t.shape
+        if d % BLOCK_SIZE != 0:
+            warnings.warn(
+                f"Embedding hidden dim {d} is not a multiple of the Spyre "
+                f"stick size {BLOCK_SIZE}; falling back to the default layout "
+                "(no gather optimization) for this embedding table.",
+                stacklevel=2,
+            )
+            return None
+        return SpyreTensorLayout(
+            [rows, d // BLOCK_SIZE, BLOCK_SIZE],
+            [d, BLOCK_SIZE, 1],
+            get_device_dtype(dtype),
+        )
 
     def _alloc_on_spyre(t: torch.Tensor) -> torch.Tensor:
+        # Embedding tables are gather-indexed, so they take a gather-optimal
+        # layout (vocab dim outermost) rather than the matmul row-major one.
+        #
         # The row-major [1, 0] dim_order describes a 2-D permutation, so it only
         # applies to 2-D matmul weights. 1-D tensors (norms, biases) and any
         # higher-rank weight (e.g. the 3-D/4-D Conv2d and position-embedding
         # tables in a multimodal checkpoint's vision/audio towers) keep the
         # default layout — forcing [1, 0] on them raises "Incompatible host_size
-        # and dim_order". Embedding tables are gather-only and also skipped.
-        if t.dim() == 2 and t.data_ptr() not in skip_layout_ptrs:
+        # and dim_order".
+        if t.data_ptr() in embedding_ptrs:
+            stl = _embedding_layout(t)
+        elif t.dim() == 2:
             stl = SpyreTensorLayout(t.shape, t.stride(), dtype, [1, 0])
         else:
             stl = None
