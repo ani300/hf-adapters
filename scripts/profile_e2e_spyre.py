@@ -30,6 +30,11 @@ Usage (on the Spyre pod, with the project root on PYTHONPATH)::
 The HF hub cache lives at ``<HF_HOME>/hub``; pass ``--hf-home`` (or set the
 ``HF_HOME`` env var) to point at a shared cache instead of the default.
 
+Pass ``--with-stack`` to annotate each trace event with its Python source
+stack and module hierarchy, so an op (e.g. the per-layer ``torch.full``) can
+be traced back to its origin in the viewer. It is off by default because it
+adds per-event overhead and enlarges the trace.
+
 Open the resulting trace in https://ui.perfetto.dev/ or chrome://tracing.
 """
 
@@ -70,10 +75,12 @@ from transformers import AutoTokenizer  # noqa: E402
 from hf_adapters import AutoSpyreModelForCausalLM  # noqa: E402
 
 # Registry key -> (HF path, Spyre-safe dtype). Kept inline so this script has
-# no dependency on the tests/ package. Ministral 3 uses bfloat16 (see
-# hf_adapters.auto_spyre_model.MODEL_PATH_TO_TORCH_DTYPE).
+# no dependency on the tests/ package. Dtypes mirror
+# hf_adapters.auto_spyre_model.MODEL_PATH_TO_TORCH_DTYPE: Ministral 3 uses
+# bfloat16; Granite 3.3 8B has no entry there, so it takes the fp16 default.
 MODELS: dict[str, tuple[str, "torch.dtype"]] = {
     "ministral3": ("mistralai/Ministral-3-14B-Instruct-2512", torch.bfloat16),
+    "granite8b": ("ibm-granite/granite-3.3-8b-instruct", torch.float16),
 }
 
 DEFAULT_PROMPT = "The capital of France is"
@@ -112,6 +119,16 @@ def build_parser() -> argparse.ArgumentParser:
             "the HF imports. Defaults to $HF_HOME, else HF's own default."
         ),
     )
+    parser.add_argument(
+        "--with-stack",
+        action="store_true",
+        help=(
+            "Record the Python source stack (file:line) and module hierarchy "
+            "for each op so you can trace an event (e.g. the per-layer "
+            "torch.full) back to its origin in the trace viewer. Off by "
+            "default: it adds per-event overhead and enlarges the trace."
+        ),
+    )
     return parser
 
 
@@ -121,6 +138,7 @@ def run_profile(
     prompt: str,
     max_new_tokens: int,
     out_path: str,
+    with_stack: bool = False,
 ) -> None:
     """Load *model_path*, warm the compile cache, then profile one generate."""
     print(f"{'=' * 70}")
@@ -145,10 +163,16 @@ def run_profile(
     #     NOTE(#114): do NOT call prof.events() / prof.key_averages().table() —
     #     reading the event buffer hits the libaiupti/kineto ABI decode crash.
     #     export_chrome_trace() writes the trace without walking that buffer.
-    print("[profile] capturing trace...")
+    print(f"[profile] capturing trace... (with_stack={with_stack})")
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
         record_shapes=True,
+        # --with-stack: attach each event's Python source stack (file:line)
+        # and module hierarchy, so an op can be traced back to its origin
+        # (e.g. the per-layer torch.full -> torch_spyre's SDPA decomposition).
+        # Both are gated because they add per-event overhead and grow the trace.
+        with_stack=with_stack,
+        with_modules=with_stack,
     ) as prof:
         outputs = model.generate(tokenizer, [prompt], **gen_kwargs)
 
@@ -177,6 +201,7 @@ def main(argv: list[str] | None = None) -> None:
         prompt=args.prompt,
         max_new_tokens=args.max_new_tokens,
         out_path=out,
+        with_stack=args.with_stack,
     )
 
 
