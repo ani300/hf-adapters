@@ -26,12 +26,14 @@ Usage::
     outputs = model.generate(tokenizer, ["Hello!"], max_new_tokens=32)
 """
 
+import torch
+
 from hf_adapters.hf_common import (
     get_backbone,
     pad_lm_head,
     patch_rmsnorm,
     prepare_rope_and_heads,
-    prepare_standard_gqa_blocks,
+    prepare_standard_gqa_region_blocks,
     text_config,
 )
 
@@ -97,6 +99,25 @@ def _run_forward(
     return logits / text_config(model.config).logits_scaling
 
 
+def _make_compiled_run_forward(model):
+    """Bind Granite's whole-forward to ``model`` and torch.compile it once.
+
+    The compiled callable owns the embed/mul/rope prologue, the 40-block loop
+    (each block a nested_compile_region → compiled once), and the norm/head/
+    scaling epilogue. Signature matches generate()'s run_forward_fn contract
+    minus the leading ``model`` (which is closed over)."""
+    def _bound(
+        input_ids, position_ids, attn_mask,
+        key_caches, value_caches, is_filling, token_index, cache_position,
+    ):
+        return _run_forward(
+            model, input_ids, position_ids, attn_mask,
+            key_caches, value_caches, is_filling, token_index, cache_position,
+        )
+
+    return torch.compile(_bound, dynamic=False)
+
+
 def prepare_for_spyre(model):
     """Apply Spyre adaptations to Granite 3.3 model in-place."""
     from transformers.models.granite.modeling_granite import GraniteRMSNorm
@@ -104,6 +125,7 @@ def prepare_for_spyre(model):
     prepare_rope_and_heads(model)
     patch_rmsnorm(GraniteRMSNorm)
     pad_lm_head(model)
-    model._spyre_compiled_blocks = prepare_standard_gqa_blocks(
+    model._spyre_compiled_blocks = prepare_standard_gqa_region_blocks(
         get_backbone(model).layers, True
     )
+    model._spyre_run_forward = _make_compiled_run_forward(model)
