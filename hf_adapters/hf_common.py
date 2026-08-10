@@ -1062,6 +1062,17 @@ def kv_cache_shapes(model):
     return [(num_kv_heads, head_dim, v_head_dim) for _ in range(num_layers)]
 
 
+def generation_cache_len(prompt_length: int, max_new_tokens: int) -> int:
+    """Compute KV cache size needed for prompt + generation tokens.
+
+    Pads both prompt and generation length to BLOCK_SIZE multiples and sums them.
+    Used by ``generate`` and profiling scripts to size KV caches.
+    """
+    padded_prompt = math.ceil(prompt_length / BLOCK_SIZE) * BLOCK_SIZE
+    padded_generation = math.ceil(max_new_tokens / BLOCK_SIZE) * BLOCK_SIZE
+    return padded_prompt + padded_generation
+
+
 def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
     """Allocate zeroed per-layer key/value caches matching the model's shapes.
 
