@@ -245,3 +245,14 @@ config.local.*
 .claude/commands/
 .bob/
 # Made with Bob
+
+# Superpowers brainstorming/plan/spec docs (working artifacts, not shipped)
+docs/superpowers/
+
+# Profiling helper scripts — contain a live HF_TOKEN, must never be committed
+scripts/profiler.sh
+scripts/hier_profile_run.sh
+
+# Profiling trace artifacts (large JSON dumps)
+*_trace_baseline.json
+*.pt.trace.json
