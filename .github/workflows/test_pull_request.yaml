@@ -1,5 +1,14 @@
 name: test_pull_request
 
+# Doubles as hf-adapters' "trunk" (push-to-main) workflow -- on push this
+# still runs every job unconditionally (job-selection for trunk == full,
+# which is already this workflow's only mode), so the run-name below is
+# purely a labeling change. Full delegation to _test_matrix.yaml's
+# test_type-gated suites (like integration-tests.yaml uses) is deferred --
+# this file defines its jobs inline and lacks _test_matrix.yaml's reranker
+# suite and RPM-build inputs, so reconciling them is a separate effort.
+run-name: ${{ github.event_name == 'push' && 'trunk' || 'test_pull_request' }}
+
 on:
   push:
     branches: [main]
@@ -114,11 +123,42 @@ jobs:
       - name: Run pre-commit
         uses: pre-commit/action@v3.0.1
         with:
-          # Skip the local mypy hook — it requires the project venv with
-          # torch/transformers installed, which we don't set up in this lint job.
           extra_args: --all-files --hook-stage commit --show-diff-on-failure
         env:
-          SKIP: mypy
+          SKIP: mypy  # mypy runs in its own job below; see the `mypy` job
+
+  # ---------------------------------------------------------------------------
+  # mypy — static type checker for hf_adapters/.
+  #
+  # Runs in its own job so it can install torch+transformers (needed to resolve
+  # the type stubs) without bloating the pre-commit lint job, which runs on a
+  # plain Python install. The local pre-commit mypy hook is intentionally kept
+  # so developers still get feedback on commit; this job is the CI enforcement.
+  # ---------------------------------------------------------------------------
+  mypy:
+    name: mypy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --quiet \
+            "torch>=2.0" \
+            "transformers>=5.12.1,<6.0.0" \
+            "mypy>=2.3.0,<3"
+
+      - name: Run mypy
+        run: mypy --config-file=pyproject.toml
 
   # ===========================================================================
   # Dynamic matrix generation
@@ -134,6 +174,7 @@ jobs:
   generate-matrix:
     name: Generate test matrices
     runs-on: ubuntu-latest
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test')) }}
     outputs:
       causal_matrix: ${{ steps.generate.outputs.causal_matrix }}
       embed_matrix: ${{ steps.generate.outputs.embed_matrix }}
@@ -169,6 +210,7 @@ jobs:
   adapter-coverage:
     name: adapter coverage
     runs-on: ubuntu-latest
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test')) }}
     defaults:
       run:
         working-directory: .
@@ -245,6 +287,7 @@ jobs:
   spyre-load-tests:
     name: Spyre load (${{ matrix.model_key }})
     needs: [generate-matrix]
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test')) }}
     runs-on:
       - x86_64
       - spyre_pf_x1__pvc_1tb_x1
@@ -294,6 +337,7 @@ jobs:
   spyre-smoke-tests:
     name: Spyre smoke (${{ matrix.model_key }})
     needs: [generate-matrix]
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test')) }}
     runs-on:
       - x86_64
       - spyre_pf_x1__pvc_1tb_x1
@@ -342,6 +386,7 @@ jobs:
   spyre-token-compare-tests:
     name: Spyre token compare (${{ matrix.model_key }})
     needs: [generate-matrix]
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test')) }}
     runs-on:
       - x86_64
       - spyre_pf_x1__pvc_1tb_x1
@@ -390,6 +435,7 @@ jobs:
   spyre-embed-compare-tests:
     name: Spyre embed compare (${{ matrix.model_key }})
     needs: [generate-matrix]
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test')) }}
     runs-on:
       - x86_64
       - spyre_pf_x1__pvc_1tb_x1
@@ -438,6 +484,7 @@ jobs:
   spyre-reranker-compare-tests:
     name: Spyre reranker compare (${{ matrix.model_key }})
     needs: [generate-matrix]
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test')) }}
     runs-on:
       - x86_64
       - spyre_pf_x1__pvc_1tb_x1
@@ -484,6 +531,7 @@ jobs:
   spyre-vlm-e2e-tests:
     name: Spyre VLM e2e (${{ matrix.model_key }})
     needs: [generate-matrix]
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test')) }}
     runs-on:
       - x86_64
       - spyre_pf_x1__pvc_1tb_x1
@@ -532,6 +580,7 @@ jobs:
 
   spyre-model-module-tests:
     name: Spyre model-module tests (${{ matrix.config }})
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test')) }}
     runs-on:
       - x86_64
       - spyre_pf_x1__pvc_1tb_x1
@@ -591,6 +640,11 @@ jobs:
   # Required check gate — fans in all matrix jobs so a single branch
   # protection rule ("tests / run spyre unit tests") passes only when every
   # suite passes.
+  #
+  # All upstream jobs are individually skipped (via `if:`) when the PR is
+  # labeled "integration-test" -- that flow is handled elsewhere. `needs.*`
+  # then resolve to `skipped`, which is not `failure`/`cancelled`, so this
+  # gate still passes (green, near-instant) rather than blocking the merge.
   # ===========================================================================
   run-spyre-unit-tests:
     name: run spyre unit tests
@@ -600,6 +654,7 @@ jobs:
         working-directory: .
     needs:
       - pre-commit
+      - mypy
       - generate-matrix
       - adapter-coverage
 #      - cpu-tests
@@ -620,6 +675,7 @@ jobs:
         # lines when restoring either job.
         run: |-
           if ${{ contains(needs.pre-commit.result, 'failure') || contains(needs.pre-commit.result, 'cancelled') ||
+                 contains(needs.mypy.result, 'failure') || contains(needs.mypy.result, 'cancelled') ||
                  contains(needs.generate-matrix.result, 'failure') || contains(needs.generate-matrix.result, 'cancelled') ||
                  contains(needs.adapter-coverage.result, 'failure') || contains(needs.adapter-coverage.result, 'cancelled') ||
                  contains(needs.spyre-load-tests.result, 'failure') || contains(needs.spyre-load-tests.result, 'cancelled') ||
