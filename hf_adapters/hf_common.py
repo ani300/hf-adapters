@@ -1712,11 +1712,9 @@ def nested_region_block(block):
     call per layer instead of inlining N copies. Compile-once across the N
     layers is what keeps compile time flat for the whole-forward graph.
     """
-    # Wrap in a lambda to avoid AttributeError on bound methods.
-    @nested_compile_region
-    def forward(hidden_states, selected_freqs, attn_mask, key_cache, value_cache, is_filling, token_index, cache_position):
-        return block.forward(hidden_states, selected_freqs, attn_mask, key_cache, value_cache, is_filling, token_index, cache_position)
-    return forward
+    def wrapper(*args, **kwargs):
+        return block.forward(*args, **kwargs)
+    return nested_compile_region(wrapper)
 
 
 def prepare_standard_gqa_region_blocks(layers, is_res_mul=None):
