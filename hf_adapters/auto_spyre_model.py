@@ -192,6 +192,24 @@ MODEL_PATH_TO_TORCH_DTYPE: dict[str, torch.dtype] = {
 }
 
 
+def _resolve_run_forward_fn(model, eager_run_forward):
+    """Prefer the compiled whole-forward on ``model`` over the eager function.
+
+    generate() calls run_forward_fn(model, input_ids, ...). model._spyre_run_forward
+    closes over model and omits that leading arg, so wrap it in a shim that drops
+    the first positional (model) and forwards the rest. Falls back to the eager
+    _run_forward when no compiled forward is attached (non-hierarchical adapters).
+    """
+    compiled = getattr(model, "_spyre_run_forward", None)
+    if compiled is None:
+        return eager_run_forward
+
+    def run_forward_fn(_model, *args, **kwargs):
+        return compiled(*args, **kwargs)
+
+    return run_forward_fn
+
+
 def resolve_adapter_module(
     model_name_or_path: Union[str, os.PathLike[str]],
     mapping: dict[
@@ -284,7 +302,8 @@ class AutoSpyreModelForCausalLM(AutoSpyreModel):
         ):
             from hf_adapters.hf_common import generate
 
-            return generate(module._run_forward, self, tokenizer, prompts, **kwargs)
+            run_forward_fn = _resolve_run_forward_fn(self, module._run_forward)
+            return generate(run_forward_fn, self, tokenizer, prompts, **kwargs)
 
         model.generate = MethodType(model_generate, model)  # type: ignore[assignment]
 
