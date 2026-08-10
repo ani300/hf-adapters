@@ -1711,9 +1711,22 @@ def nested_region_block(block):
     compiled, Dynamo compiles this block once and emits one ``invoke_subgraph``
     call per layer instead of inlining N copies. Compile-once across the N
     layers is what keeps compile time flat for the whole-forward graph.
+
+    The wrapper drops the block's ``(key_cache, value_cache)`` return and
+    exposes only ``h``. ``StandardGQABlock`` updates the KV caches IN PLACE
+    (``kv_cache_update`` slice-assignment) and then returns those same buffers
+    for the eager (non-region) callers. But under the whole-forward compile the
+    region becomes an ``invoke_subgraph`` HOP call, and that HOP rejects a
+    subgraph output that aliases a subgraph input (input-to-output aliasing on
+    the KV caches). In-place mutation of a HOP input IS supported
+    (``auto_functionalize`` handles it) and is copy-free, so we keep the
+    mutation and discard the aliasing return here — leaving the shared
+    ``StandardGQABlock`` contract untouched for eager adapters (olmo,
+    granite_vision_mm, mistral3_vision_mm).
     """
     def wrapper(*args, **kwargs):
-        return block.forward(*args, **kwargs)
+        h, _key_cache, _value_cache = block.forward(*args, **kwargs)
+        return h
     return nested_compile_region(wrapper)
 
 
