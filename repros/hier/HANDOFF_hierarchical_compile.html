@@ -1,0 +1,548 @@
+<title>Hierarchical Compile Handoff</title>
+<style>
+  :root {
+    --paper: #f7f5f1;
+    --paper-raised: #fffefb;
+    --ink: #16181d;
+    --ink-soft: #4b4f57;
+    --ink-faint: #6b7280;
+    --rule: #e2ddd3;
+    --rule-strong: #cec7b9;
+    --accent: #3a5a8c;
+    --accent-soft: #eef2f8;
+    --done: #2f7d4f;
+    --done-bg: #ebf5ee;
+    --open: #b5730f;
+    --open-bg: #fbf1e0;
+    --drop: #6b7280;
+    --drop-bg: #eeeeec;
+    --code-bg: #edeae3;
+    --code-ink: #2a2d34;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #16181c;
+      --paper-raised: #1e2127;
+      --ink: #e9e6df;
+      --ink-soft: #b3b0a8;
+      --ink-faint: #8b8880;
+      --rule: #2c2f36;
+      --rule-strong: #3a3e46;
+      --accent: #8fb0e0;
+      --accent-soft: #232b38;
+      --done: #6cc48d;
+      --done-bg: #1a2c22;
+      --open: #e0a24a;
+      --open-bg: #2f2513;
+      --drop: #8b8880;
+      --drop-bg: #23252a;
+      --code-bg: #23262d;
+      --code-ink: #d2cfc8;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #16181c;
+    --paper-raised: #1e2127;
+    --ink: #e9e6df;
+    --ink-soft: #b3b0a8;
+    --ink-faint: #8b8880;
+    --rule: #2c2f36;
+    --rule-strong: #3a3e46;
+    --accent: #8fb0e0;
+    --accent-soft: #232b38;
+    --done: #6cc48d;
+    --done-bg: #1a2c22;
+    --open: #e0a24a;
+    --open-bg: #2f2513;
+    --drop: #8b8880;
+    --drop-bg: #23252a;
+    --code-bg: #23262d;
+    --code-ink: #d2cfc8;
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 17px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 60rem;
+    margin: 0 auto;
+    padding: clamp(1.5rem, 4vw, 4rem) clamp(1.1rem, 4vw, 3rem) 6rem;
+  }
+  code, kbd, .mono {
+    font-family: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    font-size: 0.86em;
+  }
+  code {
+    background: var(--code-bg);
+    color: var(--code-ink);
+    padding: 0.1em 0.38em;
+    border-radius: 4px;
+    word-break: break-word;
+  }
+  a { color: var(--accent); text-underline-offset: 2px; }
+
+  /* ---- Masthead ---- */
+  .masthead {
+    border-bottom: 2px solid var(--ink);
+    padding-bottom: 1.4rem;
+    margin-bottom: 2.4rem;
+  }
+  .eyebrow {
+    font-size: 0.72rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 650;
+    margin: 0 0 0.7rem;
+  }
+  h1 {
+    font-size: clamp(1.9rem, 5vw, 2.9rem);
+    line-height: 1.08;
+    letter-spacing: -0.022em;
+    margin: 0 0 0.8rem;
+    text-wrap: balance;
+    font-weight: 700;
+  }
+  .dek {
+    font-size: 1.08rem;
+    color: var(--ink-soft);
+    margin: 0;
+    max-width: 46rem;
+  }
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.4rem;
+    margin-top: 1.3rem;
+    font-size: 0.82rem;
+    color: var(--ink-faint);
+  }
+  .meta-row .mono { color: var(--ink-soft); }
+
+  /* ---- TL;DR panel ---- */
+  .tldr {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule-strong);
+    border-left: 4px solid var(--accent);
+    border-radius: 8px;
+    padding: 1.3rem 1.5rem;
+    margin: 0 0 2.8rem;
+  }
+  .tldr h2 { margin-top: 0; border: 0; padding: 0; font-size: 0.78rem; }
+  .tldr p { margin: 0.5rem 0 0; }
+  .tldr p:first-of-type { margin-top: 0.7rem; }
+
+  /* ---- Section headings ---- */
+  h2 {
+    font-size: 0.8rem;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    font-weight: 680;
+    color: var(--ink-faint);
+    border-top: 1px solid var(--rule);
+    padding-top: 1.5rem;
+    margin: 3.2rem 0 1.2rem;
+  }
+  h3 {
+    font-size: 1.28rem;
+    letter-spacing: -0.01em;
+    margin: 2rem 0 0.6rem;
+    font-weight: 660;
+    text-wrap: balance;
+  }
+  p { margin: 0.85rem 0; }
+  strong { font-weight: 650; }
+
+  /* ---- Status chips ---- */
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    font-size: 0.72rem;
+    font-weight: 640;
+    letter-spacing: 0.02em;
+    padding: 0.18em 0.62em;
+    border-radius: 100px;
+    white-space: nowrap;
+    vertical-align: middle;
+  }
+  .chip::before {
+    content: "";
+    width: 0.5em; height: 0.5em;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .chip.done { color: var(--done); background: var(--done-bg); }
+  .chip.open { color: var(--open); background: var(--open-bg); }
+  .chip.drop { color: var(--drop); background: var(--drop-bg); }
+  .chip.pr   { color: var(--accent); background: var(--accent-soft); }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem 1rem;
+    margin: 0.4rem 0 0;
+    padding: 0;
+    list-style: none;
+    font-size: 0.85rem;
+    color: var(--ink-soft);
+  }
+  .legend li { display: flex; align-items: center; gap: 0.5rem; }
+
+  /* ---- Pipeline (the dependency chain) ---- */
+  .pipeline {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    margin: 1.4rem 0 0;
+    counter-reset: step;
+  }
+  .stage {
+    position: relative;
+    display: grid;
+    grid-template-columns: 2.6rem 1fr;
+    gap: 0 1.1rem;
+    padding: 1.2rem 0 1.5rem;
+    border-top: 1px solid var(--rule);
+  }
+  .stage:first-child { border-top: 0; }
+  .node {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .node .num {
+    width: 2.4rem; height: 2.4rem;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    font-family: ui-monospace, monospace;
+    font-size: 0.95rem;
+    font-weight: 600;
+    background: var(--accent);
+    color: #fff;
+    flex: none;
+  }
+  :root[data-theme="dark"] .node .num,
+  :root:not([data-theme="light"]) .node .num { color: #10141c; }
+  @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .node .num { color: #fff; } }
+  .stage.merged .node .num { background: var(--done); }
+  .stage.blocked .node .num { background: var(--open); }
+  .node .stem {
+    flex: 1;
+    width: 2px;
+    background: var(--rule-strong);
+    margin-top: 0.4rem;
+    min-height: 0.5rem;
+  }
+  .stage:last-child .node .stem { display: none; }
+  .stage-body h3 { margin-top: 0.1rem; font-size: 1.15rem; }
+  .stage-head {
+    display: flex; flex-wrap: wrap; align-items: baseline;
+    gap: 0.5rem 0.9rem;
+  }
+  .stage-head .branch { font-size: 0.82rem; color: var(--ink-faint); }
+  .stage-body .depends {
+    font-size: 0.8rem;
+    color: var(--ink-faint);
+    margin: 0.15rem 0 0.7rem;
+  }
+  .stage-body ul { margin: 0.5rem 0 0; padding-left: 1.1rem; }
+  .stage-body li { margin: 0.28rem 0; }
+  .filelist { margin-top: 0.7rem; }
+
+  /* ---- Tables ---- */
+  .table-scroll { overflow-x: auto; margin: 1rem 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.88rem;
+    min-width: 34rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.55rem 0.85rem;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  th {
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 640;
+    border-bottom: 1.5px solid var(--rule-strong);
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  td .mono { color: var(--ink-soft); }
+
+  /* ---- Callout ---- */
+  .note {
+    background: var(--open-bg);
+    border: 1px solid var(--open);
+    border-radius: 8px;
+    padding: 1rem 1.3rem;
+    margin: 1.4rem 0;
+    font-size: 0.95rem;
+  }
+  .note .tag {
+    font-size: 0.72rem; font-weight: 680; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--open);
+    display: block; margin-bottom: 0.35rem;
+  }
+  .note.info { background: var(--accent-soft); border-color: var(--accent); }
+  .note.info .tag { color: var(--accent); }
+
+  ul.plain { padding-left: 1.15rem; }
+  ul.plain li { margin: 0.35rem 0; }
+
+  .foot {
+    margin-top: 3.5rem;
+    border-top: 1px solid var(--rule);
+    padding-top: 1.2rem;
+    font-size: 0.82rem;
+    color: var(--ink-faint);
+  }
+  @media (max-width: 34rem) {
+    .stage { grid-template-columns: 2rem 1fr; }
+    .node .num { width: 1.9rem; height: 1.9rem; font-size: 0.82rem; }
+  }
+</style>
+
+<div class="wrap">
+  <header class="masthead">
+    <p class="eyebrow">Engineering handoff · IBM Spyre</p>
+    <h1>Full-Graph Compile with Hierarchical Compilation</h1>
+    <p class="dek">Compile Granite 3.3's entire causal-LM forward as one <code>torch.compile</code> graph, with all decoder layers sharing a single <code>invoke_subgraph</code> body (compile-once), correct and token-matching on the Spyre card. This is where the work stands and what remains to ship.</p>
+    <div class="meta-row">
+      <span>Repos: <span class="mono">torch-spyre</span> · <span class="mono">hf-adapters</span></span>
+      <span>As of <span class="mono">2026-08-13</span></span>
+      <span>1 PR open · 5 to create</span>
+    </div>
+  </header>
+
+  <section class="tldr">
+    <h2>Bottom line</h2>
+    <p><strong>Eager path is green</strong> (5/5 token-match vs HF CPU). The <strong>whole-forward compiled path is 0/5</strong> (<span class="mono">max_diff 13.76</span>), blocked on the Inductor <code>invoke_subgraph</code> work being incomplete and uncommitted in torch-spyre.</p>
+    <p>Exactly <strong>one PR exists</strong> — torch-spyre <a href="https://github.com/torch-spyre/torch-spyre/pull/3647">#3647</a>, the foundation. Everything else lives as dirty/untracked changes in two working trees. Five PRs need creating in dependency order; the single high-uncertainty item is <strong>Blocker&nbsp;3</strong> (open, device-proven).</p>
+    <p class="depends" style="margin-top:0.8rem;color:var(--ink-faint);font-size:0.82rem;">The <em>numeric</em> fix (Blocker&nbsp;6) is fully device-verified — all four discriminators <span class="mono">0.000000</span>. It's the cleanest piece and gates correctness once the graph runs.</p>
+  </section>
+
+  <h2>How the pieces fit</h2>
+  <p>The whole forward — <code>embed×multiplier → 40-block loop → norm → lm_head → /logits_scaling</code> — becomes <strong>one</strong> compiled graph. Each decoder layer is wrapped in <code>torch.compiler.nested_compile_region</code>, so all layers reuse a single <code>invoke_subgraph</code> HOP body. That keeps compile time flat regardless of layer count (compile-once), instead of compiling 40 blocks individually with an eager prologue/epilogue.</p>
+  <p>Two host-side behaviors must stay <em>outside</em> the graph: <strong>RoPE</strong> (its cache-extend does <code>.item()</code>-driven CPU fancy-indexing) is hoisted so the body consumes <code>selected_freqs</code> as a graph input; and the in-place <strong>KV mutation</strong> is preserved (copy-free, via <code>auto_functionalize</code>) while the aliasing return is dropped, because <code>invoke_subgraph</code> rejects a subgraph output that aliases a subgraph input.</p>
+
+  <h2>Status legend</h2>
+  <ul class="legend">
+    <li><span class="chip done">Verified / merged-ready</span></li>
+    <li><span class="chip open">Open / blocked</span></li>
+    <li><span class="chip pr">PR exists</span></li>
+    <li><span class="chip drop">Do not ship</span></li>
+  </ul>
+
+  <h2>The blocker map</h2>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr><th>Blocker</th><th>What it is</th><th>State</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Guard</strong></td>
+          <td><code>_spyre_TENSOR_MATCH</code> unregistered in <code>GUARD_VALUE_DISPATCH</code> → any <code>nested_compile_region</code> use aborts the process globally.</td>
+          <td><span class="chip pr">PR #3647</span></td>
+        </tr>
+        <tr>
+          <td><strong>1</strong></td>
+          <td><code>split_multi_ops</code> foreign-origin assert — subgraph buffer origins union parent+subgraph FX graphs; <code>next(iter(origins))</code> picks a foreign node → "Node to insert before is not in graph".</td>
+          <td><span class="chip done">Fixed</span></td>
+        </tr>
+        <tr>
+          <td><strong>2</strong></td>
+          <td>Subgraph wrapper had no Spyre codegen — no <code>invoke_subgraph</code> body could emit valid Spyre code.</td>
+          <td><span class="chip done">Fixed</span></td>
+        </tr>
+        <tr>
+          <td><strong>3</strong></td>
+          <td>RoPE mul-over-size-2-axis + <code>.sum(4)</code> mis-lowers to a <code>batchmatmul</code> inside the HOP that can't stick <code>y_var=d1</code> → device abort. <strong>This is the live cause of 0/5.</strong></td>
+          <td><span class="chip open">Open</span></td>
+        </tr>
+        <tr>
+          <td><strong>6</strong></td>
+          <td>Shared-weight unit-BMM: helper rewrote an <em>already-present</em> physical unit axis on the 3 Granite MLP projections → corrupted iteration space → numeric residual.</td>
+          <td><span class="chip done">Fixed (device-verified)</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note">
+    <span class="tag">Resolve before touching Blocker 3</span>
+    Two design docs tell contradictory Blocker-3 stories. <code>INVOKE_SUBGRAPH_LAYOUT_DESIGN.md</code> proposes a subgraph-input-STL / layout-starvation fix — that theory was <strong>REFUTED on device</strong>. The authoritative <code>INVOKE_SUBGRAPH_SPLIT_DIAGNOSIS.md</code> pins the real cause to the RoPE size-2 → batchmatmul mis-lowering. <strong>Trust the code + the diagnosis doc, not the design doc.</strong> Verify on-device which fix clears the abort; it may move to <code>work_division</code> — investigate there, don't pre-fix.
+  </div>
+
+  <h2>The PR plan — land in this order</h2>
+  <p>The numbers are the landing sequence: each stage depends on the ones above it reaching <code>main</code> (or being stacked on the prior branch). Stages 0–2 and 5 are done in code; stages 3 needs a decision, 4 is verified-and-ready.</p>
+
+  <div class="pipeline">
+
+    <div class="stage merged">
+      <div class="node"><div class="num">0</div><div class="stem"></div></div>
+      <div class="stage-body">
+        <div class="stage-head">
+          <h3>Guard reuse — the foundation</h3>
+          <span class="chip pr">PR #3647 · OPEN · MERGEABLE</span>
+        </div>
+        <p class="branch mono">fix/spyre-tensor-match-subgraph-reuse · a1310bc · +192/−0</p>
+        <p>Registers the layout-aware <code>GuardCheckSpec</code> for <code>_spyre_TENSOR_MATCH</code> in <code>GUARD_VALUE_DISPATCH</code>. Self-contained. Everything else sits on top of it.</p>
+        <p><strong>Action:</strong> get it reviewed and merged. Nothing downstream lands cleanly until this is in.</p>
+        <div class="filelist">
+          <div class="table-scroll"><table><tbody>
+            <tr><td class="mono">torch_spyre/_monkey_patch.py</td><td>guard spec (lines ~283–346)</td></tr>
+            <tr><td class="mono">tests/test_nested_compile_region_guard.py</td><td>CPU test — belongs to #3647</td></tr>
+          </tbody></table></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="node"><div class="num">A</div><div class="stem"></div></div>
+      <div class="stage-body">
+        <div class="stage-head">
+          <h3>Subgraph wrapper codegen + decomp threading</h3>
+          <span class="chip open">To create</span>
+        </div>
+        <p class="branch mono">e.g. fix/invoke-subgraph-wrapper-and-decomp</p>
+        <p class="depends">Depends on #3647. <strong>Must be stacked on / rebased after <code>a1310bc</code></strong>, not main.</p>
+        <p>Pure enablement: the wrapper mixin lets an <code>invoke_subgraph</code> body emit valid Spyre code (Blocker 2); the decomp threading makes the HOP body decompose like its parent (needed for SDPA, Blocker 6 shape).</p>
+        <div class="note info">
+          <span class="tag">Do not double-ship the guard</span>
+          <code>_monkey_patch.py</code> is dirty as a <em>superset</em> of #3647. Diff this branch against <code>a1310bc</code> so it carries <strong>only</strong> the <code>_patch_invoke_subgraph_decompositions</code> + <code>in_spyre_compile</code> delta — never the guard spec again. Do not re-add <code>test_nested_compile_region_guard.py</code>.
+        </div>
+        <div class="filelist"><div class="table-scroll"><table><tbody>
+          <tr><td class="mono">torch_spyre/_inductor/wrapper.py</td><td><code>_SpyreWrapperCodegenMixin</code> + <code>SpyreSubgraphPythonWrapperCodegen</code></td></tr>
+          <tr><td class="mono">torch_spyre/_inductor/__init__.py</td><td><code>_compile_state</code> thread-local + <code>in_spyre_compile()</code></td></tr>
+          <tr><td class="mono">torch_spyre/_monkey_patch.py</td><td>decomp-threading delta only (vs #3647)</td></tr>
+          <tr><td class="mono">tests/inductor/test_codegen.py</td><td><code>TestInjectPoolAllocDealloc</code></td></tr>
+        </tbody></table></div></div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="node"><div class="num">B</div><div class="stem"></div></div>
+      <div class="stage-body">
+        <div class="stage-head">
+          <h3>Origin-in-graph selection (Blocker 1)</h3>
+          <span class="chip open">To create</span>
+        </div>
+        <p class="branch mono">e.g. fix/invoke-subgraph-origin-in-graph</p>
+        <p class="depends">Depends on PR-A (fixing this is what first <em>reaches</em> the wrapper code A fixes).</p>
+        <p>Adds <code>_origin_in_graph</code> to pick the origin whose <code>.graph</code> is the current graph — clears the "Node to insert before is not in graph" assert. Promote <code>repro_invoke_subgraph_split.py</code> to a host-only regression test.</p>
+        <div class="filelist"><div class="table-scroll"><table><tbody>
+          <tr><td class="mono">torch_spyre/_inductor/split_multi_ops.py</td><td><code>_origin_in_graph</code> helper + 3 call sites</td></tr>
+          <tr><td class="mono">torch_spyre/_inductor/scratchpad/graph_editor.py</td><td>use helper vs <code>list(origins)[0]</code></td></tr>
+        </tbody></table></div></div>
+      </div>
+    </div>
+
+    <div class="stage blocked">
+      <div class="node"><div class="num">C</div><div class="stem"></div></div>
+      <div class="stage-body">
+        <div class="stage-head">
+          <h3>Blocker 3 — the RoPE size-2 batchmatmul</h3>
+          <span class="chip open">Open · undecided · device-proven</span>
+        </div>
+        <p class="branch mono">e.g. fix/invoke-subgraph-rope-size2-contraction</p>
+        <p class="depends">Depends on PR-B (needs codegen to reach the layout path at all). <strong>The single highest-uncertainty item on the whole path.</strong></p>
+        <p>This is what makes <code>whole_forward_e2e.py -k granite</code> 0/5. The dirty <code>propagate_layouts.py</code> holds a forward-seed <code>_subgraph_input_stls</code> attempt whose <em>premise is refuted</em> — do not assume it's the fix. Decide RoPE-batchmatmul vs. subgraph-input-STL on device first (see the callout above). Correct <code>repro_invoke_subgraph_matmul.py</code>'s stale docstring before promoting it to a test.</p>
+        <div class="filelist"><div class="table-scroll"><table><tbody>
+          <tr><td class="mono">torch_spyre/_inductor/propagate_layouts.py</td><td>dirty forward-seed attempt (premise refuted — re-examine)</td></tr>
+          <tr><td class="mono">repro_invoke_subgraph_matmul.py</td><td>fix docstring, then promote to regression test</td></tr>
+        </tbody></table></div></div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="node"><div class="num">D</div><div class="stem"></div></div>
+      <div class="stage-body">
+        <div class="stage-head">
+          <h3>Blocker 6 — shared-weight unit-BMM numeric fix</h3>
+          <span class="chip done">Device-verified · cleanest piece</span>
+        </div>
+        <p class="branch mono">e.g. fix/shared-weight-unit-bmm-present-axis</p>
+        <p class="depends">Independent in code; only <em>matters</em> once the compile-once path runs. Can land first among B/C/D on its own correctness merits.</p>
+        <p>Early-return guard in <code>_preserve_shared_weight_unit_bmm_dim</code>: only insert/recover a unit axis when it was squeezed away on both target args; leave an already-present physical unit axis unchanged. Body discriminator <span class="mono">14.61 → 8.66 → 0.000000</span>; all four device discriminators <span class="mono">0.000000</span>; stock eager token-compare 5/5.</p>
+        <div class="filelist"><div class="table-scroll"><table><tbody>
+          <tr><td class="mono">torch_spyre/_inductor/spyre_kernel.py</td><td><code>_preserve_shared_weight_unit_bmm_dim</code> early-return guard</td></tr>
+          <tr><td class="mono">torch_spyre/_inductor/temp_passes.py</td><td><code>_has_rank_expanding_reshape_user</code> gate</td></tr>
+          <tr><td class="mono">tests/inductor/test_coarse_tiling.py</td><td><code>TestSharedWeightUnitBmmLayout</code> — 6 passed</td></tr>
+        </tbody></table></div></div>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="node"><div class="num">E</div><div class="stem"></div></div>
+      <div class="stage-body">
+        <div class="stage-head">
+          <h3>hf-adapters — Granite whole-forward wiring</h3>
+          <span class="chip open">Branch exists · unpushed · no PR</span>
+        </div>
+        <p class="branch mono">worktree-hier-compile · 6 commits ahead of origin/main</p>
+        <p class="depends">Depends on #3647 for CPU gates; on PR-A…D for on-device green.</p>
+        <p>The region wrapper, RoPE hoist, KV-alias drop, generate routing, and device gate. <strong>First commit the dirty tree</strong> — <code>hf_common.py</code> carries the load-bearing closure→positional <code>_shared_region_block</code> fix (a closure captures layer-0 cells for all layers; passing the block positionally is what makes each layer use its own weights).</p>
+        <div class="filelist"><div class="table-scroll"><table><tbody>
+          <tr><td class="mono">hf_adapters/hf_common.py</td><td>dirty — <code>_shared_region_block</code> positional fix + region-block builders</td></tr>
+          <tr><td class="mono">hf_adapters/hf_granite.py</td><td>committed — RoPE hoist, freqs-as-input, region loop, <code>_spyre_run_forward</code></td></tr>
+          <tr><td class="mono">hf_adapters/auto_spyre_model.py</td><td>committed — generate routes through compiled forward</td></tr>
+          <tr><td class="mono">tests/test_nested_region_*.py</td><td>dirty — CPU compile-once / KV-contract gates</td></tr>
+          <tr><td class="mono">repros/hier/whole_forward_e2e.py</td><td>committed — device token-compare gate (the pytest that must go green)</td></tr>
+        </tbody></table></div></div>
+      </div>
+    </div>
+
+  </div>
+
+  <p style="margin-top:1.6rem;">Follow-ups <em>not</em> part of the above — land only if forward-only still fails token-match on device: reverse-MultiOutput layout fixup, and <code>work_division</code> seeding. Both are described in <code>INVOKE_SUBGRAPH_LAYOUT_DESIGN.md</code> as design-only.</p>
+
+  <h2>Critical path to a green gate</h2>
+  <p>To get <code>whole_forward_e2e.py -k granite</code> passing on the card:</p>
+  <ol>
+    <li>Merge <strong>#3647</strong> (guard reuse) — unblocks <code>nested_compile_region</code> from process-global abort.</li>
+    <li>Land <strong>PR-A</strong> — without the Spyre subgraph wrapper, no <code>invoke_subgraph</code> body emits valid code.</li>
+    <li>Land <strong>PR-B</strong> — clears the origin assert.</li>
+    <li>Resolve + land <strong>PR-C</strong> (Blocker 3) — verify on device the abort clears; this is the real unblock for 0/5 → passing.</li>
+    <li><strong>PR-D</strong> is already device-correct — ensures the shared body is numerically right once it runs.</li>
+    <li>Commit the dirty <code>hf_common.py</code> fix, push <strong>PR-E</strong>, run the device gate. Require every discriminator <span class="mono">0.000000</span>, then green token-compare.</li>
+  </ol>
+
+  <h2>Watch-outs the incoming engineer will hit</h2>
+  <ul class="plain">
+    <li><strong>Co-mingled dirty tree.</strong> torch-spyre changes span Blockers 1/2/3 <em>and</em> the separate Blocker 6 fix, all dirty in one tree on the unrelated branch <code>perf/embedding-gather-optimal-layout</code>. Splitting into PR-A/B/C/D is per-hunk surgery — one stray <code>git checkout</code> loses work. Snapshot before splitting.</li>
+    <li><strong>Design doc drift.</strong> <code>INVOKE_SUBGRAPH_LAYOUT_DESIGN.md</code> proposes an approach the shipped code did <em>not</em> take (parent-side push + reverse MultiOutput). Annotate or supersede it; don't build from it.</li>
+    <li><strong>Structural assumption unvalidated.</strong> The <code>_subgraph_input_stls</code> approach assumes one <code>InvokeSubgraph</code> per body. A shared body reused across call-sites with different operand STLs would break first-match. Unproven — flag if you keep that path.</li>
+    <li><strong>Rebuild rule.</strong> Python-only <code>_inductor</code> edits need no rebuild; C++ changes need <code>build-torch-spyre.sh --local-pytorch</code>. After <code>_inductor</code> edits, move the inductor cache aside (<code>TORCHINDUCTOR_CACHE_DIR</code>) or stale codegen bites.</li>
+    <li><strong>Device runs.</strong> Single-tenant VFIO card + real Granite weights; can't run in normal CI. Don't <code>manual_seed</code> in device repros; don't kill/relaunch to clear VFIO; move caches aside, never recursively delete.</li>
+  </ul>
+
+  <h2>What not to ship</h2>
+  <p><span class="chip drop">Do not PR</span> One-off diagnostics whose hypotheses are now closed (address-binding, fold-planner, raw-launch, LX/HBM-pool):</p>
+  <div class="table-scroll"><table><tbody>
+    <tr><td class="mono">repros/hier/shared_region_bisect.py</td><td class="mono">two_layer_call_isolation.py</td></tr>
+    <tr><td class="mono">two_layer_shared_region.py</td><td class="mono">single_layer_layout_dump.py</td></tr>
+    <tr><td class="mono">n1_vs_n2_codegen_diff.py</td><td class="mono">seq_launch_control.py</td></tr>
+    <tr><td class="mono">subgraph_addr_branch_probe.py</td><td class="mono">instrument_prefill_divergence.py</td></tr>
+  </tbody></table></div>
+  <p><strong>Scrub before any PR:</strong> the <code>granite8b_trace.json</code> artifact (gitignore/delete); all <code>B6_*</code> diagnostic env toggles (<code>B6_FOLD_DUMP</code> already reverted in <code>work_division.py</code>; scrub the residual <code>B6DIAG3</code> comment in <code>_monkey_patch.py</code>); the refuted rationale in <code>repro_invoke_subgraph_matmul.py</code>'s docstring.</p>
+  <p><strong>Team call:</strong> the 8 canonical device gates (<code>standalone_body_discriminator.py</code> is the canonical one — re-run any candidate fix against it first, plus the single-projection / attention / projection-consumer discriminators and the projection/qkv/sdpa/sdpa-output rungs). They're the durable regression ladder for the shared-region fix but hard-require the single-tenant card + real weights + the dirty tree, so they can't run in normal CI. Land under a dedicated device-repro area or keep as local tooling.</p>
+
+  <div class="foot">
+    <p>Ground truth confirmed against live <code>git</code>/<code>gh</code> state and the four device discriminator logs on 2026-08-13. No commits have been made in either tree; all changes above are preserved as-is. The authoritative status doc is <code>torch-spyre/INVOKE_SUBGRAPH_SPLIT_DIAGNOSIS.md</code>; the numeric-fix record is memory <code>project-blocker6-unit-bmm-present-axis</code>.</p>
+  </div>
+</div>
