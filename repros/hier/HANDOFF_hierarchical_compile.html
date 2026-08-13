@@ -332,7 +332,7 @@
   <section class="tldr">
     <h2>Bottom line</h2>
     <p><strong>Eager path is green</strong> (5/5 token-match vs HF CPU). The <strong>whole-forward compiled path is 0/5</strong> (<span class="mono">max_diff 13.76</span>), blocked on the Inductor <code>invoke_subgraph</code> work being incomplete and uncommitted in torch-spyre.</p>
-    <p>Exactly <strong>one PR exists</strong> — torch-spyre <a href="https://github.com/torch-spyre/torch-spyre/pull/3647">#3647</a>, the foundation. Everything else lives as dirty/untracked changes in two working trees. Five PRs need creating in dependency order; the single high-uncertainty item is <strong>Blocker&nbsp;3</strong> (open, device-proven).</p>
+    <p>Exactly <strong>one upstream PR exists</strong> — torch-spyre <a href="https://github.com/torch-spyre/torch-spyre/pull/3647">#3647</a>, the foundation. The other five stages are now <strong>committed and pushed as branches on the <code>ani300</code> forks</strong> (see each stage below for its branch + compare URL); they still need PRs opened against <code>torch-spyre/torch-spyre</code> and the hf-adapters upstream. The single high-uncertainty item is <strong>Blocker&nbsp;3</strong> (open, device-proven, pushed as a WIP branch).</p>
     <p class="depends" style="margin-top:0.8rem;color:var(--ink-faint);font-size:0.82rem;">The <em>numeric</em> fix (Blocker&nbsp;6) is fully device-verified — all four discriminators <span class="mono">0.000000</span>. It's the cleanest piece and gates correctness once the graph runs.</p>
   </section>
 
@@ -389,7 +389,7 @@
   </div>
 
   <h2>The PR plan — land in this order</h2>
-  <p>The numbers are the landing sequence: each stage depends on the ones above it reaching <code>main</code> (or being stacked on the prior branch). Stages 0–2 and 5 are done in code; stages 3 needs a decision, 4 is verified-and-ready.</p>
+  <p>The numbers are the landing sequence: each stage depends on the ones above it reaching <code>main</code> (or being stacked on the prior branch). Stages 0–2 and 5 are done in code; stage 3 needs a decision, 4 is verified-and-ready. <strong>All five are already committed and pushed</strong> — A→B→C are stacked (each branches off the previous, ultimately off #3647's head <code>a1310bc</code>), D is standalone on <code>a1310bc</code>, and E is on the hf-adapters worktree branch. Open PRs in this same order.</p>
 
   <div class="pipeline">
 
@@ -417,10 +417,10 @@
       <div class="stage-body">
         <div class="stage-head">
           <h3>Subgraph wrapper codegen + decomp threading</h3>
-          <span class="chip open">To create</span>
+          <span class="chip pr">Pushed · PR to open</span>
         </div>
-        <p class="branch mono">e.g. fix/invoke-subgraph-wrapper-and-decomp</p>
-        <p class="depends">Depends on #3647. <strong>Must be stacked on / rebased after <code>a1310bc</code></strong>, not main.</p>
+        <p class="branch mono"><a href="https://github.com/ani300/torch-spyre/pull/new/wip/hier-A-wrapper-decomp">wip/hier-A-wrapper-decomp</a> · 4efe2a0 · off a1310bc</p>
+        <p class="depends">Depends on #3647. Branched directly off <code>a1310bc</code> (#3647's head) so it carries only the delta — B and C are stacked on top of this.</p>
         <p>Pure enablement: the wrapper mixin lets an <code>invoke_subgraph</code> body emit valid Spyre code (Blocker 2); the decomp threading makes the HOP body decompose like its parent (needed for SDPA, Blocker 6 shape).</p>
         <div class="note info">
           <span class="tag">Do not double-ship the guard</span>
@@ -440,10 +440,10 @@
       <div class="stage-body">
         <div class="stage-head">
           <h3>Origin-in-graph selection (Blocker 1)</h3>
-          <span class="chip open">To create</span>
+          <span class="chip pr">Pushed · PR to open</span>
         </div>
-        <p class="branch mono">e.g. fix/invoke-subgraph-origin-in-graph</p>
-        <p class="depends">Depends on PR-A (fixing this is what first <em>reaches</em> the wrapper code A fixes).</p>
+        <p class="branch mono"><a href="https://github.com/ani300/torch-spyre/pull/new/wip/hier-B-origin-in-graph">wip/hier-B-origin-in-graph</a> · eaa7982 · stacked on A</p>
+        <p class="depends">Depends on PR-A (fixing this is what first <em>reaches</em> the wrapper code A fixes); branch is stacked directly on <code>wip/hier-A-wrapper-decomp</code>.</p>
         <p>Adds <code>_origin_in_graph</code> to pick the origin whose <code>.graph</code> is the current graph — clears the "Node to insert before is not in graph" assert. Promote <code>repro_invoke_subgraph_split.py</code> to a host-only regression test.</p>
         <div class="filelist"><div class="table-scroll"><table><tbody>
           <tr><td class="mono">torch_spyre/_inductor/split_multi_ops.py</td><td><code>_origin_in_graph</code> helper + 3 call sites</td></tr>
@@ -457,10 +457,10 @@
       <div class="stage-body">
         <div class="stage-head">
           <h3>Blocker 3 — the RoPE size-2 batchmatmul</h3>
-          <span class="chip open">Open · undecided · device-proven</span>
+          <span class="chip open">Pushed WIP · DO NOT MERGE · undecided</span>
         </div>
-        <p class="branch mono">e.g. fix/invoke-subgraph-rope-size2-contraction</p>
-        <p class="depends">Depends on PR-B (needs codegen to reach the layout path at all). <strong>The single highest-uncertainty item on the whole path.</strong></p>
+        <p class="branch mono"><a href="https://github.com/ani300/torch-spyre/pull/new/wip/hier-C-blocker3-rope-wip">wip/hier-C-blocker3-rope-wip</a> · 87de6b1 · stacked on B · WIP</p>
+        <p class="depends">Depends on PR-B (needs codegen to reach the layout path at all); branch is stacked on <code>wip/hier-B-origin-in-graph</code>. <strong>The single highest-uncertainty item on the whole path — pushed only to preserve the WIP, not as a merge candidate.</strong></p>
         <p>This is what makes <code>whole_forward_e2e.py -k granite</code> 0/5. The dirty <code>propagate_layouts.py</code> holds a forward-seed <code>_subgraph_input_stls</code> attempt whose <em>premise is refuted</em> — do not assume it's the fix. Decide RoPE-batchmatmul vs. subgraph-input-STL on device first (see the callout above). Correct <code>repro_invoke_subgraph_matmul.py</code>'s stale docstring before promoting it to a test.</p>
         <div class="filelist"><div class="table-scroll"><table><tbody>
           <tr><td class="mono">torch_spyre/_inductor/propagate_layouts.py</td><td>dirty forward-seed attempt (premise refuted — re-examine)</td></tr>
@@ -474,10 +474,10 @@
       <div class="stage-body">
         <div class="stage-head">
           <h3>Blocker 6 — shared-weight unit-BMM numeric fix</h3>
-          <span class="chip done">Device-verified · cleanest piece</span>
+          <span class="chip done">Device-verified · pushed · cleanest piece</span>
         </div>
-        <p class="branch mono">e.g. fix/shared-weight-unit-bmm-present-axis</p>
-        <p class="depends">Independent in code; only <em>matters</em> once the compile-once path runs. Can land first among B/C/D on its own correctness merits.</p>
+        <p class="branch mono"><a href="https://github.com/ani300/torch-spyre/pull/new/wip/hier-D-blocker6-unit-bmm">wip/hier-D-blocker6-unit-bmm</a> · b0a57a2 · off a1310bc (standalone)</p>
+        <p class="depends">Independent in code; only <em>matters</em> once the compile-once path runs. Branched standalone off <code>a1310bc</code> (not stacked on A/B/C) — can land first among B/C/D on its own correctness merits.</p>
         <p>Early-return guard in <code>_preserve_shared_weight_unit_bmm_dim</code>: only insert/recover a unit axis when it was squeezed away on both target args; leave an already-present physical unit axis unchanged. Body discriminator <span class="mono">14.61 → 8.66 → 0.000000</span>; all four device discriminators <span class="mono">0.000000</span>; stock eager token-compare 5/5.</p>
         <div class="filelist"><div class="table-scroll"><table><tbody>
           <tr><td class="mono">torch_spyre/_inductor/spyre_kernel.py</td><td><code>_preserve_shared_weight_unit_bmm_dim</code> early-return guard</td></tr>
@@ -492,11 +492,11 @@
       <div class="stage-body">
         <div class="stage-head">
           <h3>hf-adapters — Granite whole-forward wiring</h3>
-          <span class="chip open">Branch exists · unpushed · no PR</span>
+          <span class="chip pr">Pushed · PR to open</span>
         </div>
-        <p class="branch mono">worktree-hier-compile · 6 commits ahead of origin/main</p>
+        <p class="branch mono"><a href="https://github.com/ani300/hf-adapters/pull/new/worktree-hier-compile">worktree-hier-compile</a> · c20417d · pushed to ani300/hf-adapters</p>
         <p class="depends">Depends on #3647 for CPU gates; on PR-A…D for on-device green.</p>
-        <p>The region wrapper, RoPE hoist, KV-alias drop, generate routing, and device gate. <strong>First commit the dirty tree</strong> — <code>hf_common.py</code> carries the load-bearing closure→positional <code>_shared_region_block</code> fix (a closure captures layer-0 cells for all layers; passing the block positionally is what makes each layer use its own weights).</p>
+        <p>The region wrapper, RoPE hoist, KV-alias drop, generate routing, and device gate. The dirty tree is now committed as <code>c20417d</code> — <code>hf_common.py</code> carries the load-bearing closure→positional <code>_shared_region_block</code> fix (a closure captures layer-0 cells for all layers; passing the block positionally is what makes each layer use its own weights). That commit also lands the 8 standalone discriminators, both BLOCKER6 docs, and this HANDOFF; the closed-hypothesis probes and the trace dump were intentionally left out.</p>
         <div class="filelist"><div class="table-scroll"><table><tbody>
           <tr><td class="mono">hf_adapters/hf_common.py</td><td>dirty — <code>_shared_region_block</code> positional fix + region-block builders</td></tr>
           <tr><td class="mono">hf_adapters/hf_granite.py</td><td>committed — RoPE hoist, freqs-as-input, region loop, <code>_spyre_run_forward</code></td></tr>
@@ -519,12 +519,12 @@
     <li>Land <strong>PR-B</strong> — clears the origin assert.</li>
     <li>Resolve + land <strong>PR-C</strong> (Blocker 3) — verify on device the abort clears; this is the real unblock for 0/5 → passing.</li>
     <li><strong>PR-D</strong> is already device-correct — ensures the shared body is numerically right once it runs.</li>
-    <li>Commit the dirty <code>hf_common.py</code> fix, push <strong>PR-E</strong>, run the device gate. Require every discriminator <span class="mono">0.000000</span>, then green token-compare.</li>
+<strong>PR-E</strong> is committed and pushed (<code>c20417d</code> on <code>worktree-hier-compile</code>); the remaining action is to run the device gate once A–D are in. Require every discriminator <span class="mono">0.000000</span>, then green token-compare.</li>
   </ol>
 
   <h2>Watch-outs the incoming engineer will hit</h2>
   <ul class="plain">
-    <li><strong>Co-mingled dirty tree.</strong> torch-spyre changes span Blockers 1/2/3 <em>and</em> the separate Blocker 6 fix, all dirty in one tree on the unrelated branch <code>perf/embedding-gather-optimal-layout</code>. Splitting into PR-A/B/C/D is per-hunk surgery — one stray <code>git checkout</code> loses work. Snapshot before splitting.</li>
+    <li><strong>Already split &amp; pushed (was a co-mingled dirty tree).</strong> The torch-spyre changes originally lived dirty in one tree on the unrelated branch <code>perf/embedding-gather-optimal-layout</code> (Blockers 1/2/3 <em>and</em> the separate Blocker 6 fix intermixed). They have since been split via per-hunk surgery into the four pushed branches — A/B/C stacked off <code>a1310bc</code>, D standalone off <code>a1310bc</code>. The guard spec + <code>test_nested_compile_region_guard.py</code> were deliberately kept out of all four (they belong to #3647). Safety snapshots: torch-spyre <code>backup/hier-snapshot-20260813</code> and <code>/tmp/hier-backup-20260813/</code>. When rebasing onto a newer <code>a1310bc</code>, re-verify each branch still carries only its delta.</li>
     <li><strong>Design doc drift.</strong> <code>INVOKE_SUBGRAPH_LAYOUT_DESIGN.md</code> proposes an approach the shipped code did <em>not</em> take (parent-side push + reverse MultiOutput). Annotate or supersede it; don't build from it.</li>
     <li><strong>Structural assumption unvalidated.</strong> The <code>_subgraph_input_stls</code> approach assumes one <code>InvokeSubgraph</code> per body. A shared body reused across call-sites with different operand STLs would break first-match. Unproven — flag if you keep that path.</li>
     <li><strong>Rebuild rule.</strong> Python-only <code>_inductor</code> edits need no rebuild; C++ changes need <code>build-torch-spyre.sh --local-pytorch</code>. After <code>_inductor</code> edits, move the inductor cache aside (<code>TORCHINDUCTOR_CACHE_DIR</code>) or stale codegen bites.</li>
@@ -543,6 +543,6 @@
   <p><strong>Team call:</strong> the 8 canonical device gates (<code>standalone_body_discriminator.py</code> is the canonical one — re-run any candidate fix against it first, plus the single-projection / attention / projection-consumer discriminators and the projection/qkv/sdpa/sdpa-output rungs). They're the durable regression ladder for the shared-region fix but hard-require the single-tenant card + real weights + the dirty tree, so they can't run in normal CI. Land under a dedicated device-repro area or keep as local tooling.</p>
 
   <div class="foot">
-    <p>Ground truth confirmed against live <code>git</code>/<code>gh</code> state and the four device discriminator logs on 2026-08-13. No commits have been made in either tree; all changes above are preserved as-is. The authoritative status doc is <code>torch-spyre/INVOKE_SUBGRAPH_SPLIT_DIAGNOSIS.md</code>; the numeric-fix record is memory <code>project-blocker6-unit-bmm-present-axis</code>.</p>
+    <p>Ground truth confirmed against live <code>git</code>/<code>gh</code> state and the four device discriminator logs on 2026-08-13. The work has since been committed and pushed as five branches on the <code>ani300</code> forks — four on <code>ani300/torch-spyre</code> (<code>wip/hier-A-wrapper-decomp</code>, <code>wip/hier-B-origin-in-graph</code>, <code>wip/hier-C-blocker3-rope-wip</code>, <code>wip/hier-D-blocker6-unit-bmm</code>) and one on <code>ani300/hf-adapters</code> (<code>worktree-hier-compile</code>) — with PRs still to be opened against upstream. The authoritative status doc is <code>torch-spyre/INVOKE_SUBGRAPH_SPLIT_DIAGNOSIS.md</code>; the numeric-fix record is memory <code>project-blocker6-unit-bmm-present-axis</code>.</p>
   </div>
 </div>
