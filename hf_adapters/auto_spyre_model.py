@@ -61,7 +61,6 @@ from transformers import (
     Granite4VisionConfig,
     GraniteConfig,
     GraniteMoeHybridConfig,
-    GraniteSWAConfig,
     LlamaConfig,
     MistralConfig,
     ModernBertConfig,
@@ -78,6 +77,9 @@ from transformers import (
 )
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import MaskedLMOutput, QuestionAnsweringModelOutput
+from transformers.models.granite_swa.configuration_granite_swa import (
+    GraniteSWAConfig,
+)
 from transformers.models.ministral.configuration_ministral import MinistralConfig
 from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
 

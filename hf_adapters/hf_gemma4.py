@@ -532,13 +532,60 @@ def _setup_gemma4_text_decoder(model, *, allow_moe=False):
     rmsnorm_cls = type(backbone.layers[0].input_layernorm)
     _patch_gemma4_rmsnorm(rmsnorm_cls)
 
-    head_dim = cfg.head_dim
-    global_head_dim = getattr(cfg, "global_head_dim", None) or head_dim
-    num_q_heads = cfg.num_attention_heads
-    num_kv_heads = cfg.num_key_value_heads
-    num_global_kv_heads = (
-        getattr(cfg, "num_global_key_value_heads", None) or num_kv_heads
+    # Per-layer attribute sourcing. Gemma 4's sliding and global (full_attention)
+    # layers carry different head_dim / num_key_value_heads. transformers >= 5.15
+    # stores these PER LAYER in ``cfg.per_layer_config`` and RAISES on the bare
+    # global ``cfg.head_dim`` / ``cfg.num_key_value_heads`` for such a
+    # heterogeneous config (and no longer exposes the flat ``global_head_dim`` /
+    # ``num_global_key_value_heads``). Resolve each per-type value from the first
+    # layer of that type in ``per_layer_config``; fall back to the flat globals
+    # for older configs / homogeneous variants that still expose them.
+    per_layer = getattr(cfg, "per_layer_config", None)
+    layer_types = cfg.layer_types
+
+    def _first_layer_of_type(lt):
+        for i, t in enumerate(layer_types):
+            if t == lt:
+                return per_layer[i]
+        return None
+
+    def _per_type_attr(layer_type, attr, flat_name, flat_fallback=None):
+        """head_dim / num_key_value_heads for a layer_type.
+
+        Prefer per_layer_config[first-of-type].<attr>; else the flat global
+        (guarded via the escape hatch when the config marks it per-layer)."""
+        if per_layer is not None:
+            lc = _first_layer_of_type(layer_type)
+            if lc is not None:
+                v = getattr(lc, attr, None)
+                if v is not None:
+                    return v
+        # Older / homogeneous config: read the flat attribute. Enable the
+        # escape hatch first so a heterogeneous-but-flat read does not raise.
+        try:
+            cfg.allow_global_per_layer_attribute_access = True
+        except Exception:
+            pass
+        v = getattr(cfg, flat_name, None)
+        return v if v is not None else flat_fallback
+
+    # Sliding layers: local head_dim / num_key_value_heads.
+    head_dim = _per_type_attr("sliding_attention", "head_dim", "head_dim")
+    num_kv_heads = _per_type_attr(
+        "sliding_attention", "num_key_value_heads", "num_key_value_heads"
     )
+    # Global (full_attention) layers: global head_dim / kv-head count. Fall back
+    # to the sliding values when the model has no full_attention layers.
+    global_head_dim = _per_type_attr(
+        "full_attention", "head_dim", "global_head_dim", flat_fallback=head_dim
+    )
+    num_global_kv_heads = _per_type_attr(
+        "full_attention",
+        "num_key_value_heads",
+        "num_global_key_value_heads",
+        flat_fallback=num_kv_heads,
+    )
+    num_q_heads = cfg.num_attention_heads
     attention_k_eq_v = getattr(cfg, "attention_k_eq_v", False)
 
     # Both head_dims must be stick-aligned for the RoPE [2, D/2] reshape.
