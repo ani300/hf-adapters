@@ -296,6 +296,20 @@ CAUSAL_LM_MODELS = {
         "size": "26b",
         "dtype": "bfloat16",
     },
+    "gemma4_e2b": {
+        "name": "Gemma 4 E2B",
+        "path": "google/gemma-4-E2B-it",
+        "adapter": "hf_gemma4.py",
+        "is_gated": True,
+        "size": "2b",
+    },
+    "gemma4_e4b": {
+        "name": "Gemma 4 E4B",
+        "path": "google/gemma-4-E4B",
+        "adapter": "hf_gemma4.py",
+        "is_gated": True,
+        "size": "4b",
+    },
     # DSpark speculative-decoding drafters (block proposers). kind="dspark_draft"
     # keeps them out of the generate-based causal-LM harnesses (see CAUSAL_PATHS);
     # tests/spyre/test_dspark_draft_spyre.py exercises the block-propose path.
@@ -786,6 +800,8 @@ NON_BLOCKING_CAUSAL_MODELS: dict[str, str] = _non_blocking(
         "gemma4_google",
         "gemma4_31b",
         "gemma4_moe",
+        "gemma4_e2b",  # E-variant device numerics under investigation (PR draft)
+        "gemma4_e4b",  # E-variant device numerics under investigation (PR draft)
     ),
 )
 
