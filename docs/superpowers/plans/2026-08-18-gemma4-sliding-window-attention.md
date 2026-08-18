@@ -1353,6 +1353,7 @@ import torch
 from _swa_helpers import identity_freqs, make_sliding_attention
 from hf_adapters.hf_common import (
     add_causal_sliding_window_band,
+    build_decode_mask,
     build_prefill_mask,
     make_cache_index,
 )
@@ -1797,6 +1798,7 @@ from _swa_helpers import FakeKVModel, identity_freqs, make_sliding_attention
 from hf_adapters.hf_common import (
     add_causal_sliding_window_band,
     allocate_kv_caches,
+    build_decode_mask,
     build_prefill_mask,
     make_cache_index,
 )
@@ -1882,7 +1884,13 @@ def test_decode_op_matches_band_mask():
     op = copy.deepcopy(band)
     op.swa_mode = "phase1"
 
-    mask = build_prefill_mask(1, 1, capacity, 0, dtype=DTYPE)
+    # build_decode_mask, not build_prefill_mask: a one-token step at a non-zero
+    # cache position must allow every real column up to that position, whereas
+    # build_prefill_mask masks everything past the query's *relative* row index
+    # and so allows only column 0. The band is combined additively, so an
+    # over-restrictive base cannot be widened back — every column ends up masked
+    # and the comparison fails for a reason unrelated to the wiring.
+    mask = build_decode_mask(1, capacity, written, 0, dtype=DTYPE)
     mask = add_causal_sliding_window_band(
         mask, torch.tensor([[written]]), WINDOW
     ).to("spyre")
@@ -2458,7 +2466,19 @@ KV_HEADS = 2
 
 
 def _band_mask(seqlen, block_base):
-    mask = build_prefill_mask(1, seqlen, FULL_CAPACITY, 0, dtype=torch.float32)
+    """What _build_layer_masks builds for a sliding layer today.
+
+    Dispatches the way ``generate`` does: ``build_decode_mask`` for a one-token
+    step at a non-zero cache position, ``build_prefill_mask`` otherwise.
+    ``build_prefill_mask`` masks every column past the query's *relative* row
+    index, so at a non-zero ``block_base`` it allows only column 0 — and the band
+    is additive, so it cannot widen that back. Using it for decode masks every
+    column and fails the comparison for a reason unrelated to the buffer.
+    """
+    if seqlen == 1 and block_base > 0:
+        mask = build_decode_mask(1, FULL_CAPACITY, block_base, 0, dtype=torch.float32)
+    else:
+        mask = build_prefill_mask(1, seqlen, FULL_CAPACITY, 0, dtype=torch.float32)
     coords = torch.arange(seqlen)[None, :] + block_base
     return add_causal_sliding_window_band(mask, coords, WINDOW)
 
@@ -2936,7 +2956,9 @@ def test_anchored_decode_matches_band_mask_across_a_shift():
         slot = prompt + step_index
         token = torch.randn(1, 1, Q_HEADS * HEAD_DIM, dtype=DTYPE).to("spyre")
         token_freqs = identity_freqs(1, 1, HEAD_DIM, dtype=DTYPE).to("spyre")
-        band_mask = build_prefill_mask(1, 1, full_capacity, 0, dtype=DTYPE)
+        # build_decode_mask for a one-token step at a non-zero position; see the
+        # note in the decode A/B above.
+        band_mask = build_decode_mask(1, full_capacity, slot, 0, dtype=DTYPE)
         band_mask = add_causal_sliding_window_band(
             band_mask, torch.tensor([[slot]]), window
         ).to("spyre")
