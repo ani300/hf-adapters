@@ -83,6 +83,7 @@ from hf_adapters.hf_common import (
     pad_lm_head,
     text_config,
 )
+from hf_adapters.swa_attention import sliding_window_attention
 
 
 def _gemma4_backbone(model):
@@ -142,7 +143,17 @@ class Gemma4Attention(nn.Module):
     through ``v_norm``, mirroring stock HF.
     """
 
-    def __init__(self, attn, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
+    def __init__(
+        self,
+        attn,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        is_kv_eq_v,
+        is_sliding=False,
+        window_size=None,
+        swa_mode=None,
+    ):
         super().__init__()
         self.q_proj = attn.q_proj
         self.k_proj = attn.k_proj
@@ -156,6 +167,12 @@ class Gemma4Attention(nn.Module):
         self.head_dim = head_dim
         self.is_kv_eq_v = is_kv_eq_v
         self.scaling = attn.scaling  # 1.0 for Gemma 4
+        self.is_sliding = is_sliding
+        self.window_size = window_size
+        # None keeps the band-masked SDPA path. "phase1" reads the window out of
+        # the full-length cache -- a correctness harness only: cache_seqlen grows,
+        # so it recompiles once per 64 decode steps without bound.
+        self.swa_mode = swa_mode
 
     def forward(
         self,
@@ -165,6 +182,8 @@ class Gemma4Attention(nn.Module):
         key_cache,
         value_cache,
         cache_index,
+        cache_seqlen=None,
+        valid_start=None,
     ):
         bsz, seq_len, _ = hidden_states.shape
         # Q/K/V projections viewed as [B, L, n_heads, head_dim]; norms are
@@ -201,15 +220,29 @@ class Gemma4Attention(nn.Module):
             value_cache,
             cache_index,
         )
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            key_cache,
-            value_cache,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            scale=self.scaling,
-            enable_gqa=True,
-        )
+        if self.is_sliding and self.swa_mode is not None:
+            # Windowing is an offset plus a length, so attn_mask is unused here
+            # and arrives as None; left padding travels as valid_start instead.
+            attn_out = sliding_window_attention(
+                q,
+                key_cache,
+                value_cache,
+                window_size=self.window_size,
+                scale=self.scaling,
+                cache_seqlen=cache_seqlen,
+                buffer_origin=0,
+                valid_start=valid_start,
+            )
+        else:
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                key_cache,
+                value_cache,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                scale=self.scaling,
+                enable_gqa=True,
+            )
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out), key_cache, value_cache
 
@@ -217,7 +250,17 @@ class Gemma4Attention(nn.Module):
 class Gemma4Block(nn.Module):
     """Registered dense Gemma 4 decoder block used by the Spyre adapter."""
 
-    def __init__(self, layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
+    def __init__(
+        self,
+        layer,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        is_kv_eq_v,
+        is_sliding=False,
+        window_size=None,
+        swa_mode=None,
+    ):
         super().__init__()
         self.self_attn = Gemma4Attention(
             layer.self_attn,
@@ -225,6 +268,9 @@ class Gemma4Block(nn.Module):
             num_kv_heads,
             head_dim,
             is_kv_eq_v,
+            is_sliding=is_sliding,
+            window_size=window_size,
+            swa_mode=swa_mode,
         )
         self.mlp = layer.mlp
         self.input_layernorm = layer.input_layernorm
@@ -247,6 +293,8 @@ class Gemma4Block(nn.Module):
         value_cache,
         cache_index,
         layer_scalar,
+        cache_seqlen=None,
+        valid_start=None,
     ):
         residual = hidden_states
         h = self.input_layernorm(hidden_states)
@@ -257,6 +305,8 @@ class Gemma4Block(nn.Module):
             key_cache,
             value_cache,
             cache_index,
+            cache_seqlen,
+            valid_start,
         )
         # Sandwich: norm the attention output BEFORE adding the residual.
         h = residual + self.post_attention_layernorm(attn_out)
@@ -270,7 +320,13 @@ class Gemma4Block(nn.Module):
 
 
 def prepare_gemma4_blocks(
-    layers, num_q_heads_per_layer, kv_shapes, is_kv_eq_v_per_layer
+    layers,
+    num_q_heads_per_layer,
+    kv_shapes,
+    is_kv_eq_v_per_layer,
+    layer_types,
+    window_size,
+    swa_mode,
 ):
     """Replace Gemma 4 decoder layers with registered blocks and compile them."""
     blocks = []
@@ -281,6 +337,9 @@ def prepare_gemma4_blocks(
             kv_shapes[i][0],
             kv_shapes[i][1],
             is_kv_eq_v_per_layer[i],
+            is_sliding=layer_types[i] == "sliding_attention",
+            window_size=window_size,
+            swa_mode=swa_mode,
         )
         layers[i] = block
         blocks.append(torch.compile(block, dynamic=False))
@@ -293,6 +352,7 @@ def _build_layer_masks(
     seq_len,
     batch_size,
     block_base,
+    sliding_band=True,
 ):
     """Build the text-only per-layer-type mask dict {full_attention, sliding_attention}.
 
@@ -305,11 +365,22 @@ def _build_layer_masks(
     ``block_base`` is the cache column the first query row occupies — the first
     entry of the block's ``cache_index`` (``int(cache_index[0])``).
 
+    ``sliding_band=False`` (the SWA op path) returns ``None`` for the sliding
+    entry rather than a stale band: the op derives its window from
+    ``cache_seqlen`` and ``window_size`` instead, so any layer that is mis-wired
+    to still take the mask path fails visibly (``None`` into SDPA) instead of
+    quietly attending the pad columns behind a mask nobody meant it to use.
+
     This is the text-decoder mask policy. The unified VLM adapter
     (``hf_gemma4_mm``) needs a bidirectional vision overlay OR-ed into both mask
     types, so it builds its own mask dict and passes it to
     ``_run_blocks_over_embeds(..., masks=...)`` rather than calling this.
     """
+    if not sliding_band:
+        # The op path derives its window from cache_seqlen and window_size. Return
+        # None rather than a stale band so a mis-wired layer fails visibly instead
+        # of quietly attending the pad columns.
+        return {"full_attention": attn_mask, "sliding_attention": None}
     cfg = text_config(model.config)
     query_coords = (torch.arange(seq_len)[None, :] + block_base).expand(
         batch_size, seq_len
@@ -318,6 +389,18 @@ def _build_layer_masks(
         attn_mask, query_coords, cfg.sliding_window
     )
     return {"full_attention": attn_mask, "sliding_attention": sliding_mask}
+
+
+def _swa_valid_start(model, batch_size):
+    """First attendable cache column per sequence -- ``generate``'s left padding.
+
+    ``generate`` stashes ``_spyre_prompt_offsets``; a caller driving the forward
+    directly (the layer tests) has none.
+    """
+    offsets = getattr(model, "_spyre_prompt_offsets", None)
+    if offsets is None:
+        return [0] * batch_size
+    return [int(offset) for offset in offsets]
 
 
 def _run_blocks_over_embeds(
@@ -352,19 +435,25 @@ def _run_blocks_over_embeds(
         for layer_type, rope in model._spyre_rope.items()
     }
 
+    swa_mode = getattr(model, "_spyre_swa_mode", None)
+    if masks is not None:
+        # A caller supplying its own masks is the unified VLM adapter, whose
+        # bidirectional vision overlay *widens* attention. The op cannot express
+        # that (is_causal=False raises, and an additive mask only ever removes), so
+        # the VLM keeps the band-masked path.
+        swa_mode = None
+    bsz, seq_len = h.shape[0], h.shape[1]
+    # The scalar read syncs from the device; deliberately not optimized, and now
+    # needed by the op path as well as by the band. Once per step, not per layer.
+    block_base = int(cache_index[0]) if masks is None or swa_mode else 0
+
     if masks is None:
-        bsz, seq_len = h.shape[0], h.shape[1]
-        # The sliding-window band needs each query row's cache coordinate: row j
-        # sits at block_base + j, where block_base is the first cache slot this
-        # block writes — the first entry of cache_index.
-        #
-        # The scalar read syncs from the device; deliberately not optimized. This
-        # runs once per step (not per layer — the mask dict is reused across all
-        # layers) in eager code outside the compiled block, and
-        # add_causal_sliding_window_band already round-trips the whole mask
-        # through CPU by necessity. See the same note in hf_gemma3.
-        block_base = int(cache_index[0])
-        masks = _build_layer_masks(model, attn_mask, seq_len, bsz, block_base)
+        masks = _build_layer_masks(
+            model, attn_mask, seq_len, bsz, block_base, sliding_band=swa_mode is None
+        )
+
+    cache_seqlen = block_base + seq_len if swa_mode else None
+    valid_start = _swa_valid_start(model, bsz) if swa_mode else None
 
     backbone_layers = backbone.layers
     for i, compiled_block in enumerate(model._spyre_compiled_blocks):
@@ -380,6 +469,8 @@ def _run_blocks_over_embeds(
             value_caches[i],
             cache_index,
             backbone_layers[i].layer_scalar,
+            cache_seqlen,
+            valid_start,
         )
 
     h = backbone.norm(h)
@@ -513,6 +604,9 @@ def prepare_text_decoder_for_spyre(model):
         num_q_heads_per_layer,
         kv_shapes,
         is_kv_eq_v_per_layer,
+        cfg.layer_types,
+        cfg.sliding_window,
+        getattr(model, "_spyre_swa_mode", None),
     )
 
 
