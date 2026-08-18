@@ -1124,6 +1124,27 @@ def kv_cache_shapes(model):
     return [(num_kv_heads, head_dim, v_head_dim) for _ in range(num_layers)]
 
 
+def kv_cache_capacities(model, padded_prompt_len, max_cache_len):
+    """Resolve the per-layer KV-cache row count.
+
+    Most models allocate ``max_cache_len`` rows for every layer. A model whose
+    layers need different lengths — Gemma 4's sliding layers keep a compact
+    ``window + 64`` buffer while its global layers hold the whole generation — sets
+    ``model._spyre_kv_capacity(layer_index, padded_prompt_len, max_cache_len)``.
+
+    ``padded_prompt_len`` is passed because a sliding layer's prefill buffer is
+    sized by the prompt rather than by the generation: it is compacted at the
+    prefill/decode boundary and never sees the generated tail.
+
+    Returns a list of length ``num_hidden_layers``.
+    """
+    num_layers = len(kv_cache_shapes(model))
+    hook = getattr(model, "_spyre_kv_capacity", None)
+    if hook is None:
+        return [max_cache_len] * num_layers
+    return [hook(i, padded_prompt_len, max_cache_len) for i in range(num_layers)]
+
+
 def generation_cache_len(prompt_length: int, max_new_tokens: int) -> int:
     """Compute KV cache size needed for prompt + generation tokens.
 
@@ -1200,7 +1221,9 @@ def make_cache_index(start, length, device=None):
     return idx.to(device) if device is not None else idx
 
 
-def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
+def allocate_kv_caches(
+    model, batch_size, max_cache_len, dtype, device=None, capacities=None
+):
     """Allocate zeroed per-layer key/value caches with a scatter-ready device layout.
 
     Shapes are unchanged: ``[batch_size, n_kv_heads, max_cache_len, head_dim]``.
@@ -1216,19 +1239,30 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
     correctly-sized caches per layer. Returns ``(key_caches, value_caches)``
     lists. ``device`` defaults to the module ``DEVICE`` resolved at call time (so
     the conftest CPU patch applies).
+
+    ``capacities`` overrides ``max_cache_len`` per layer (see
+    ``kv_cache_capacities``); it must have one entry per layer. Every entry is
+    still allocated with the same pinned device layout, so a compact cache
+    scatters correctly like any other.
     """
     if device is None:
         device = DEVICE
     shapes = kv_cache_shapes(model)
+    if capacities is None:
+        capacities = [max_cache_len] * len(shapes)
+    elif len(capacities) != len(shapes):
+        raise ValueError(
+            f"capacities has {len(capacities)} entries for {len(shapes)} layers"
+        )
     on_spyre = torch.device(device).type == "spyre"
 
-    def _alloc(n_kv, head_dim):
+    def _alloc(n_kv, head_dim, rows):
         stl = (
-            _cache_position_first_stl(batch_size, n_kv, max_cache_len, head_dim, dtype)
+            _cache_position_first_stl(batch_size, n_kv, rows, head_dim, dtype)
             if on_spyre
             else None
         )
-        shape = (batch_size, n_kv, max_cache_len, head_dim)
+        shape = (batch_size, n_kv, rows, head_dim)
         if stl is None:
             return torch.zeros(shape, dtype=dtype, device=device)
         cache: torch.Tensor = torch.empty(  # type: ignore[call-overload]
@@ -1240,8 +1274,14 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
         cache.zero_()
         return cache
 
-    key_caches = [_alloc(n_kv, hd) for (n_kv, hd, _vhd) in shapes]
-    value_caches = [_alloc(n_kv, vhd) for (n_kv, _hd, vhd) in shapes]
+    key_caches = [
+        _alloc(n_kv, hd, rows)
+        for (n_kv, hd, _vhd), rows in zip(shapes, capacities)
+    ]
+    value_caches = [
+        _alloc(n_kv, vhd, rows)
+        for (n_kv, _hd, vhd), rows in zip(shapes, capacities)
+    ]
     return key_caches, value_caches
 
 
@@ -1662,7 +1702,11 @@ def generate(
     # Match KV cache and mask dtype to the model's weight dtype.
     model_d_type = get_model_dtype(model)
     key_caches, value_caches = allocate_kv_caches(
-        model, batch_size, max_cache_len, model_d_type
+        model,
+        batch_size,
+        max_cache_len,
+        model_d_type,
+        capacities=kv_cache_capacities(model, padded_len, max_cache_len),
     )
 
     # Decode state. Every decode step writes exactly one token at

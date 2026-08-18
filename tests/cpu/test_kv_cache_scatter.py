@@ -241,3 +241,44 @@ def test_single_position_write_matches_slice_assignment():
         k, k, cache, cache.clone(), torch.tensor([pos], dtype=torch.long)
     )
     torch.testing.assert_close(new_key, old)
+
+
+def test_capacities_default_to_max_cache_len():
+    """Without a model hook, every layer keeps the single length."""
+    from hf_adapters.hf_common import kv_cache_capacities
+
+    model = _FakeModel(num_layers=3)
+    assert kv_cache_capacities(model, 128, 576) == [576, 576, 576]
+
+
+def test_capacities_honor_the_model_hook():
+    """Gemma 4 style: sliding layers want a compact buffer, global ones do not."""
+    from hf_adapters.hf_common import kv_cache_capacities
+
+    def capacity(layer_index, padded_prompt_len, max_cache_len):
+        return 1088 if layer_index % 2 == 0 else max_cache_len
+
+    model = _FakeModel(num_layers=4)
+    model._spyre_kv_capacity = capacity
+    assert kv_cache_capacities(model, 512, 576) == [1088, 576, 1088, 576]
+
+
+def test_allocate_uses_per_layer_capacities():
+    """The allocation, not just the arithmetic."""
+    model = _FakeModel(num_layers=3, num_kv_heads=8, head_dim=128)
+    keys, values = allocate_kv_caches(
+        model, 2, 576, torch.float32, device="cpu", capacities=[1088, 576, 1088]
+    )
+    assert [k.shape[2] for k in keys] == [1088, 576, 1088]
+    assert [v.shape[2] for v in values] == [1088, 576, 1088]
+    for k, v in zip(keys, values):
+        assert not k.any() and not v.any(), "caches must start zeroed"
+
+
+def test_allocate_rejects_a_capacity_per_layer_mismatch():
+    """A short list is a silent wrong-size cache; refuse it."""
+    model = _FakeModel(num_layers=3)
+    with pytest.raises(ValueError, match="capacities"):
+        allocate_kv_caches(
+            model, 1, 576, torch.float32, device="cpu", capacities=[1088]
+        )
