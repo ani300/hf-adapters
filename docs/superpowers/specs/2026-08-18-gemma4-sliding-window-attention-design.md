@@ -285,6 +285,19 @@ open PR and is not modified uninvited.
   cannot catch this; the layer-level A/B across a shift is what does.
 - **Perf numbers in this document are arithmetic, not measurements.** No
   performance claim should be repeated until it is measured on device.
+- **Fully-masked query rows are reachable, and the three paths disagree on them.**
+  Whenever `valid_start` exceeds a row's entire window — row `i` spans
+  `(i - W, i]`, so every row below the threshold qualifies — that row has no
+  attendable column. Verified on CPU: no path produces NaN (SDPA handles it
+  safely), but a uniform `-inf` reference spreads weight over all columns, the
+  band path spreads it over its pad columns only (its mask mixes
+  `_mask_fill_value` with `-inf`), and the device op is a third answer again
+  (its `-inf` saturates to a finite value on-device). Over the rows whose
+  attention IS defined, the uniform-`-inf` reference matches the band path at
+  max abs diff exactly 0.0. Those rows are padding whose outputs are discarded
+  and which stay inert in the KV cache, so equivalence tests must compare rows
+  at or above the threshold and assert only **finiteness** elsewhere. A test
+  that compares them instead measures an artifact.
 - **`key.shape == value.shape` is required** by `check_window_read`. Gemma 4
   sliding layers satisfy it (256/256); Gemma 3 does too. Any future model with
   `v_head_dim != head_dim` cannot use this path.
