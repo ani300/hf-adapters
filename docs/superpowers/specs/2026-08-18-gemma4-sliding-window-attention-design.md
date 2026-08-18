@@ -190,9 +190,11 @@ allowed = (0 <= delta < window_size) & (column >= valid_start[b])
 Still built on CPU, still from `int`s only — no device mask tensor, no per-block
 slice, no extra memory traffic. The band stays `[1, 1, q_block, buffer_width]`
 when the values are uniform and widens to `[B, 1, q_block, buffer_width]` only
-when they differ. `rejection_reason` validates `len(valid_start) == batch` and
-`0 <= v <= cache_seqlen`. `block_is_fully_attended` must return `False` whenever
-any `valid_start` is non-zero.
+when they differ. `spyre_sliding_window_attention` validates `len(valid_start) == batch` and
+`0 <= v <= cache_seqlen`, raising `Unsupported` — not `rejection_reason`, which is
+torch-free and answers placement questions only, and does not see the batch. The
+band must be emitted (not skipped by `block_is_fully_attended`) whenever any
+`valid_start` is non-zero.
 
 Rejected: a general additive `attn_mask` tensor. It is more general but adds a
 device slice per block, defeats the `block_is_fully_attended` fast path, and
@@ -209,9 +211,14 @@ Out of scope).
 | `hf_adapters/hf_gemma4.py` | `Gemma4Attention` gains `is_sliding`; sliding layers call the dispatcher instead of `F.scaled_dot_product_attention`; `_build_layer_masks` stops building the sliding band on the op path; shift and post-prefill compaction happen in `_run_blocks_over_embeds`, which already holds the caches and `cache_index`. |
 | `hf_adapters/hf_gemma3.py` | The same replacement, as the green control. |
 
-`generate()` is untouched. This is hf-adapters' **first** `torch.ops.spyre.*`
-call, so the coupling to a torch-spyre-private API stays in one file;
-`hf_common.py` is already 2744 lines.
+`generate()` changes by two lines: it resolves per-layer capacities through a new
+`kv_cache_capacities(model, padded_prompt_len, max_cache_len)` and passes them to
+`allocate_kv_caches`. Sliding layers must not be allocated at `prompt + generation`
+and then immediately compacted — for a 8192-token context that is ~2.7 GB
+allocated and freed across 40 layers. Everything else about the decode loop is
+unchanged. This is hf-adapters' **first** `torch.ops.spyre.*` call, so the
+coupling to a torch-spyre-private API stays in one file; `hf_common.py` is already
+2744 lines.
 
 ## Testing
 
@@ -263,9 +270,10 @@ open PR and is not modified uninvited.
 
 ## Risks
 
-- **`head_dim=256` is untested in #3405** — every test there uses 64. Gemma 4's
-  sliding layers are 256, so `kv_window`'s transposed slice at `E=256` is the
-  first thing to smoke, before anything else.
+- **`head_dim=256` is untested in #3405.** Its widest case is
+  `test_prefill_head_dim_128`; everything else uses 64. Gemma 4's sliding layers
+  are 256, so `kv_window`'s transposed slice at `E=256` is the first thing to
+  smoke, before anything else.
 - **`torch_spyre` does not currently import in this workspace** (backend
   extension load failure); `source torch-spyre-docs/scripts/dev-env.sh` first.
 - **LX pressure from the 64-row query stick** (`64 x 1088` fp16 score tile).
