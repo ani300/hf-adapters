@@ -81,7 +81,19 @@ def test_reference_matches_the_band_masked_path():
 
 
 def test_reference_honors_valid_start_like_left_padding():
-    """valid_start must reproduce build_prefill_mask's left-pad columns."""
+    """valid_start must reproduce build_prefill_mask's left-pad columns.
+
+    Compared only over rows ``>= 17``. A row below the threshold has its ENTIRE
+    window excluded — row ``i``'s window is ``(i - 64, i]``, and every one of those
+    columns is below 17 — so it is a fully-masked row, and the two paths legitimately
+    disagree there: this reference fills uniformly with ``-inf`` and so spreads weight
+    over every column, while the band path's mask mixes ``_mask_fill_value`` (on the
+    pad columns) with ``-inf`` (out of band) and so spreads weight over the pad
+    columns only. Neither answer means anything — those query rows ARE padding, and
+    their outputs are discarded — so the assertion covers the rows whose attention is
+    defined, plus finiteness everywhere, which is the property that actually matters
+    (a non-finite value would travel into the next layer's KV cache).
+    """
     query, key_cache, value_cache = _inputs()
     expected = _band_masked_attention(query, key_cache, value_cache, 64, 17)
     actual = sliding_window_attention(
@@ -93,17 +105,26 @@ def test_reference_honors_valid_start_like_left_padding():
         cache_seqlen=128,
         valid_start=[17],
     )
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(
+        actual[:, :, 17:], expected[:, :, 17:], rtol=1e-5, atol=1e-6
+    )
+    assert torch.isfinite(actual).all(), "fully-masked rows must stay finite"
 
 
 def test_reference_honors_per_sequence_valid_start():
-    """A ragged batch: each entry gets its own threshold."""
+    """A ragged batch: each entry gets its own threshold.
+
+    Per-entry row slicing for the same reason as the test above: entry 1's threshold
+    of 40 makes its rows ``[0, 40)`` fully masked, while entry 0's threshold of 0
+    makes none of its rows fully masked.
+    """
     query, key_cache, value_cache = _inputs(batch=2)
+    offsets = (0, 40)
     per_entry = [
         _band_masked_attention(
             query[b : b + 1], key_cache[b : b + 1], value_cache[b : b + 1], 64, offset
         )
-        for b, offset in enumerate((0, 40))
+        for b, offset in enumerate(offsets)
     ]
     expected = torch.cat(per_entry, dim=0)
     actual = sliding_window_attention(
@@ -113,9 +134,13 @@ def test_reference_honors_per_sequence_valid_start():
         window_size=64,
         scale=None,
         cache_seqlen=128,
-        valid_start=[0, 40],
+        valid_start=list(offsets),
     )
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    for b, offset in enumerate(offsets):
+        torch.testing.assert_close(
+            actual[b, :, offset:], expected[b, :, offset:], rtol=1e-5, atol=1e-6
+        )
+    assert torch.isfinite(actual).all(), "fully-masked rows must stay finite"
 
 
 def test_explicit_scale_is_honored():
