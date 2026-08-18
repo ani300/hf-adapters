@@ -65,15 +65,24 @@ split / loop bmm paths -- the chunked path uses plain 2D matmuls):
 """
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from hf_adapters.hf_common import text_config
 from hf_adapters.hf_gemma4 import (
-    _gemma4_attention,
+    Gemma4Attention,
     _gemma4_backbone,
-    _run_blocks_over_embeds,
+    _run_backbone_forward,  # re-exported: block-agnostic, drives _spyre_compiled_blocks
+    _run_forward,  # re-exported: block-agnostic backbone + LM head + softcap
     _setup_gemma4_text_decoder,
 )
+
+# ``_run_forward`` / ``_run_backbone_forward`` are re-exported from ``hf_gemma4``
+# unchanged: since #350 they drive ``model._spyre_compiled_blocks`` and read
+# ``layer_scalar`` off each registered block, so they are block-AGNOSTIC — the
+# MoE blocks slot in transparently. Kept in this module's namespace because
+# ``resolve_adapter_module`` / ``generate`` look them up on the resolved adapter.
+__all__ = ["prepare_for_spyre", "_run_forward", "_run_backbone_forward"]
 
 # Top-K pinned to 4 for MoE bring-up (Global Constraints). The device grouped
 # GEMM and the host route/permute path are validated at this K; a different K
@@ -791,133 +800,130 @@ def _moe_ffn_chunked(x_router, x_expert, router, compiled_route,
     return acc
 
 
-def _make_moe_block(layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
-    """Build one Gemma 4 **MoE** decoder-layer block callable.
+class Gemma4MoEBlock(nn.Module):
+    """Registered Gemma 4 **MoE** decoder block used by the Spyre adapter.
 
-    NOT a single ``torch.compile`` of the whole block: the FFN's routing is
-    host-side (spec §2.1). The block runs the **compiled** attention (shared
-    ``_gemma4_attention``, wrapped here) and the **compiled** dense MLP, and
-    calls ``_moe_ffn_split`` for the sparse branch, combining per the stock
-    ``Gemma4TextDecoderLayer.forward`` (``enable_moe_block=True``):
+    Mirrors the dense ``hf_gemma4.Gemma4Block`` (same class shape, same 7-arg
+    ``cache_index`` call signature, same ``layer_scalar`` buffer idiom) but its
+    ``forward`` reproduces the ``enable_moe_block=True`` branch of the stock
+    ``Gemma4TextDecoderLayer.forward``: a dense MLP **in parallel** with a
+    top-K MoE FFN, combined ``post_feedforward_layernorm(h_dense + h_moe)``.
 
-        # attention half -> residual add (inside _gemma4_attention)
+    Attention is the upstream ``Gemma4Attention`` module composed VERBATIM
+    (exactly as ``Gemma4Block`` does), so KV handling (in-place
+    ``kv_cache_update`` indirect scatter, #330) is the same code path the dense
+    adapter is tested on. The block is NOT a single ``torch.compile`` — the MoE
+    routing is host-side in the default/split mode — so it composes several
+    per-region ``torch.compile`` handles built once in ``__init__``:
+
+        # attention half -> post-attn-norm sandwich -> residual add
         residual = h
         h_dense = post_feedforward_layernorm_1(mlp(pre_feedforward_layernorm(h)))
         flat    = residual.reshape(-1, H)          # RAW residual
-        # router reads flat (its own scale-free norm inside _moe_ffn_split);
+        # router reads flat (its own scale-free norm inside the FFN region);
         # experts read a SEPARATE pre_ff_ln_2 norm of the same flat.
-        h_moe   = post_feedforward_layernorm_2(
-                      _moe_ffn_split(flat, pre_feedforward_layernorm_2(flat), ...))
+        h_moe   = post_feedforward_layernorm_2(<ffn mode>(flat, pre_ff_ln_2(flat), ...))
         h       = post_feedforward_layernorm(h_dense + h_moe)
         h       = residual + h
         h       = h * layer_scalar
 
-    The pre/post ``_2`` norms run on-device on the flattened ``[T,H]`` tensor
-    before / after the split; the router's internal norm runs on the raw
-    ``flat`` (NOT the pre_ff_ln_2 output), so the host only ever sees the small
-    routing tensors plus the ``[T*K,H]`` gathered / expert-out buffers.
-
-    Matches the dense block's call signature
-    (``hidden_states, selected_freqs, attn_mask, key_cache, value_cache,
-    is_filling, token_index, cache_position, layer_scalar``); the MoE weights
-    are captured from ``layer`` / ``prepare_for_spyre``.
+    The pre/post ``_2`` norms run on-device on the flattened ``[T,H]`` tensor;
+    the router's internal norm runs on the raw ``flat`` (NOT the pre_ff_ln_2
+    output), so the host only ever sees the small routing tensors plus the
+    ``[T*K,H]`` gathered / expert-out buffers. Mode-specific expert weights
+    (set by ``prepare_for_spyre``) are read fresh from ``self`` at call time,
+    the same call-time-read rule the dense block uses for ``layer_scalar``.
     """
-    attn = layer.self_attn
-    q_proj = attn.q_proj
-    k_proj = attn.k_proj
-    v_proj = attn.v_proj  # None when is_kv_eq_v
-    o_proj = attn.o_proj
-    q_norm = attn.q_norm
-    k_norm = attn.k_norm
-    v_norm = attn.v_norm
-    scaling = attn.scaling  # 1.0 for Gemma 4
 
-    input_ln = layer.input_layernorm
-    post_attn_ln = layer.post_attention_layernorm
-    pre_ff_ln = layer.pre_feedforward_layernorm
-    post_ff_ln = layer.post_feedforward_layernorm
-    mlp = layer.mlp
+    def __init__(self, layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
+        super().__init__()
+        self.self_attn = Gemma4Attention(
+            layer.self_attn,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            is_kv_eq_v,
+        )
+        self.mlp = layer.mlp
+        self.input_layernorm = layer.input_layernorm
+        self.post_attention_layernorm = layer.post_attention_layernorm
+        self.pre_feedforward_layernorm = layer.pre_feedforward_layernorm
+        self.post_feedforward_layernorm = layer.post_feedforward_layernorm
+        # MoE-branch submodules / norms (stock Gemma4TextDecoderLayer names).
+        self.router = layer.router
+        self.post_feedforward_layernorm_1 = layer.post_feedforward_layernorm_1
+        self.pre_feedforward_layernorm_2 = layer.pre_feedforward_layernorm_2
+        self.post_feedforward_layernorm_2 = layer.post_feedforward_layernorm_2
+        self.register_buffer(
+            "layer_scalar",
+            layer.layer_scalar,
+            persistent="layer_scalar" not in layer._non_persistent_buffers_set,
+        )
+        # Captured knobs. K + eps are per-layer scalars; the mode-specific
+        # expert stacks are read fresh off ``self`` at call time (populated by
+        # prepare_for_spyre), NOT captured here.
+        self._moe_k = layer._spyre_moe_k
+        # Gemma4RMSNorm exposes ``.eps`` (== config.rms_norm_eps).
+        self._moe_rms_eps = self.pre_feedforward_layernorm_2.eps
 
-    # MoE-specific submodules / norms (stock Gemma4TextDecoderLayer names).
-    router = layer.router
-    post_ff_ln_1 = layer.post_feedforward_layernorm_1  # dense-branch post-norm
-    pre_ff_ln_2 = layer.pre_feedforward_layernorm_2  # MoE pre-norm (on residual)
-    post_ff_ln_2 = layer.post_feedforward_layernorm_2  # MoE post-norm
-    K = layer._spyre_moe_k
-    moe_rms_eps = pre_ff_ln_2.eps  # Gemma4RMSNorm uses .eps (== config.rms_norm_eps)
-    # The pre-transposed expert-weight stacks (``_spyre_gate_up_t`` [E,H,2M],
-    # ``_spyre_down_t`` [E,M,H]) are laid down by ``prepare_for_spyre`` (shape
-    # rule 2 + expert-dim-outermost, spec §3.5) as PLAIN CPU ATTRIBUTES that the
-    # spyre move deliberately leaves on the host (the per-row select is an eager
-    # index, unsupported on-device — see _moe_ffn_split). They are NOT captured
-    # here: read fresh from ``layer`` at call time, the same call-time-read rule
-    # the dense block uses for ``layer_scalar``.
+        # Compiled device regions (built once per block). The dense MLP is
+        # compiled as its own region so the dense branch lowers; the router,
+        # gather, expert GEMM, loop, and per-chunk regions are each compiled
+        # for whichever FFN mode is active.
+        self._compiled_mlp = torch.compile(self.mlp, dynamic=False)
+        self._compiled_gather = torch.compile(
+            _compiled_device_gather, dynamic=False
+        )
+        self._compiled_expert = torch.compile(
+            _compiled_moe_device_region, dynamic=False
+        )
+        self._compiled_loop = torch.compile(
+            _compiled_moe_loop_region, dynamic=False
+        )
+        self._compiled_route = torch.compile(_moe_route_padded, dynamic=False)
+        self._compiled_chunk = torch.compile(_moe_expert_chunk, dynamic=False)
+        self.train(layer.training)
 
-    # Compiled device regions (shared per layer; router.proj/gather/expert). The
-    # dense MLP is compiled as its own region too so the dense branch lowers.
-    compiled_mlp = torch.compile(mlp, dynamic=False)
-    compiled_gather = torch.compile(_compiled_device_gather, dynamic=False)
-    compiled_expert = torch.compile(_compiled_moe_device_region, dynamic=False)
-    compiled_loop = torch.compile(_compiled_moe_loop_region, dynamic=False)
-    # All-device chunked path: the router (dense [T,E] weight, topk-pad) and the
-    # per-chunk expert region (SwiGLU + mask-reduce weight + [T,H] accumulate)
-    # are each their own compiled region; the host glue loop threads the device
-    # accumulator across chunks.
-    compiled_route = torch.compile(_moe_route_padded, dynamic=False)
-    compiled_chunk = torch.compile(_moe_expert_chunk, dynamic=False)
-    compiled_attn = torch.compile(_gemma4_attention, dynamic=False)
-
-    def block_forward(
+    def forward(
+        self,
         hidden_states,
         selected_freqs,
         attn_mask,
         key_cache,
         value_cache,
-        is_filling,
-        token_index,
-        cache_position,
+        cache_index,
         layer_scalar,
     ):
-        h, key_cache, value_cache = compiled_attn(
-            hidden_states,
-            input_ln=input_ln,
-            post_attn_ln=post_attn_ln,
-            q_proj=q_proj,
-            k_proj=k_proj,
-            v_proj=v_proj,
-            o_proj=o_proj,
-            q_norm=q_norm,
-            k_norm=k_norm,
-            v_norm=v_norm,
-            scaling=scaling,
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            is_kv_eq_v=is_kv_eq_v,
-            selected_freqs=selected_freqs,
-            attn_mask=attn_mask,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            is_filling=is_filling,
-            token_index=token_index,
-            cache_position=cache_position,
+        residual = hidden_states
+        h = self.input_layernorm(hidden_states)
+        attn_out, key_cache, value_cache = self.self_attn(
+            h,
+            selected_freqs,
+            attn_mask,
+            key_cache,
+            value_cache,
+            cache_index,
         )
+        # Sandwich: norm the attention output BEFORE adding the residual.
+        h = residual + self.post_attention_layernorm(attn_out)
 
         residual = h
         bsz, seq_len, hidden = h.shape
 
         # Dense branch: pre_ff_ln -> mlp -> post_ff_ln_1.
-        h_dense = post_ff_ln_1(compiled_mlp(pre_ff_ln(residual)))
+        h_dense = self.post_feedforward_layernorm_1(
+            self._compiled_mlp(self.pre_feedforward_layernorm(residual))
+        )
 
         # Sparse branch: the router reads the RAW flattened residual (its own
         # scale-free norm is applied inside the FFN region), while the experts
         # consume a SEPARATE pre_ff_ln_2 normalization of that same residual
-        # (stock modeling_gemma4.py:1432-1435). Thread them as two tensors so
-        # the router input is not double-normalized. The per-layer expert
-        # weights (mode-specific layout, set by prepare_for_spyre) are read
-        # fresh from ``layer`` at call time (like the dense block's layer_scalar).
+        # (stock modeling_gemma4.py). Thread them as two tensors so the router
+        # input is not double-normalized. The per-layer expert weights
+        # (mode-specific layout, set by prepare_for_spyre) are read fresh off
+        # ``self`` at call time (like the dense block's layer_scalar).
         flat = residual.reshape(-1, hidden)  # [T,H] RAW -> router
-        x_moe = pre_ff_ln_2(flat)  # [T,H] normed -> experts
+        x_moe = self.pre_feedforward_layernorm_2(flat)  # [T,H] normed -> experts
         if _MOE_CHUNKED_ONDEVICE:
             # ALL-DEVICE: router + expert GEMMs + weight + sum-over-experts all
             # lower; host does only the chunk-loop glue (inside _moe_ffn_chunked)
@@ -926,46 +932,43 @@ def _make_moe_block(layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
             moe_out = _moe_ffn_chunked(
                 flat,
                 x_moe,
-                router,
-                compiled_route,
-                compiled_chunk,
-                layer._spyre_moe_chunks,
-                K,
-                moe_rms_eps,
+                self.router,
+                self._compiled_route,
+                self._compiled_chunk,
+                self._spyre_moe_chunks,
+                self._moe_k,
+                self._moe_rms_eps,
             )  # [T,H]
         elif _MOE_LOOP_ON_TOPK:
             moe_out = _moe_ffn_loop(
                 flat,
                 x_moe,
-                router,
-                compiled_loop,
-                layer._spyre_gate_up_dev,
-                layer._spyre_down_dev,
-                K,
+                self.router,
+                self._compiled_loop,
+                self._spyre_gate_up_dev,
+                self._spyre_down_dev,
+                self._moe_k,
                 _MOE_TILE,
-                moe_rms_eps,
+                self._moe_rms_eps,
             )  # [T,H]
         else:
             moe_out = _moe_ffn_split(
                 flat,
                 x_moe,
-                router,
-                compiled_gather,
-                compiled_expert,
-                layer._spyre_gate_up_t,
-                layer._spyre_down_t,
-                K,
+                self.router,
+                self._compiled_gather,
+                self._compiled_expert,
+                self._spyre_gate_up_t,
+                self._spyre_down_t,
+                self._moe_k,
             )  # [T,H]
         moe_out = moe_out.reshape(bsz, seq_len, hidden)
-        h_moe = post_ff_ln_2(moe_out)
+        h_moe = self.post_feedforward_layernorm_2(moe_out)
 
         # Combine dense + MoE, final sandwich norm, residual, per-layer scalar.
-        h = post_ff_ln(h_dense + h_moe)
+        h = self.post_feedforward_layernorm(h_dense + h_moe)
         h = residual + h
-        h = h * layer_scalar
-        return h, key_cache, value_cache
-
-    return block_forward
+        return h * layer_scalar, key_cache, value_cache
 
 
 def prepare_for_spyre(model):
@@ -1034,8 +1037,8 @@ def prepare_for_spyre(model):
             "non-power-of-two (topk-pad fix)."
         )
 
-    num_q_heads, kv_shapes, is_kv_eq_v_per_layer = _setup_gemma4_text_decoder(
-        model, allow_moe=True
+    num_q_heads_per_layer, kv_shapes, is_kv_eq_v_per_layer = (
+        _setup_gemma4_text_decoder(model, allow_moe=True)
     )
 
     # Lay out expert weights: expert-dim-outermost (already, [E,...]) and
@@ -1062,13 +1065,35 @@ def prepare_for_spyre(model):
     # ``down_proj`` parameters are deleted (the stock ``Gemma4TextExperts.forward``
     # never runs; the split FFN uses only the transposed CPU stacks), so the
     # experts are not paid for twice on the host either.
-    for layer in backbone.layers:
+    # One pass per layer: build the MoE block (composing upstream Gemma4Attention
+    # verbatim), attach its mode-specific expert weights, register it back into
+    # ``backbone.layers[i]`` (so ``_run_blocks_over_embeds`` can read
+    # ``layer_scalar`` off it, exactly as ``prepare_gemma4_blocks`` does for the
+    # dense path), and compile it. The expert-weight layout below targets the
+    # BLOCK instance (``block._spyre_*``), read fresh by ``Gemma4MoEBlock.forward``
+    # — the same call-time-read rule the dense block uses for ``layer_scalar``.
+    compiled_blocks = []
+    for i, layer in enumerate(list(backbone.layers)):
+        # Stash the pinned K on the layer so Gemma4MoEBlock.__init__ can capture
+        # it (cfg.top_k_experts was coerced to _MOE_BRINGUP_K above).
+        layer._spyre_moe_k = _MOE_BRINGUP_K
+        block = Gemma4MoEBlock(
+            layer,
+            num_q_heads_per_layer[i],
+            kv_shapes[i][0],
+            kv_shapes[i][1],
+            is_kv_eq_v_per_layer[i],
+        )
         experts = layer.experts
         # gate_up_proj: [E,2M,H] -> [E,H,2M]; down_proj: [E,H,M] -> [E,M,H].
         gate_up_t = experts.gate_up_proj.data.transpose(1, 2).contiguous()
         down_t = experts.down_proj.data.transpose(1, 2).contiguous()
         del experts.gate_up_proj
         del experts.down_proj
+        # The router is shared between ``layer`` and ``block`` (composed as
+        # ``self.router = layer.router``), so router-weight moves below apply to
+        # the block's router too.
+        router = block.router
         if _MOE_CHUNKED_ONDEVICE:
             # ALL-DEVICE chunked path (spec Approach A, "nothing but glue on
             # host"). De-fuse the packed gate_up [E,H,2M] into separate gate /
@@ -1099,12 +1124,11 @@ def prepare_for_spyre(model):
                     down_t[lo:hi].contiguous().to("spyre"),    # [Ec,M,H]
                     onehot[lo:hi].contiguous().to("spyre"),    # [Ec,E]
                 ))
-            layer._spyre_moe_chunks = chunks
+            block._spyre_moe_chunks = chunks
             # The router runs entirely on-device (scale-free norm + [H] scale +
             # proj + softmax + padded topk + per_expert_scale), so its weights
             # must be device-resident. Reassign the Parameter (a cross-backend
             # ``param.data = ...`` raises on the type change).
-            router = layer.router
             router.proj.weight = torch.nn.Parameter(
                 router.proj.weight.data.to("spyre"), requires_grad=False
             )
@@ -1121,8 +1145,8 @@ def prepare_for_spyre(model):
             # operand (2M / H is the generated dim on the stick) -> zero
             # restickify. Move explicitly (plain attrs are not in the buffer
             # sweep).
-            layer._spyre_gate_up_dev = gate_up_t.to("spyre")  # [E,H,2M]
-            layer._spyre_down_dev = down_t.to("spyre")  # [E,M,H]
+            block._spyre_gate_up_dev = gate_up_t.to("spyre")  # [E,H,2M]
+            block._spyre_down_dev = down_t.to("spyre")  # [E,M,H]
             # The whole router runs on-device in the loop region (scale-free
             # norm + [H] scale + proj + topk + per_expert_scale gather), so its
             # weights must be device-resident too. Move them here rather than
@@ -1132,7 +1156,6 @@ def prepare_for_spyre(model):
             # ``param.data = ...`` set_data raises on the type change); the
             # spyre move stickifies proj.weight [E,H] like any 2D matmul weight.
             # router.scalar_root_size is a Python float (no move).
-            router = layer.router
             router.proj.weight = torch.nn.Parameter(
                 router.proj.weight.data.to("spyre"), requires_grad=False
             )
@@ -1143,84 +1166,30 @@ def prepare_for_spyre(model):
                 router.per_expert_scale.data.to("spyre"), requires_grad=False
             )
         else:
-            layer._spyre_gate_up_t = gate_up_t.cpu()  # [E,H,2M] host-resident
-            layer._spyre_down_t = down_t.cpu()  # [E,M,H] host-resident
-        layer._spyre_moe_k = _MOE_BRINGUP_K
+            block._spyre_gate_up_t = gate_up_t.cpu()  # [E,H,2M] host-resident
+            block._spyre_down_t = down_t.cpu()  # [E,M,H] host-resident
 
-    model._spyre_compiled_blocks = [
-        _make_moe_block(
-            layer,
-            num_q_heads,
-            kv_shapes[i][0],
-            kv_shapes[i][1],
-            is_kv_eq_v_per_layer[i],
-        )
-        for i, layer in enumerate(backbone.layers)
-    ]
+        # Register the block back into the backbone (so _run_blocks_over_embeds
+        # reads layer_scalar off it), then append the EAGER block to the
+        # compiled-blocks list. Unlike the dense Gemma4Block (a pure-device
+        # forward that prepare_gemma4_blocks wraps in torch.compile), the MoE
+        # block's forward is a HYBRID: eager host orchestration (topk/argsort/
+        # index_add/chunk-loop glue, all outside any spyre graph per the
+        # all-device Global Constraint) around several inner torch.compile'd
+        # device regions built in __init__. Wrapping the whole block in
+        # torch.compile would try to trace that host work into one spyre graph.
+        # So _run_blocks_over_embeds invokes the eager block, which dispatches to
+        # its inner compiled regions.
+        backbone.layers[i] = block
+        compiled_blocks.append(block)
 
-
-def _run_backbone_forward(
-    model,
-    input_ids,
-    position_ids,
-    attn_mask,
-    key_caches,
-    value_caches,
-    is_filling,
-    token_index,
-    cache_position,
-):
-    """Gemma 4 MoE backbone: scaled embedding, per-type RoPE + masks, blocks.
-
-    Identical to the dense backbone except the compiled blocks are the MoE
-    blocks (``prepare_for_spyre`` populated ``model._spyre_compiled_blocks``).
-    Delegates the block loop + final norm to the shared
-    ``_run_blocks_over_embeds`` machinery.
-    """
-    backbone = _gemma4_backbone(model)
-    h = backbone.embed_tokens(input_ids)
-    return _run_blocks_over_embeds(
-        model,
-        h,
-        position_ids,
-        attn_mask,
-        key_caches,
-        value_caches,
-        is_filling,
-        token_index,
-        cache_position,
-    )
+    model._spyre_compiled_blocks = compiled_blocks
 
 
-def _run_forward(
-    model,
-    input_ids,
-    position_ids,
-    attn_mask,
-    key_caches,
-    value_caches,
-    is_filling,
-    token_index,
-    cache_position,
-):
-    """Gemma 4 MoE causal-LM forward: backbone + LM head + logit softcap."""
-    h = _run_backbone_forward(
-        model,
-        input_ids,
-        position_ids,
-        attn_mask,
-        key_caches,
-        value_caches,
-        is_filling,
-        token_index,
-        cache_position,
-    )
-
-    logits = model.lm_head(h)
-
-    cap = text_config(model.config).final_logit_softcapping
-    if cap is not None:
-        logits = logits / cap
-        logits = torch.tanh(logits)
-        logits = logits * cap
-    return logits
+# ``_run_backbone_forward`` and ``_run_forward`` are NOT defined here — they are
+# re-exported from ``hf_gemma4`` (see the import block at the top of this file).
+# Since #350 both are block-AGNOSTIC: they drive ``model._spyre_compiled_blocks``
+# and read ``layer_scalar`` off each registered block, so the MoE blocks slot in
+# with no MoE-specific forward. This removes the last carrier of the pre-#330
+# ``is_filling/token_index/cache_position`` triple and guarantees the MoE forward
+# tracks any future dense-forward change.
