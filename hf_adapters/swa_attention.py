@@ -123,28 +123,24 @@ def _reference_attention(
     only, where the dlfloat16 saturation that motivates the finite fill does not
     apply.
     """
-    from hf_adapters.hf_common import _mask_fill_value
-
-    batch = query.size(0)
     seqlen_q = query.size(2)
     capacity = key_cache.size(2)
     rows = torch.arange(seqlen_q, device=query.device) + (cache_seqlen - seqlen_q)
     columns = torch.arange(capacity, device=query.device) + buffer_origin
     delta = rows.unsqueeze(-1) - columns.unsqueeze(0)
-    in_window = (delta >= 0) & (delta < window_size)
-    in_window = in_window.unsqueeze(0).unsqueeze(0).expand(batch, 1, -1, -1)
-    in_valid = torch.ones(in_window.shape, dtype=torch.bool, device=query.device)
+    allowed = (delta >= 0) & (delta < window_size)
     if valid_start is not None and max(valid_start) > 0:
-        starts = torch.tensor(valid_start, device=query.device).view(-1, 1, 1, 1)
-        in_valid = columns.view(1, 1, 1, -1) >= starts
-    mask = torch.zeros(in_window.shape, dtype=query.dtype, device=query.device)
-    mask.masked_fill_(~in_window, float("-inf"))
-    mask.masked_fill_(~in_valid & in_window, _mask_fill_value(query.dtype))
+        starts = torch.tensor(valid_start, device=query.device).view(-1, 1, 1)
+        allowed = allowed.unsqueeze(0) & (columns.view(1, 1, -1) >= starts)
+    else:
+        allowed = allowed.unsqueeze(0)
+    mask = torch.zeros(allowed.shape, dtype=query.dtype, device=query.device)
+    mask.masked_fill_(~allowed, float("-inf"))
     return F.scaled_dot_product_attention(
         query,
         key_cache,
         value_cache,
-        attn_mask=mask,
+        attn_mask=mask.unsqueeze(1),
         dropout_p=0.0,
         scale=scale,
         enable_gqa=True,
