@@ -981,6 +981,36 @@ layers. `allocate_kv_caches` currently takes one `max_cache_len` for every layer
     max_cache_len) -> int`, a plain module-level function (not a lambda, so a model
     stays picklable).
 
+- [ ] **Step 0: Repair the `_FakeModel` fixture first**
+
+`kv_cache_shapes` gained a tensor-parallel head-count probe in `6f1cbc4`
+("TP enablement", #234) that reads
+`get_backbone(model).layers[0].self_attn`. `get_backbone` falls through to the
+model itself for a stub object, so every `_FakeModel` without an explicit
+`_spyre_kv_shapes` now raises `AttributeError: 'NoneType' object has no attribute
+'layers'` — which already breaks the pre-existing
+`test_allocate_keeps_attention_shapes`, and would break the tests below. Give the
+fixture the one attribute that probe needs, in `tests/cpu/test_kv_cache_scatter.py`:
+
+```python
+class _FakeModel:
+    """Minimal stand-in for the parts of a model allocate_kv_caches reads."""
+
+    def __init__(self, num_layers=2, num_kv_heads=8, head_dim=128, kv_shapes=None):
+        self.config = _FakeConfig(num_layers, num_kv_heads, head_dim)
+        # kv_cache_shapes probes layers[0].self_attn.k_proj to recover the KV-head
+        # count under tensor parallelism (hf_common, added in #234). No k_proj here,
+        # so it falls back to the config count -- which is what these tests want.
+        self.layers = [types.SimpleNamespace(self_attn=types.SimpleNamespace())]
+        if kv_shapes is not None:
+            self._spyre_kv_shapes = kv_shapes
+```
+
+and add `import types` to that file's imports.
+
+Run `python3 -m pytest tests/cpu/test_kv_cache_scatter.py -q` and confirm the
+pre-existing failure is gone before writing anything new.
+
 - [ ] **Step 1: Write the failing tests**
 
 Append to `tests/cpu/test_kv_cache_scatter.py`:
