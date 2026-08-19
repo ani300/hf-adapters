@@ -23,8 +23,12 @@ all attention-side Spyre prep (RMSNorm patch, per-type RoPE, KV shapes,
 LM-head padding) are shared with the dense adapter ``hf_gemma4`` — this module
 only adds the sparse FFN and the surrounding block/prepare/forward wiring.
 
-The FFN has three selectable formulations (module flags, mutually exclusive):
+The FFN has four selectable formulations (module flags, mutually exclusive):
 
+  * ``_MOE_PERSISTENT_ONDEVICE`` -- the router runs once, then the dense
+    all-expert value path lowers through ``spyre::moe_ffn`` to one counted
+    device loop. The activation and output accumulator remain in LX while the
+    gate/up/down weights and routing scalar advance once per expert.
   * ``_MOE_CHUNKED_ONDEVICE`` (Gate-A5-PROVEN, mean_rel=0.028) -- the WHOLE FFN
     runs on the device; host does only chunk-loop glue. Sidesteps the routing
     ops below via the topk-pad fix (pad logits to a non-pow2 width before topk,
@@ -151,6 +155,11 @@ _MOE_LOOP_ON_TOPK = False
 # Flip to True only after gateA5_chunked_ondevice.py passes on-card. Mutually
 # exclusive with _MOE_LOOP_ON_TOPK (asserted in prepare_for_spyre).
 _MOE_CHUNKED_ONDEVICE = False
+
+# Persistent all-expert formulation selector. This is intentionally opt-in:
+# it requires the torch-spyre persistent-expert compiler stack and keeps the
+# existing PR293 paths unchanged when disabled.
+_MOE_PERSISTENT_ONDEVICE = True
 
 # Experts per compiled chunk for the all-device path. >32 expert GEMM-chains in
 # one fused sdsc program crashes the DDC scheduler (Incorrect chunk size); <=32
@@ -752,6 +761,98 @@ def _moe_expert_chunk(x_expert, w, acc, gate_c, up_c, down_c, onehot_c):
     return acc
 
 
+def _moe_route_persistent_packed(
+    x_router,
+    router_proj_w,
+    router_scale,
+    router_scalar_root_size,
+    per_expert_scale,
+    K,
+    eps,
+    pad_w,
+    pad_neg,
+    route_identity,
+):
+    """Produce one broadcast-ready stick per token/expert route scalar."""
+    token_major = _moe_route_padded(
+        x_router,
+        router_proj_w,
+        router_scale,
+        router_scalar_root_size,
+        per_expert_scale,
+        K,
+        eps,
+        pad_w,
+        pad_neg,
+    )
+    # Materialize the logical expansion first in the router's natural layout,
+    # then use an ordinary BMM to put the broadcast lane on the physical stick.
+    # The semantic values are unchanged because route_identity is I64.
+    expanded = torch.relu(token_major.unsqueeze(-1).expand(-1, -1, 64))
+    return expanded @ route_identity
+
+
+def _moe_expert_persistent(x_expert, routing_weight, gate, up, down, K):
+    """Run the all-expert value path through torch-spyre's semantic op."""
+    return torch.ops.spyre.moe_ffn.default(
+        x_expert,
+        gate,
+        up,
+        down,
+        routing_weight,
+        K,
+        "gelu_tanh",
+    )
+
+
+def _moe_ffn_persistent(
+    x_router,
+    x_expert,
+    router,
+    compiled_route,
+    compiled_persistent,
+    gate,
+    up,
+    down,
+    route_identity,
+    K,
+    eps,
+):
+    """Run PR293 routing once, then one persistent all-expert value path."""
+    from torch_spyre._inductor import config as spyre_config
+
+    routing_sticks = compiled_route(
+        x_router,
+        router.proj.weight,
+        router.scale,
+        router.scalar_root_size,
+        router.per_expert_scale,
+        K,
+        eps,
+        _MOE_PADW,
+        _MOE_PAD_NEG,
+        route_identity,
+    )
+    # The semantic op consumes logical [T,E,1]. Lane zero is a zero-copy view
+    # over one full broadcast stick per token/expert scalar.
+    routing_weight = routing_sticks[..., :1]
+    with spyre_config.patch(
+        {
+            "sencores": 32,
+            "lx_planning": True,
+            "enable_dense_expert_persistent": True,
+        }
+    ):
+        return compiled_persistent(
+            x_expert,
+            routing_weight,
+            gate,
+            up,
+            down,
+            K,
+        )
+
+
 def _moe_ffn_chunked(x_router, x_expert, router, compiled_route,
                      compiled_chunk, chunks, K, eps):
     """All-device chunked MoE FFN orchestrator (spec Approach A).
@@ -882,6 +983,12 @@ class Gemma4MoEBlock(nn.Module):
         )
         self._compiled_route = torch.compile(_moe_route_padded, dynamic=False)
         self._compiled_chunk = torch.compile(_moe_expert_chunk, dynamic=False)
+        self._compiled_persistent_route = torch.compile(
+            _moe_route_persistent_packed, dynamic=False
+        )
+        self._compiled_persistent = torch.compile(
+            _moe_expert_persistent, dynamic=False
+        )
         self.train(layer.training)
 
     def forward(
@@ -924,7 +1031,21 @@ class Gemma4MoEBlock(nn.Module):
         # ``self`` at call time (like the dense block's layer_scalar).
         flat = residual.reshape(-1, hidden)  # [T,H] RAW -> router
         x_moe = self.pre_feedforward_layernorm_2(flat)  # [T,H] normed -> experts
-        if _MOE_CHUNKED_ONDEVICE:
+        if _MOE_PERSISTENT_ONDEVICE:
+            moe_out = _moe_ffn_persistent(
+                flat,
+                x_moe,
+                self.router,
+                self._compiled_persistent_route,
+                self._compiled_persistent,
+                self._spyre_persistent_gate,
+                self._spyre_persistent_up,
+                self._spyre_persistent_down,
+                self._spyre_persistent_route_identity,
+                self._moe_k,
+                self._moe_rms_eps,
+            )  # [T,H]
+        elif _MOE_CHUNKED_ONDEVICE:
             # ALL-DEVICE: router + expert GEMMs + weight + sum-over-experts all
             # lower; host does only the chunk-loop glue (inside _moe_ffn_chunked)
             # threading a device-resident accumulator. Per-chunk offset-0 expert
@@ -984,6 +1105,9 @@ def prepare_for_spyre(model):
         pre-transposed** (``gate_up`` ``[E,2M,H]`` -> ``[E,H,2M]``, ``down``
         ``[E,H,M]`` -> ``[E,M,H]``; shape rule 2 + spec §3.5). The layout THEN
         depends on the active FFN mode:
+          - ``_MOE_PERSISTENT_ONDEVICE``: store gate/up/down with K-major
+            backing and expose logical expert-major views to ``spyre::moe_ffn``;
+            router weights remain device-resident;
           - ``_MOE_CHUNKED_ONDEVICE``: de-fuse gate_up into gate/up ``[E,H,M]``
             halves, slice into ``ceil(E/_MOE_EC)`` chunks, move each chunk +
             its one-hot rows to the device as OFFSET-0 contiguous tensors
@@ -1019,22 +1143,30 @@ def prepare_for_spyre(model):
         f"config hidden_activation={act_fn!r} is unsupported."
     )
 
-    # The three FFN modes lay experts out differently and are mutually
+    # The device FFN modes lay experts out differently and are mutually
     # exclusive; guard so a mis-set pair fails loudly at load rather than
     # reading a stack the active mode's forward never populated.
-    assert not (_MOE_CHUNKED_ONDEVICE and _MOE_LOOP_ON_TOPK), (
-        "_MOE_CHUNKED_ONDEVICE and _MOE_LOOP_ON_TOPK are mutually exclusive "
-        "FFN modes; enable at most one."
-    )
-    if _MOE_CHUNKED_ONDEVICE:
-        E = cfg.num_experts
-        assert E % _MOE_EC == 0, (
-            f"all-device chunked MoE needs num_experts ({E}) divisible by "
-            f"_MOE_EC ({_MOE_EC})."
+    enabled_modes = sum(
+        (
+            _MOE_PERSISTENT_ONDEVICE,
+            _MOE_CHUNKED_ONDEVICE,
+            _MOE_LOOP_ON_TOPK,
         )
+    )
+    assert enabled_modes <= 1, (
+        "persistent, chunked, and loop-on-topk are mutually exclusive FFN "
+        "modes; enable at most one."
+    )
+    if _MOE_PERSISTENT_ONDEVICE or _MOE_CHUNKED_ONDEVICE:
+        E = cfg.num_experts
         assert _MOE_PADW > E and (_MOE_PADW & (_MOE_PADW - 1)) != 0, (
             f"_MOE_PADW ({_MOE_PADW}) must exceed num_experts ({E}) and be "
             "non-power-of-two (topk-pad fix)."
+        )
+    if _MOE_CHUNKED_ONDEVICE:
+        assert E % _MOE_EC == 0, (
+            f"all-device chunked MoE needs num_experts ({E}) divisible by "
+            f"_MOE_EC ({_MOE_EC})."
         )
 
     num_q_heads_per_layer, kv_shapes, is_kv_eq_v_per_layer = (
@@ -1094,7 +1226,40 @@ def prepare_for_spyre(model):
         # ``self.router = layer.router``), so router-weight moves below apply to
         # the block's router too.
         router = block.router
-        if _MOE_CHUNKED_ONDEVICE:
+        if _MOE_PERSISTENT_ONDEVICE:
+            # Keep contiguous physical [K,E,N] backing while exposing the
+            # logical [E,K,N] expert-major tensors required by moe_ffn. The
+            # persistent lowering streams one expert bank per loop trip.
+            M = gate_up_t.shape[2] // 2
+            gate_packed = (
+                gate_up_t[:, :, :M]
+                .permute(1, 0, 2)
+                .contiguous()
+                .to("spyre")
+            )
+            up_packed = (
+                gate_up_t[:, :, M:]
+                .permute(1, 0, 2)
+                .contiguous()
+                .to("spyre")
+            )
+            down_packed = down_t.permute(1, 0, 2).contiguous().to("spyre")
+            block._spyre_persistent_gate = gate_packed.permute(1, 0, 2)
+            block._spyre_persistent_up = up_packed.permute(1, 0, 2)
+            block._spyre_persistent_down = down_packed.permute(1, 0, 2)
+            block._spyre_persistent_route_identity = torch.eye(
+                64, dtype=gate_packed.dtype
+            ).to("spyre")
+            router.proj.weight = torch.nn.Parameter(
+                router.proj.weight.data.to("spyre"), requires_grad=False
+            )
+            router.scale = torch.nn.Parameter(
+                router.scale.data.to("spyre"), requires_grad=False
+            )
+            router.per_expert_scale = torch.nn.Parameter(
+                router.per_expert_scale.data.to("spyre"), requires_grad=False
+            )
+        elif _MOE_CHUNKED_ONDEVICE:
             # ALL-DEVICE chunked path (spec Approach A, "nothing but glue on
             # host"). De-fuse the packed gate_up [E,H,2M] into separate gate /
             # up [E,H,M] halves (matching x@Wg (gate) and x@Wu (up) in
