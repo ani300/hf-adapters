@@ -3102,6 +3102,124 @@ git commit -s -m "feat(gemma4): anchored compact sliding-window KV buffer"
 - Consumes: Tasks 6, 7, 8.
 - Produces: nothing.
 
+- [ ] **Step 0: Close two CPU gaps first, before spending device time**
+
+Two things the earlier tasks left uncovered, both cheap on CPU and both worth having
+before a device run. Add to `tests/cpu/test_swa_anchored_cpu.py`:
+
+**(a) The shift at the geometry Gemma 4 actually ships.** The 70-step test uses
+`W=128` so it can cross a shift quickly, the CPU accuracy suite decodes only 4
+tokens, and this task's device test uses the same synthetic window — so
+`capacity=1088` / `anchor=1024` is exercised nowhere. The arithmetic is
+capacity-parameterized, so a CPU test closes the gap for pennies.
+
+```python
+def test_anchored_shift_at_the_shipped_geometry():
+    """The 1088-row, 1024-anchor roll Gemma 4 actually runs, crossed once.
+
+    W=1024 means anchor 1024, so 64 writes fill rows [1024, 1088) and the 65th
+    step triggers the roll. Small head_dim and head counts keep this quick; what
+    is under test is the bookkeeping at the real capacity, not the arithmetic
+    intensity.
+    """
+    window, prompt, steps = 1024, 1024, 65
+    capacity, full_capacity = 1088, 1152
+    head_dim, q_heads, kv_heads = 32, 2, 1
+
+    def band_mask(seqlen, block_base):
+        if seqlen == 1 and block_base > 0:
+            mask = build_decode_mask(
+                1, full_capacity, block_base, 0, dtype=torch.float32
+            )
+        else:
+            mask = build_prefill_mask(
+                1, seqlen, full_capacity, 0, dtype=torch.float32
+            )
+        coords = torch.arange(seqlen)[None, :] + block_base
+        return add_causal_sliding_window_band(mask, coords, window)
+
+    torch.manual_seed(21)
+    band = make_sliding_attention(q_heads, kv_heads, head_dim, window, swa_mode=None)
+    op = copy.deepcopy(band)
+    op.swa_mode = "anchored"
+
+    band_k = torch.zeros(1, kv_heads, full_capacity, head_dim)
+    band_v = torch.zeros(1, kv_heads, full_capacity, head_dim)
+    op_k = torch.zeros(1, kv_heads, prompt, head_dim)
+    op_v = torch.zeros(1, kv_heads, prompt, head_dim)
+
+    hidden = torch.randn(1, prompt, q_heads * head_dim)
+    freqs = identity_freqs(1, prompt, head_dim)
+    index = make_cache_index(0, prompt)
+    _, band_k, band_v = band(
+        hidden, freqs, band_mask(prompt, 0), band_k, band_v, index
+    )
+    _, op_k, op_v = op(
+        hidden, freqs, None, op_k, op_v, index, cache_seqlen=prompt, valid_start=[0]
+    )
+
+    state = SlidingWindowCache.after_prefill(window, prompt, [0])
+    assert state.capacity == capacity and state.anchor == 1024
+    assert state.valid_start == [0], "a prompt of exactly anchor rows leaves no gap"
+    op_k, op_v = compact_after_prefill(op_k, op_v, state, prompt)
+    assert op_k.shape[2] == capacity
+
+    shifts = 0
+    for step_index in range(steps):
+        slot = prompt + step_index
+        token = torch.randn(1, 1, q_heads * head_dim)
+        token_freqs = identity_freqs(1, 1, head_dim)
+        expected, band_k, band_v = band(
+            token, token_freqs, band_mask(1, slot), band_k, band_v,
+            make_cache_index(slot, 1),
+        )
+        step = anchored_step(state, "cpu")
+        shifts += int(step.do_shift)
+        actual, op_k, op_v = op(
+            token,
+            token_freqs,
+            None,
+            op_k,
+            op_v,
+            step.cache_index,
+            cache_seqlen=step.cache_seqlen,
+            valid_start=step.valid_start,
+            stick_index=step.stick_index,
+            do_shift=step.do_shift,
+        )
+        state.advance()
+        torch.testing.assert_close(
+            actual, expected, rtol=1e-4, atol=1e-5, msg=f"step {step_index}"
+        )
+
+    assert shifts == 1, f"65 steps at anchor 1024 must roll exactly once, got {shifts}"
+    assert op_k.shape[2] == capacity, "the compact buffer must never grow"
+```
+
+**(b) Pin the tensor-ness of the per-step values.** The design rests on the write
+position and stick index never becoming graph constants, and that currently rests on
+code inspection alone. Add two lines to the existing
+`test_anchored_geometry_is_constant_across_steps`, inside its loop:
+
+```python
+        assert isinstance(step.cache_index, torch.Tensor), "write position must be a tensor"
+        assert isinstance(step.stick_index, torch.Tensor), "stick index must be a tensor"
+```
+
+An `int` in either place silently reintroduces one compiled graph per decode
+position — the exact cost this design exists to avoid — while every correctness test
+still passes.
+
+Run both in the foreground before continuing:
+
+```bash
+cd /mnt/home/spyre/hf-adapters
+python3 -m pytest tests/cpu/test_swa_anchored_cpu.py -v 2>&1 | tail -12
+```
+
+Expected: 4 passed. Commit this separately (`git commit -s`) before the device work,
+so a device failure later cannot be confused with a bookkeeping bug.
+
 - [ ] **Step 1: Write the test**
 
 Append to `tests/spyre/test_swa_layer_ab_spyre.py`:
