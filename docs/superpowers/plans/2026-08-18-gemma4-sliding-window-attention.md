@@ -1688,12 +1688,24 @@ In `_run_blocks_over_embeds`, replace the mask-building block and the call:
 
 ```python
     swa_mode = getattr(model, "_spyre_swa_mode", None)
-    if masks is not None:
+    if masks is not None and swa_mode is not None:
         # A caller supplying its own masks is the unified VLM adapter, whose
-        # bidirectional vision overlay *widens* attention. The op cannot express
-        # that (is_causal=False raises, and an additive mask only ever removes), so
-        # the VLM keeps the band-masked path.
-        swa_mode = None
+        # bidirectional vision overlay *widens* attention — which the op cannot
+        # express (is_causal=False raises, and an additive mask only ever removes).
+        #
+        # This raises rather than quietly falling back, because quietly falling back
+        # is not available here: `swa_mode` is a local, but the branch that consumes
+        # it lives on each attention module and was fixed at prepare time. Zeroing
+        # the local only withholds `cache_seqlen` from a branch that still runs —
+        # which crashes. The opt-out is therefore a prepare-time decision: set
+        # `model._spyre_swa_mode = None` BEFORE `prepare_for_spyre`, as
+        # `hf_gemma4_mm` does.
+        raise SpyreUnsupportedFeatureError(
+            "Gemma 4's sliding-window op path cannot be combined with "
+            "caller-supplied masks: the VLM's bidirectional vision overlay widens "
+            "attention, and an additive mask can only ever remove. Set "
+            "model._spyre_swa_mode = None before prepare_for_spyre."
+        )
     bsz, seq_len = h.shape[0], h.shape[1]
     # The scalar read syncs from the device; deliberately not optimized, and now
     # needed by the op path as well as by the band. Once per step, not per layer.
@@ -2865,9 +2877,10 @@ pass them to `self.self_attn(...)` after `valid_start`.
 
 - [ ] **Step 6: Drive it from `_run_blocks_over_embeds`**
 
-Add the import:
+Add the imports (`SpyreUnsupportedFeatureError` is defined in `hf_common`):
 
 ```python
+from hf_adapters.hf_common import SpyreUnsupportedFeatureError
 from hf_adapters.swa_attention import SlidingWindowCache, anchored_step, compact_after_prefill
 ```
 
@@ -2987,6 +3000,53 @@ In `prepare_text_decoder_for_spyre`, just before the `prepare_gemma4_blocks` cal
 ```
 
 and add `import functools` at the top of the module.
+
+- [ ] **Step 7b: Opt the VLM adapter out at prepare time**
+
+`hf_gemma4_mm.prepare_for_spyre` delegates to `hf_gemma4`, so without this it
+inherits the new `"anchored"` default and its vision path enters the op branch. Add,
+before it calls into `hf_gemma4`:
+
+```python
+    # The unified VLM's bidirectional vision overlay widens attention, which the
+    # sliding-window op cannot express. Opt out here, before the blocks are built:
+    # prepare_text_decoder_for_spyre only fills in _spyre_swa_mode when absent.
+    model._spyre_swa_mode = None
+```
+
+Then add a CPU test to `tests/cpu/test_swa_anchored_cpu.py` pinning the guard, so the
+raise is exercised rather than merely present:
+
+```python
+def test_caller_supplied_masks_reject_the_op_path():
+    """The VLM's own masks and the op path cannot be combined — say so loudly.
+
+    The module-level branch is fixed at prepare time, so a driver cannot un-enable
+    it per call; the only correct answer is to refuse and name the opt-out.
+    """
+    import pytest
+
+    from hf_adapters.hf_common import SpyreUnsupportedFeatureError
+
+    model = _MinimalGemma4(swa_mode="anchored")
+    with pytest.raises(SpyreUnsupportedFeatureError, match="_spyre_swa_mode"):
+        _run_blocks_over_embeds(
+            model,
+            torch.zeros(1, 4, 8),
+            torch.zeros(1, 4, dtype=torch.long),
+            None,
+            [],
+            [],
+            make_cache_index(0, 4),
+            masks={"full_attention": None, "sliding_attention": None},
+        )
+```
+
+Build `_MinimalGemma4` as the smallest object `_run_blocks_over_embeds` reads before
+it reaches the guard — the guard is the second statement in the function, so a stub
+carrying `_spyre_swa_mode` and a `config` is enough. If the guard's position makes a
+stub impractical, say so in your report and assert the guard by calling the adapter
+the way the VLM does instead.
 
 - [ ] **Step 8: Stash the left padding in `generate`**
 
@@ -3485,10 +3545,12 @@ Replace everything in that function from `bsz, seq_len = ...` down to the end of
 the block loop with:
 
 ```python
+    # No bidirectional gate here on purpose: prepare_for_spyre already set
+    # _spyre_swa_mode to None for an embedder config, and it has to be there rather
+    # than here — the branch that consumes this lives in the compiled block's
+    # closure and is fixed at prepare time, so zeroing a local in the driver would
+    # only withhold cache_seqlen from a branch that still runs. One decision point.
     swa_mode = getattr(model, "_spyre_swa_mode", None)
-    if getattr(cfg, "use_bidirectional_attention", False):
-        # The op is causal-only. The embedder path keeps the symmetric band.
-        swa_mode = None
 
     bsz, seq_len = input_ids.shape[0], input_ids.shape[1]
     # These reads sync a scalar back from the device: fine here and deliberately
