@@ -28,10 +28,12 @@ Two things make that a module rather than a call site:
    keep them constant.
 """
 
+import dataclasses
+
 import torch
 import torch.nn.functional as F
 
-from hf_adapters.hf_common import BLOCK_SIZE
+from hf_adapters.hf_common import BLOCK_SIZE, allocate_kv_cache
 
 
 def sliding_capacity(window_size, q_block=BLOCK_SIZE):
@@ -145,3 +147,135 @@ def _reference_attention(
         scale=scale,
         enable_gqa=True,
     )
+
+
+@dataclasses.dataclass
+class SlidingWindowCache:
+    """Anchored compact-buffer state for one generation's sliding layers.
+
+    The invariant, at the start of every 64-token stick period:
+
+      * physical rows ``[0, anchor)`` hold the most recent ``anchor`` tokens, all
+        real once the buffer has filled
+      * rows ``[anchor, capacity)`` are empty and take the next 64 writes
+
+    Token ``m`` of a period is written at row ``anchor + m``; after the 64th, rows
+    ``[64, capacity)`` shift down to ``[0, anchor)`` and the invariant is restored.
+    The shift happens *before* a stick of writes rather than after, which is what
+    keeps every row below the write cursor real and so keeps ``valid_start`` at 0
+    in the steady state.
+
+    Why this shape at all: the op takes its geometry as trace-time integers, so
+    every distinct ``(cache_seqlen, buffer_origin, seqlen_q)`` is a distinct
+    compiled graph. Anchoring pins all three — ``capacity``, 0, and 64 — for the
+    whole generation, so decode compiles one graph (two, counting the shift
+    branch) instead of one per position.
+    """
+
+    window_size: int
+    capacity: int
+    write_row: int
+    valid_start: list
+
+    @property
+    def anchor(self):
+        """First physical row of the 64-row stick currently being written."""
+        return self.capacity - BLOCK_SIZE
+
+    @classmethod
+    def after_prefill(cls, window_size, prompt_len, offsets):
+        """State for the first decode step, i.e. just after compaction.
+
+        ``offsets`` is ``generate``'s per-sequence left padding, in the prefill
+        buffer's coordinates. Compaction keeps the newest ``min(prompt_len,
+        anchor)`` rows, right-aligned at the anchor, so:
+
+          * a prompt longer than the buffer pushes its pad columns off the front
+            and needs no threshold at all;
+          * a shorter one leaves unwritten rows at the front, and any pad that
+            travelled with it sits directly above them.
+        """
+        capacity = sliding_capacity(window_size)
+        anchor = capacity - BLOCK_SIZE
+        kept = min(prompt_len, anchor)
+        valid_start = [
+            (anchor - kept) + max(0, int(offset) - (prompt_len - kept))
+            for offset in offsets
+        ]
+        return cls(window_size, capacity, anchor, valid_start)
+
+    def stick_offset(self):
+        """Index of the current token within its 64-row query stick."""
+        return self.write_row - self.anchor
+
+    def needs_shift(self):
+        """True when the write stick is full, so the buffer must roll first."""
+        return self.write_row >= self.capacity
+
+    def shift(self):
+        """Advance the bookkeeping past a 64-row roll of the buffer."""
+        self.write_row = self.anchor
+        self.valid_start = [max(0, start - BLOCK_SIZE) for start in self.valid_start]
+
+    def advance(self):
+        """Move the write cursor on by the one token this step wrote."""
+        self.write_row += 1
+
+
+def shift_indices(capacity, device):
+    """``(src, dst)`` for rolling a compact buffer down by one stick.
+
+    Rows ``[64, capacity)`` move to ``[0, capacity - 64)``. Built on CPU then
+    moved, like ``make_cache_index``: ``torch.arange`` falls back to CPU on Spyre
+    anyway.
+    """
+    src = torch.arange(BLOCK_SIZE, capacity, dtype=torch.long)
+    dst = torch.arange(0, capacity - BLOCK_SIZE, dtype=torch.long)
+    return src.to(device), dst.to(device)
+
+
+def compact_after_prefill(key_cache, value_cache, state, prompt_len):
+    """Move a prefill-sized cache's newest rows into a fresh anchored buffer.
+
+    Prefill needs ``max(sliding_capacity(W), prompt)`` rows; decode needs only
+    ``capacity``. Rather than carry the prefill allocation for the whole
+    generation — at Gemma 4 12B's 40 sliding layers and an 8192-token context that
+    is gigabytes — copy the newest ``min(prompt_len, anchor)`` rows into
+    ``[anchor - kept, anchor)`` of a compact buffer and let the big one go.
+
+    Returns the new ``(key_cache, value_cache)``; the caller must replace its
+    references, since nothing else keeps the compact buffers alive.
+    """
+    anchor = state.anchor
+    kept = min(prompt_len, anchor)
+    device = key_cache.device
+    src = torch.arange(prompt_len - kept, prompt_len, dtype=torch.long).to(device)
+    dst = torch.arange(anchor - kept, anchor, dtype=torch.long).to(device)
+
+    batch, num_kv_heads, _, head_dim = key_cache.shape
+    compact_key = allocate_kv_cache(
+        batch, num_kv_heads, state.capacity, head_dim, key_cache.dtype, device
+    )
+    compact_value = allocate_kv_cache(
+        batch,
+        num_kv_heads,
+        state.capacity,
+        value_cache.shape[3],
+        value_cache.dtype,
+        device,
+    )
+    _compact_copy(compact_key, key_cache, dst, src)
+    _compact_copy(compact_value, value_cache, dst, src)
+    return compact_key, compact_value
+
+
+def _compact_copy(destination, source, dst_index, src_index):
+    """``destination[dst] = source[src]`` along the cache-position dim, in place.
+
+    ``index_select`` then ``index_copy_``, the pair ``kv_cache_update`` already
+    relies on: in place on the destination so its pinned layout survives, where an
+    out-of-place copy would come back with the default layout and be written to the
+    wrong rows afterwards (torch-spyre#3705).
+    """
+    destination.index_copy_(2, dst_index, source.index_select(2, src_index))
+    return destination

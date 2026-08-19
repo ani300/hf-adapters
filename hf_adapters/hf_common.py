@@ -1221,6 +1221,31 @@ def make_cache_index(start, length, device=None):
     return idx.to(device) if device is not None else idx
 
 
+def allocate_kv_cache(batch_size, num_kv_heads, rows, head_dim, dtype, device):
+    """One zeroed ``[B, n_kv, rows, head_dim]`` cache with a scatter-ready layout.
+
+    On Spyre the *device* layout is pinned so the cache-position dim lands at
+    device position 0, which is what ``kv_cache_update``'s indirect scatter
+    requires; a cache without the pin is written to the wrong rows silently, with
+    no error (torch-spyre#3705). Split out of ``allocate_kv_caches`` so a caller
+    allocating one replacement cache mid-generation — the sliding-window
+    compaction — gets the same pin as the initial allocation.
+    """
+    if torch.device(device).type != "spyre":
+        return torch.zeros(
+            (batch_size, num_kv_heads, rows, head_dim), dtype=dtype, device=device
+        )
+    stl = _cache_position_first_stl(batch_size, num_kv_heads, rows, head_dim, dtype)
+    cache: torch.Tensor = torch.empty(  # type: ignore[call-overload]
+        (batch_size, num_kv_heads, rows, head_dim),
+        device=torch.device(device),
+        device_layout=stl,
+        dtype=dtype,
+    )
+    cache.zero_()
+    return cache
+
+
 def allocate_kv_caches(
     model, batch_size, max_cache_len, dtype, device=None, capacities=None
 ):
@@ -1254,25 +1279,9 @@ def allocate_kv_caches(
         raise ValueError(
             f"capacities has {len(capacities)} entries for {len(shapes)} layers"
         )
-    on_spyre = torch.device(device).type == "spyre"
 
     def _alloc(n_kv, head_dim, rows):
-        stl = (
-            _cache_position_first_stl(batch_size, n_kv, rows, head_dim, dtype)
-            if on_spyre
-            else None
-        )
-        shape = (batch_size, n_kv, rows, head_dim)
-        if stl is None:
-            return torch.zeros(shape, dtype=dtype, device=device)
-        cache: torch.Tensor = torch.empty(  # type: ignore[call-overload]
-            shape,
-            device=torch.device(device),
-            device_layout=stl,
-            dtype=dtype,
-        )
-        cache.zero_()
-        return cache
+        return allocate_kv_cache(batch_size, n_kv, rows, head_dim, dtype, device)
 
     key_caches = [
         _alloc(n_kv, hd, rows)
