@@ -64,8 +64,9 @@ split / loop bmm paths -- the chunked path uses plain 2D matmuls):
    ``L3_ADDEARIMM Immediate value out of boundary``). ``prepare_for_spyre``
    lays the experts out pre-transposed once.
 
-``K`` is pinned to 4 for bring-up; ``prepare_for_spyre`` coerces/asserts
-``config.top_k_experts == 4``.
+``K`` is the checkpoint's real ``config.top_k_experts`` (8 for gemma-4-26B-A4B);
+``prepare_for_spyre`` asserts only the Spyre topk ceiling ``K <= 128`` (raised
+from 4 by torch-spyre #3782, which splits topk's k across cores).
 """
 
 import torch
@@ -88,10 +89,11 @@ from hf_adapters.hf_gemma4 import (
 # ``resolve_adapter_module`` / ``generate`` look them up on the resolved adapter.
 __all__ = ["prepare_for_spyre", "_run_forward", "_run_backbone_forward"]
 
-# Top-K pinned to 4 for MoE bring-up (Global Constraints). The device grouped
-# GEMM and the host route/permute path are validated at this K; a different K
-# is a later-task concern.
-_MOE_BRINGUP_K = 4
+# Upper bound on the top-K the Spyre topk reduction can serve. torch-spyre
+# #3782 split topk's k across cores and raised the ceiling from 4 to 128, so
+# the adapter now uses the checkpoint's real ``top_k_experts`` (8 for
+# gemma-4-26B-A4B) instead of the old bring-up pin, asserting only this ceiling.
+_MOE_MAX_K = 128
 
 # Grouped-GEMM lowering selector (spec §4, Task 9 "Option 4B").
 #
@@ -459,11 +461,14 @@ def _compiled_moe_loop_region(
     Router (inlined SCALE-FREE RMSNorm on the RAW residual x_router with eps
     INSIDE the sqrt, then * router_scale[H] * router_scalar_root_size, then
     proj) -> softmax -> topk(K) -> renorm -> per_expert_scale; then, under a
-    single spyre_hint(tiles={"row": tile}) that tiles the N=T*K row axis (the
-    hint IS the loop -- no Python for), gather the expert-input rows from
-    x_expert, index_select the per-row expert weights from the HBM-resident
-    E-outermost stacks, two bmms (3D [*,1,*] throughout) with a gelu-tanh
-    SwiGLU, and weight by the router weight.
+    single spyre_hint(tiles={"row": tile}) that tiles the [T,K] row axis (the
+    hint IS the loop -- no Python for), broadcast the expert-input rows from
+    x_expert over K, index_select the per-(token,expert) weights from the
+    HBM-resident E-outermost stacks with the B5-B8 address-prep index
+    (idx_addr [T,K,32] fp32; the backend's idx2Addr turns it into weight base
+    addresses when it lowers the index_selects), two batched matmuls
+    ([T,K,1,*] throughout) with a gelu-tanh SwiGLU, and weight by the router
+    weight.
 
     Preflight-corrected router surface: the stock router.norm has NO .weight
     (Gemma4RMSNorm with_scale=False); the learnable gain is router_scale, an
@@ -472,12 +477,11 @@ def _compiled_moe_loop_region(
 
     gate_up_dev: [E,H,2M] (stick=2M), down_dev: [E,M,H] (stick=H), E outermost.
     tile must be >= 2 (single-row P=1 gather SIGABRTs in dxp_standalone).
-    Returns (row_out[N,H], token_of_row[N]) for the host index_add combine.
+    Returns (row_out[T,K,H], token_of_row[T,K]) for the host index_add combine.
     """
     from torch_spyre._inductor.propagate_hints import spyre_hint
 
     T, H = x_expert.shape
-    N = T * K
 
     # --- router (all device-lowerable): SCALE-FREE RMSNorm (eps inside sqrt)
     # on the RAW residual, then the [H] scale vector and the root-size scalar.
@@ -486,27 +490,42 @@ def _compiled_moe_loop_region(
     normed = normed * router_scale * router_scalar_root_size  # scale is [H]
     logits = F.linear(normed, router_proj_w)  # [T,E]
     probs = torch.softmax(logits, dim=-1)
-    # topk returns int64 indices (the Spyre spyre_topk decomp converts the
-    # fp16-encoded positions the dxp kernel writes to int64), so idx is ready
-    # to feed the three indirect gathers below (per_expert_scale[idx],
-    # gate_up_dev[expert_of_row], down_dev[...]) with no adapter-side cast.
-    w, idx = torch.topk(probs, K, dim=-1)  # [T,K],[T,K] int64  ASSUMED to lower
+    # topk's index is kept in its native [T,K] shape (no reshape to N). The
+    # spyre_topk decomposition leaves the index in fp16 (the device reduction
+    # materializes positions in the input dtype; Spyre has no native int64), so
+    # idx is an fp16 value that "lies" it is an index. Before it can drive an
+    # on-device indirect gather it must be put in the address-prep form the
+    # backend's idx2Addr step consumes (moe-implementation-notes-aug2026.md
+    # B5-B8): replicate the index across a dummy 64-lane stick (B5 identity),
+    # restickify that lane onto the stick (B6), widen fp16 -> fp32 for the
+    # address arithmetic (B7), then slice to the 32 elements an fp32 stick holds
+    # (B8). idx2Addr itself (B9-B11) is inserted by the backend when it lowers
+    # the index_selects below -- we produce only the B5-B8 index, not addresses.
+    w, idx = torch.topk(probs, K, dim=-1)  # [T,K] values, [T,K] fp16 indices
     w = w / w.sum(-1, keepdim=True)
-    w = w * per_expert_scale[idx]  # [T,K]
 
-    expert_of_row = idx.reshape(N)  # [N] topk order (no sort)
-    token_of_row = (token_ids.reshape(T, 1).expand(T, K)).reshape(N)  # [N]
-    row_w = w.reshape(N, 1)  # [N,1]
+    # B5-B8 index address-prep, shared by every indirect consumer below.
+    idx_stick = idx[..., None].expand(T, K, 64)  # B5: replicate over dummy 64
+    idx_stick = torch.ops.spyre.restickify(idx_stick)  # B6: dummy dim -> stick
+    idx_addr = idx_stick.to(torch.float32)[..., :32]  # B7 widen, B8 slice -> fp32
 
+    w = w * per_expert_scale[idx_addr]  # [T,K]
+
+    # The K rows for one token all read the SAME token embedding, so broadcast
+    # x_expert over the K axis instead of gathering with a flattened index. The
+    # expert-weight index_selects consume the B5-B8 idx_addr in [T,K,32] form.
     with spyre_hint(tiles={"row": tile}):
-        gathered = x_expert[token_of_row]  # [N,H]
-        W_gu = gate_up_dev[expert_of_row]  # [N,H,2M] on-device index_select
-        W_dn = down_dev[expert_of_row]  # [N,M,H]
-        gu = torch.bmm(gathered.unsqueeze(1), W_gu)  # [N,1,2M] 3D throughout
-        g, u = gu.chunk(2, dim=-1)  # [N,1,M]
-        act = F.gelu(g, approximate="tanh") * u  # [N,1,M]
-        row_out = torch.bmm(act, W_dn).squeeze(1)  # [N,H]
-        row_out = row_out * row_w  # [N,1] broadcast
+        gathered = x_expert[:, None, :].expand(T, K, H)  # [T,K,H]
+        W_gu = gate_up_dev[idx_addr]  # [T,K,H,2M] on-device index_select
+        W_dn = down_dev[idx_addr]  # [T,K,M,H]
+        gu = torch.matmul(gathered.unsqueeze(-2), W_gu)  # [T,K,1,2M] batched
+        g, u = gu.chunk(2, dim=-1)  # [T,K,1,M]
+        act = F.gelu(g, approximate="tanh") * u  # [T,K,1,M]
+        row_out = torch.matmul(act, W_dn).squeeze(-2)  # [T,K,H]
+        row_out = row_out * w[..., None]  # [T,K,1] broadcast
+    # token_of_row[t,k] = t (each of a token's K rows scatters back to token t);
+    # kept in [T,K] here, flattened host-side for the eager index_add combine.
+    token_of_row = token_ids[:, None].expand(T, K)  # [T,K]
     return row_out, token_of_row
 
 
@@ -653,8 +672,12 @@ def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_up_dev,
         tile,
         eps,
     )
-    row_out = row_out.cpu().float()
-    token_of_row = token_of_row.cpu().long()
+    # The region returns [T,K,H] / [T,K] (topk shape kept on device). Flatten to
+    # [N,H] / [N] HOST-side for the eager index_add scatter-combine -- this is
+    # host glue, not the device/topk-consumption path the "no reshape" rule
+    # governs, and index_add does not lower on device anyway.
+    row_out = row_out.cpu().float().reshape(-1, H)  # [N,H]
+    token_of_row = token_of_row.cpu().long().reshape(-1)  # [N]
     out = torch.zeros(T, H, dtype=torch.float32)
     out = out.index_add(0, token_of_row, row_out)
     return out.to(dtype=x_expert.dtype, device=x_expert.device)
@@ -682,12 +705,13 @@ def _moe_route_padded(x_router, router_proj_w, router_scale,
     topk over a pow2 stick-multiple width (E=128) aborts on-card
     (``Incorrect chunk size``), so the logits are padded to ``pad_w`` (non-pow2)
     with ``pad_neg`` (-inf) BEFORE topk; the pad columns never win top-K. Only
-    the kth topk VALUE is used (``wv[..., -1:]``) as a threshold over the
-    ORIGINAL [T,E] probs -- the fp16 index is never materialized (no
-    ``customops.py`` fp16->int32 CPU fallback). The result is a DENSE [T,E]
-    routing weight: zero for non-selected experts, ``renorm*per_expert_scale``
-    for the top-K. Downstream expert chunks turn per-expert selection into
-    arithmetic (``(w*onehot[e]).sum``), so no index/gather is needed.
+    the kth topk VALUE is used (``wv[..., -1:]``) as a threshold, applied over
+    the ORIGINAL [T,E] probs via ``torch.ops.spyre.index_mask(probs, kth)`` --
+    the fp16 index is never materialized (no ``customops.py`` fp16->int32 CPU
+    fallback). The result is a DENSE [T,E] routing weight: zero for non-selected
+    experts, ``renorm*per_expert_scale`` for the top-K. Downstream expert chunks
+    turn per-expert selection into arithmetic (``(w*onehot[e]).sum``), so no
+    index/gather is needed.
 
     Args:
         x_router: RAW flattened residual [T,H] (router's own norm applied here).
@@ -718,7 +742,11 @@ def _moe_route_padded(x_router, router_proj_w, router_scale,
     padded = torch.cat([probs, pad], dim=-1)  # [T,pad_w]
     wv, _ = torch.topk(padded, K, dim=-1)  # [T,K]; idx<E, never materialized
     kth = wv[..., -1:]  # [T,1] kth-largest VALUE threshold
-    mask = torch.where(probs >= kth, probs, torch.zeros_like(probs))  # [T,E]
+    # index_mask keeps probs where probs >= kth (the selected top-K experts) and
+    # zeroes the rest -- the device op form of the old
+    # torch.where(probs >= kth, probs, 0) threshold, with the [T,1] kth
+    # broadcast over the [T,E] probs.
+    mask = torch.ops.spyre.index_mask(probs, kth)  # [T,E]
     w = mask / mask.sum(-1, keepdim=True)  # renorm top-K to sum 1
     return w * per_expert_scale  # [T,E] dense routing weight
 
@@ -1099,8 +1127,8 @@ def prepare_for_spyre(model):
     RMSNorm patch, per-type RoPE, KV shapes, ``pad_lm_head``) and adds the MoE
     layout / bring-up steps:
 
-      * assert ``enable_moe_block=True`` and coerce/assert ``top_k_experts == 4``
-        (K pinned for bring-up, Global Constraints);
+      * assert ``enable_moe_block=True`` and use the checkpoint's real
+        ``top_k_experts`` (asserting only the Spyre topk ceiling ``<= 128``);
       * lay each layer's packed expert weights **expert-dim-outermost and
         pre-transposed** (``gate_up`` ``[E,2M,H]`` -> ``[E,H,2M]``, ``down``
         ``[E,H,M]`` -> ``[E,M,H]``; shape rule 2 + spec §3.5). The layout THEN
@@ -1127,12 +1155,13 @@ def prepare_for_spyre(model):
         "hf_gemma4_moe requires an MoE checkpoint (enable_moe_block=True); "
         "use hf_gemma4 for the dense variants."
     )
-    # K pinned to 4 for bring-up. Coerce the config then assert so the router's
-    # host topk and the device grouped-GEMM path both run at the validated K.
-    cfg.top_k_experts = _MOE_BRINGUP_K
-    assert cfg.top_k_experts == _MOE_BRINGUP_K, (
-        f"MoE bring-up pins top_k_experts to {_MOE_BRINGUP_K}; "
-        f"got {cfg.top_k_experts}."
+    # Use the checkpoint's real top_k_experts (no bring-up pin). The Spyre topk
+    # reduction serves up to k=128 (torch-spyre #3782), so only assert that
+    # ceiling; the router's topk and the device value path both run at this K.
+    moe_k = int(cfg.top_k_experts)
+    assert 1 <= moe_k <= _MOE_MAX_K, (
+        f"top_k_experts ({moe_k}) must be in [1, {_MOE_MAX_K}]; the Spyre topk "
+        f"reduction caps k at {_MOE_MAX_K}."
     )
     # The expert SwiGLU hardcodes gelu(approximate="tanh") to match this
     # checkpoint's hidden_activation. Guard so a variant with a different
@@ -1206,9 +1235,9 @@ def prepare_for_spyre(model):
     # — the same call-time-read rule the dense block uses for ``layer_scalar``.
     compiled_blocks = []
     for i, layer in enumerate(list(backbone.layers)):
-        # Stash the pinned K on the layer so Gemma4MoEBlock.__init__ can capture
-        # it (cfg.top_k_experts was coerced to _MOE_BRINGUP_K above).
-        layer._spyre_moe_k = _MOE_BRINGUP_K
+        # Stash the checkpoint's K on the layer so Gemma4MoEBlock.__init__ can
+        # capture it (validated <= _MOE_MAX_K above).
+        layer._spyre_moe_k = moe_k
         block = Gemma4MoEBlock(
             layer,
             num_q_heads_per_layer[i],
