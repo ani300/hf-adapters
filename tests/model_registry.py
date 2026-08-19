@@ -672,8 +672,6 @@ def _non_blocking(models: dict[str, dict], keys: tuple[str, ...]) -> dict[str, s
 NON_BLOCKING_CAUSAL_MODELS: dict[str, str] = _non_blocking(
     CAUSAL_LM_MODELS,
     (
-        "gemma4_google",  # gemma4 responds poorly to prompt without template
-        "gemma4_base",
         "smollm3",
     ),
 )
