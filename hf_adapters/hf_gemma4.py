@@ -79,6 +79,7 @@ from hf_adapters.hf_common import (
     BLOCK_SIZE,
     InvFreqShim,
     PrecomputedRotaryEmbedding,
+    SpyreUnsupportedFeatureError,
     add_causal_sliding_window_band,
     apply_rope_matmul,
     get_backbone,
@@ -505,6 +506,24 @@ def _run_blocks_over_embeds(
     ``attn_mask`` via ``_build_layer_masks`` (``attn_mask`` is ignored when
     ``masks`` is given).
     """
+    swa_mode = getattr(model, "_spyre_swa_mode", None)
+    if masks is not None and swa_mode is not None:
+        # A caller supplying its own masks is the unified VLM adapter, whose
+        # bidirectional vision overlay *widens* attention. The op cannot express
+        # that (is_causal=False raises, and an additive mask only ever removes).
+        # Each Gemma4Attention's self.swa_mode is baked in at prepare time, so
+        # this driver cannot disable the op path per call by zeroing a local --
+        # it can only refuse the combination and name the prepare-time opt-out.
+        raise SpyreUnsupportedFeatureError(
+            "_run_blocks_over_embeds received explicit per-type masks (a "
+            "caller-supplied mask dict, e.g. the VLM adapter) while "
+            f"model._spyre_swa_mode={swa_mode!r} is set. The sliding-window op "
+            "path is fixed per layer at prepare time and cannot be disabled "
+            "per call; set model._spyre_swa_mode = None before "
+            "prepare_text_decoder_for_spyre for any caller that supplies its "
+            "own masks."
+        )
+
     backbone = _gemma4_backbone(model)
     cfg = text_config(model.config)
 
@@ -514,13 +533,6 @@ def _run_blocks_over_embeds(
         for layer_type, rope in model._spyre_rope.items()
     }
 
-    swa_mode = getattr(model, "_spyre_swa_mode", None)
-    if masks is not None:
-        # A caller supplying its own masks is the unified VLM adapter, whose
-        # bidirectional vision overlay *widens* attention. The op cannot express
-        # that (is_causal=False raises, and an additive mask only ever removes), so
-        # the VLM keeps the band-masked path.
-        swa_mode = None
     bsz, seq_len = h.shape[0], h.shape[1]
     # The scalar read syncs from the device; deliberately not optimized, and now
     # needed by the op path as well as by the band. Once per step, not per layer.

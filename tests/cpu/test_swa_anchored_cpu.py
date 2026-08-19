@@ -35,6 +35,7 @@ from hf_adapters.hf_common import (
     build_prefill_mask,
     make_cache_index,
 )
+from hf_adapters.hf_gemma4 import _run_blocks_over_embeds
 from hf_adapters.swa_attention import (
     SlidingWindowCache,
     anchored_step,
@@ -142,3 +143,41 @@ def test_anchored_geometry_is_constant_across_steps():
         seen.add((step.cache_seqlen, tuple(step.valid_start)))
         state.advance()
     assert seen == {(1088, (0,))}, seen
+
+
+class _MinimalGemma4:
+    """Smallest stand-in that reaches the caller-supplied-masks guard.
+
+    ``_run_blocks_over_embeds`` checks ``model._spyre_swa_mode`` against
+    ``masks`` as its second statement, before it touches the backbone, the
+    config, or anything else on the model -- so nothing else needs to be real
+    here.
+    """
+
+    def __init__(self, swa_mode):
+        self._spyre_swa_mode = swa_mode
+        self.config = None
+
+
+def test_caller_supplied_masks_reject_the_op_path():
+    """The VLM's own masks and the op path cannot be combined — say so loudly.
+
+    The module-level branch is fixed at prepare time, so a driver cannot un-enable
+    it per call; the only correct answer is to refuse and name the opt-out.
+    """
+    import pytest
+
+    from hf_adapters.hf_common import SpyreUnsupportedFeatureError
+
+    model = _MinimalGemma4(swa_mode="anchored")
+    with pytest.raises(SpyreUnsupportedFeatureError, match="_spyre_swa_mode"):
+        _run_blocks_over_embeds(
+            model,
+            torch.zeros(1, 4, 8),
+            torch.zeros(1, 4, dtype=torch.long),
+            None,
+            [],
+            [],
+            make_cache_index(0, 4),
+            masks={"full_attention": None, "sliding_attention": None},
+        )
