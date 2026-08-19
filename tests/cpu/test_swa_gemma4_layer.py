@@ -23,8 +23,8 @@ op itself are a device question (tests/spyre/test_swa_layer_ab_spyre.py).
 import copy
 
 import torch
-
 from _swa_helpers import identity_freqs, make_sliding_attention
+
 from hf_adapters.hf_common import (
     add_causal_sliding_window_band,
     build_decode_mask,

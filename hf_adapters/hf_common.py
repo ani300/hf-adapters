@@ -1284,12 +1284,10 @@ def allocate_kv_caches(
         return allocate_kv_cache(batch_size, n_kv, rows, head_dim, dtype, device)
 
     key_caches = [
-        _alloc(n_kv, hd, rows)
-        for (n_kv, hd, _vhd), rows in zip(shapes, capacities)
+        _alloc(n_kv, hd, rows) for (n_kv, hd, _vhd), rows in zip(shapes, capacities)
     ]
     value_caches = [
-        _alloc(n_kv, vhd, rows)
-        for (n_kv, _hd, vhd), rows in zip(shapes, capacities)
+        _alloc(n_kv, vhd, rows) for (n_kv, _hd, vhd), rows in zip(shapes, capacities)
     ]
     return key_caches, value_caches
 

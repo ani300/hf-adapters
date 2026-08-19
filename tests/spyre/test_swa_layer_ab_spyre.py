@@ -29,8 +29,8 @@ import math
 
 import pytest
 import torch
-
 from _swa_helpers import FakeKVModel, identity_freqs, make_sliding_attention
+
 from hf_adapters.hf_common import (
     add_causal_sliding_window_band,
     allocate_kv_caches,
@@ -226,7 +226,11 @@ def test_decode_op_no_worse_than_band_mask():
         valid_start=[0],
     )
     _, ref_k, ref_v = _run_cpu32(
-        reference, prompt, prompt_freqs, prompt_mask, *_cpu_caches(capacity),
+        reference,
+        prompt,
+        prompt_freqs,
+        prompt_mask,
+        *_cpu_caches(capacity),
         prompt_index,
     )
 
@@ -261,9 +265,7 @@ def test_decode_op_no_worse_than_band_mask():
         cache_seqlen=written + 1,
         valid_start=[0],
     )
-    ref_out, _, _ = _run_cpu32(
-        reference, token, token_freqs, mask, ref_k, ref_v, index
-    )
+    ref_out, _, _ = _run_cpu32(reference, token, token_freqs, mask, ref_k, ref_v, index)
     # One query row has no stagger, so it spans WINDOW + 1 columns.
     _assert_no_worse(op_out, band_out, ref_out, terms=min(capacity, WINDOW + 1))
 
@@ -361,12 +363,16 @@ def test_anchored_decode_matches_band_mask_across_a_shift():
     compiled_band = torch.compile(band, dynamic=False)
     compiled_op = torch.compile(op, dynamic=False)
     with torch.no_grad():
-        _, band_k, band_v = compiled_band(
-            hidden, freqs, mask, band_k, band_v, index
-        )
+        _, band_k, band_v = compiled_band(hidden, freqs, mask, band_k, band_v, index)
         _, op_k, op_v = compiled_op(
-            hidden, freqs, None, op_k, op_v, index,
-            cache_seqlen=prompt, valid_start=[0],
+            hidden,
+            freqs,
+            None,
+            op_k,
+            op_v,
+            index,
+            cache_seqlen=prompt,
+            valid_start=[0],
         )
         _, ref_k, ref_v = _run_cpu32(
             reference,
@@ -398,7 +404,11 @@ def test_anchored_decode_matches_band_mask_across_a_shift():
         shifts += int(step.do_shift)
         with torch.no_grad():
             expected, band_k, band_v = compiled_band(
-                token, token_freqs, band_mask, band_k, band_v,
+                token,
+                token_freqs,
+                band_mask,
+                band_k,
+                band_v,
                 make_cache_index(slot, 1, "spyre"),
             )
             actual, op_k, op_v = compiled_op(

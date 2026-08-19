@@ -27,8 +27,8 @@ arithmetic is identical.
 import copy
 
 import torch
-
 from _swa_helpers import identity_freqs, make_sliding_attention
+
 from hf_adapters.hf_common import (
     add_causal_sliding_window_band,
     build_decode_mask,
@@ -71,9 +71,7 @@ def _band_mask(seqlen, block_base):
 
 def test_anchored_decode_matches_the_full_cache_band_path():
     torch.manual_seed(11)
-    band = make_sliding_attention(
-        Q_HEADS, KV_HEADS, HEAD_DIM, WINDOW, swa_mode=None
-    )
+    band = make_sliding_attention(Q_HEADS, KV_HEADS, HEAD_DIM, WINDOW, swa_mode=None)
     op = copy.deepcopy(band)
     op.swa_mode = "anchored"
 
@@ -106,7 +104,11 @@ def test_anchored_decode_matches_the_full_cache_band_path():
         token_freqs = identity_freqs(1, 1, HEAD_DIM)
 
         expected, band_k, band_v = band(
-            token, token_freqs, _band_mask(1, slot), band_k, band_v,
+            token,
+            token_freqs,
+            _band_mask(1, slot),
+            band_k,
+            band_v,
             make_cache_index(slot, 1),
         )
 
@@ -140,12 +142,12 @@ def test_anchored_geometry_is_constant_across_steps():
     seen = set()
     for _ in range(200):
         step = anchored_step(state, "cpu")
-        assert isinstance(step.cache_index, torch.Tensor), (
-            "write position must be a tensor"
-        )
-        assert isinstance(step.stick_index, torch.Tensor), (
-            "stick index must be a tensor"
-        )
+        assert isinstance(
+            step.cache_index, torch.Tensor
+        ), "write position must be a tensor"
+        assert isinstance(
+            step.stick_index, torch.Tensor
+        ), "stick index must be a tensor"
         seen.add((step.cache_seqlen, tuple(step.valid_start)))
         state.advance()
     assert seen == {(1088, (0,))}, seen
@@ -169,9 +171,7 @@ def test_anchored_shift_at_the_shipped_geometry():
                 1, full_capacity, block_base, 0, dtype=torch.float32
             )
         else:
-            mask = build_prefill_mask(
-                1, seqlen, full_capacity, 0, dtype=torch.float32
-            )
+            mask = build_prefill_mask(1, seqlen, full_capacity, 0, dtype=torch.float32)
         coords = torch.arange(seqlen)[None, :] + block_base
         return add_causal_sliding_window_band(mask, coords, window)
 
@@ -188,9 +188,7 @@ def test_anchored_shift_at_the_shipped_geometry():
     hidden = torch.randn(1, prompt, q_heads * head_dim)
     freqs = identity_freqs(1, prompt, head_dim)
     index = make_cache_index(0, prompt)
-    _, band_k, band_v = band(
-        hidden, freqs, band_mask(prompt, 0), band_k, band_v, index
-    )
+    _, band_k, band_v = band(hidden, freqs, band_mask(prompt, 0), band_k, band_v, index)
     _, op_k, op_v = op(
         hidden, freqs, None, op_k, op_v, index, cache_seqlen=prompt, valid_start=[0]
     )
@@ -207,7 +205,11 @@ def test_anchored_shift_at_the_shipped_geometry():
         token = torch.randn(1, 1, q_heads * head_dim)
         token_freqs = identity_freqs(1, 1, head_dim)
         expected, band_k, band_v = band(
-            token, token_freqs, band_mask(1, slot), band_k, band_v,
+            token,
+            token_freqs,
+            band_mask(1, slot),
+            band_k,
+            band_v,
             make_cache_index(slot, 1),
         )
         step = anchored_step(state, "cpu")

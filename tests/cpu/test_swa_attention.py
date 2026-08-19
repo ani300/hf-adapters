@@ -30,9 +30,7 @@ def _band_masked_attention(query, key_cache, value_cache, window_size, offset):
     """What the Gemma adapters do today: causal + left-pad mask, then a band."""
     batch, _, seqlen_q, _ = query.shape
     capacity = key_cache.size(2)
-    mask = build_prefill_mask(
-        batch, seqlen_q, capacity, offset, dtype=query.dtype
-    )
+    mask = build_prefill_mask(batch, seqlen_q, capacity, offset, dtype=query.dtype)
     coords = torch.arange(seqlen_q)[None, :].expand(batch, seqlen_q)
     mask = add_causal_sliding_window_band(mask, coords, window_size)
     return F.scaled_dot_product_attention(
