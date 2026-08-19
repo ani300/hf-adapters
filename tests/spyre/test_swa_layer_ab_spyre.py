@@ -38,6 +38,11 @@ from hf_adapters.hf_common import (
     build_prefill_mask,
     make_cache_index,
 )
+from hf_adapters.swa_attention import (
+    SlidingWindowCache,
+    anchored_step,
+    compact_after_prefill,
+)
 
 # Gemma 4 12B's sliding layers, at one quarter the head count so a test fits.
 WINDOW = 1024
@@ -311,3 +316,121 @@ def test_left_padding_op_no_worse_than_band_mask():
     _assert_no_worse(
         op_out, band_out, ref_out, terms=min(capacity, WINDOW + 64), rows_from=offset
     )
+
+
+def test_anchored_decode_matches_band_mask_across_a_shift():
+    """The shipped geometry, on device, over a 64-row roll.
+
+    The roll reads a cache it then writes (index_select into index_copy_ on the
+    same tensor). If Inductor fuses those so the read sees already-overwritten
+    rows, this is the test that catches it — the CPU lane cannot, and the
+    documented fallback is a pair of ping-pong buffers.
+    """
+    torch._dynamo.reset()
+    window, prompt, steps = 128, 256, 70
+    capacity, full_capacity = 192, 384
+
+    # Deep-copy on CPU, then move both to device: deepcopy of an already-"spyre"
+    # module fails (no aten::set_.source_Storage kernel for that backend), the
+    # same reason _modules() above deep-copies before .to("spyre").
+    band = make_sliding_attention(
+        Q_HEADS, KV_HEADS, HEAD_DIM, window, swa_mode=None, dtype=DTYPE
+    )
+    op = copy.deepcopy(band)
+    op.swa_mode = "anchored"
+    band = band.to("spyre")
+    op = op.to("spyre")
+    reference = make_sliding_attention(
+        Q_HEADS, KV_HEADS, HEAD_DIM, window, swa_mode=None, dtype=torch.float32
+    )
+
+    band_k, band_v = _spyre_caches(full_capacity)
+    op_k, op_v = _spyre_caches(prompt)
+    ref_k, ref_v = _cpu_caches(full_capacity)
+
+    torch.manual_seed(5)
+    hidden = torch.randn(1, prompt, Q_HEADS * HEAD_DIM, dtype=DTYPE).to("spyre")
+    freqs = identity_freqs(1, prompt, HEAD_DIM, dtype=DTYPE).to("spyre")
+    index = make_cache_index(0, prompt, "spyre")
+
+    mask = build_prefill_mask(1, prompt, full_capacity, 0, dtype=DTYPE)
+    mask = add_causal_sliding_window_band(
+        mask, torch.arange(prompt)[None, :], window
+    ).to("spyre")
+
+    compiled_band = torch.compile(band, dynamic=False)
+    compiled_op = torch.compile(op, dynamic=False)
+    with torch.no_grad():
+        _, band_k, band_v = compiled_band(
+            hidden, freqs, mask, band_k, band_v, index
+        )
+        _, op_k, op_v = compiled_op(
+            hidden, freqs, None, op_k, op_v, index,
+            cache_seqlen=prompt, valid_start=[0],
+        )
+        _, ref_k, ref_v = _run_cpu32(
+            reference,
+            hidden.to("cpu"),
+            freqs.to("cpu"),
+            mask.to("cpu"),
+            ref_k,
+            ref_v,
+            make_cache_index(0, prompt),
+        )
+
+    state = SlidingWindowCache.after_prefill(window, prompt, [0])
+    op_k, op_v = compact_after_prefill(op_k, op_v, state, prompt)
+    assert op_k.shape[2] == capacity
+
+    shifts = 0
+    for step_index in range(steps):
+        slot = prompt + step_index
+        token = torch.randn(1, 1, Q_HEADS * HEAD_DIM, dtype=DTYPE).to("spyre")
+        token_freqs = identity_freqs(1, 1, HEAD_DIM, dtype=DTYPE).to("spyre")
+        # build_decode_mask for a one-token step at a non-zero position; see the
+        # note in the decode A/B above.
+        band_mask = build_decode_mask(1, full_capacity, slot, 0, dtype=DTYPE)
+        band_mask = add_causal_sliding_window_band(
+            band_mask, torch.tensor([[slot]]), window
+        ).to("spyre")
+
+        step = anchored_step(state, "spyre")
+        shifts += int(step.do_shift)
+        with torch.no_grad():
+            expected, band_k, band_v = compiled_band(
+                token, token_freqs, band_mask, band_k, band_v,
+                make_cache_index(slot, 1, "spyre"),
+            )
+            actual, op_k, op_v = compiled_op(
+                token,
+                token_freqs,
+                None,
+                op_k,
+                op_v,
+                step.cache_index,
+                cache_seqlen=step.cache_seqlen,
+                valid_start=step.valid_start,
+                stick_index=step.stick_index,
+                do_shift=step.do_shift,
+            )
+            # The float32 twin keeps its own full-length cache through the same
+            # token stream, so every step is measured against truth rather than
+            # against the other fp16 path. See _assert_no_worse.
+            ref_out, ref_k, ref_v = _run_cpu32(
+                reference,
+                token.to("cpu"),
+                token_freqs.to("cpu"),
+                band_mask.to("cpu"),
+                ref_k,
+                ref_v,
+                make_cache_index(slot, 1),
+            )
+        state.advance()
+        _assert_no_worse(
+            actual.to("cpu").float(),
+            expected.to("cpu").float(),
+            ref_out,
+            terms=capacity,
+        )
+
+    assert shifts == 1
