@@ -1704,6 +1704,9 @@ def generate(
     input_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
         input_ids, actual_prompt_lengths
     )
+    # Per-layer cache management needs the left padding: a sliding-window layer
+    # cannot mask pad columns with an attention mask (see swa_attention).
+    model._spyre_prompt_offsets = prompt_offsets
 
     # Initialize empty KV caches. Per-layer shapes come from the model
     # (``_spyre_kv_shapes``) for heterogeneous architectures like Gemma 4,

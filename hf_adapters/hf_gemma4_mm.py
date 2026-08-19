@@ -167,6 +167,12 @@ def prepare_for_spyre(model):
     except ImportError:
         pass
 
+    # The unified VLM's bidirectional vision overlay widens attention, which the
+    # SWA op cannot express (see _run_blocks_over_embeds); keep the band-masked
+    # path regardless of hf_gemma4's default. Must be set before prepare, which
+    # only fills in _spyre_swa_mode when the attribute is absent.
+    model._spyre_swa_mode = None
+
     # Shared text decoder (mirrors hf_gemma4.prepare_for_spyre).
     hf_gemma4.prepare_text_decoder_for_spyre(model)
 

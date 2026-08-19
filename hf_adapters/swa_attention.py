@@ -279,3 +279,40 @@ def _compact_copy(destination, source, dst_index, src_index):
     """
     destination.index_copy_(2, dst_index, source.index_select(2, src_index))
     return destination
+
+
+@dataclasses.dataclass(frozen=True)
+class AnchoredStep:
+    """What one anchored decode step passes into a compiled sliding block.
+
+    ``cache_seqlen`` and ``valid_start`` are the same values at every step of a
+    steady-state generation, which is what keeps the block at one compiled graph;
+    ``cache_index``, ``stick_index`` and ``do_shift`` carry the per-step part —
+    the first two as tensors so the write position never becomes a graph constant,
+    the third as a bool because a shift genuinely is a different graph.
+    """
+
+    do_shift: bool
+    cache_index: torch.Tensor
+    stick_index: torch.Tensor
+    cache_seqlen: int
+    valid_start: list
+
+
+def anchored_step(state, device):
+    """Geometry for the next anchored decode step, rolling the buffer if due.
+
+    Mutates ``state`` when a shift is due — the tensor roll itself happens inside
+    the compiled block, driven by ``do_shift``. The caller must call
+    ``state.advance()`` after the step completes.
+    """
+    do_shift = state.needs_shift()
+    if do_shift:
+        state.shift()
+    return AnchoredStep(
+        do_shift=do_shift,
+        cache_index=torch.tensor([state.write_row], dtype=torch.long).to(device),
+        stick_index=torch.tensor([state.stick_offset()], dtype=torch.long).to(device),
+        cache_seqlen=state.capacity,
+        valid_start=list(state.valid_start),
+    )

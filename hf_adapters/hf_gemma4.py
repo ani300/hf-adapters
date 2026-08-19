@@ -69,11 +69,14 @@ Usage::
     outputs = model.generate(tokenizer, ["Hello!"], max_new_tokens=32)
 """
 
+import functools
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from hf_adapters.hf_common import (
+    BLOCK_SIZE,
     InvFreqShim,
     PrecomputedRotaryEmbedding,
     add_causal_sliding_window_band,
@@ -83,7 +86,14 @@ from hf_adapters.hf_common import (
     pad_lm_head,
     text_config,
 )
-from hf_adapters.swa_attention import sliding_window_attention
+from hf_adapters.swa_attention import (
+    SlidingWindowCache,
+    anchored_step,
+    compact_after_prefill,
+    shift_indices,
+    sliding_capacity,
+    sliding_window_attention,
+)
 
 
 def _gemma4_backbone(model):
@@ -174,6 +184,16 @@ class Gemma4Attention(nn.Module):
         # so it recompiles once per 64 decode steps without bound.
         self.swa_mode = swa_mode
 
+        # Non-persistent so the roll indices never enter a state_dict. Registered
+        # buffers because prepare_for_spyre runs *before* the device move, so these
+        # travel with the module; int64 survives the dtype cast, which only touches
+        # floating-point buffers.
+        if is_sliding and window_size is not None:
+            capacity = sliding_capacity(window_size)
+            src, dst = shift_indices(capacity, "cpu")
+            self.register_buffer("shift_src", src, persistent=False)
+            self.register_buffer("shift_dst", dst, persistent=False)
+
     def forward(
         self,
         hidden_states,
@@ -184,6 +204,8 @@ class Gemma4Attention(nn.Module):
         cache_index,
         cache_seqlen=None,
         valid_start=None,
+        stick_index=None,
+        do_shift=False,
     ):
         bsz, seq_len, _ = hidden_states.shape
         # Q/K/V projections viewed as [B, L, n_heads, head_dim]; norms are
@@ -213,6 +235,18 @@ class Gemma4Attention(nn.Module):
         q = apply_rope_matmul(q, selected_freqs)
         k = apply_rope_matmul(k, selected_freqs)
 
+        if do_shift:
+            # Roll the compact buffer down one stick so rows [0, anchor) hold the
+            # most recent anchor tokens again. index_select into index_copy_ keeps
+            # the destination's pinned layout, which slice_scatter would not
+            # (torch-spyre#3705); aten::roll has no Spyre lowering at all.
+            key_cache.index_copy_(
+                2, self.shift_dst, key_cache.index_select(2, self.shift_src)
+            )
+            value_cache.index_copy_(
+                2, self.shift_dst, value_cache.index_select(2, self.shift_src)
+            )
+
         key_cache, value_cache = kv_cache_update(
             k,
             v,
@@ -221,18 +255,42 @@ class Gemma4Attention(nn.Module):
             cache_index,
         )
         if self.is_sliding and self.swa_mode is not None:
-            # Windowing is an offset plus a length, so attn_mask is unused here
-            # and arrives as None; left padding travels as valid_start instead.
-            attn_out = sliding_window_attention(
-                q,
-                key_cache,
-                value_cache,
-                window_size=self.window_size,
-                scale=self.scaling,
-                cache_seqlen=cache_seqlen,
-                buffer_origin=0,
-                valid_start=valid_start,
-            )
+            # Windowing is an offset plus a length, so attn_mask is unused here and
+            # arrives as None; left padding travels as valid_start instead.
+            if stick_index is None:
+                attn_out = sliding_window_attention(
+                    q,
+                    key_cache,
+                    value_cache,
+                    window_size=self.window_size,
+                    scale=self.scaling,
+                    cache_seqlen=cache_seqlen,
+                    buffer_origin=0,
+                    valid_start=valid_start,
+                )
+            else:
+                # Anchored decode: present the whole 64-row stick with the real
+                # query at stick_index and the rest zeroed, so seqlen_q is 64 at
+                # every step and the op compiles once. The padding rows attend
+                # their own windows and are thrown away; index_copy/index_select
+                # with a tensor index keeps the offset out of the graph.
+                stick = torch.zeros(
+                    (bsz, self.num_q_heads, BLOCK_SIZE, self.head_dim),
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+                stick = stick.index_copy(2, stick_index, q)
+                attn_full = sliding_window_attention(
+                    stick,
+                    key_cache,
+                    value_cache,
+                    window_size=self.window_size,
+                    scale=self.scaling,
+                    cache_seqlen=cache_seqlen,
+                    buffer_origin=0,
+                    valid_start=valid_start,
+                )
+                attn_out = attn_full.index_select(2, stick_index)
         else:
             attn_out = F.scaled_dot_product_attention(
                 q,
@@ -295,6 +353,8 @@ class Gemma4Block(nn.Module):
         layer_scalar,
         cache_seqlen=None,
         valid_start=None,
+        stick_index=None,
+        do_shift=False,
     ):
         residual = hidden_states
         h = self.input_layernorm(hidden_states)
@@ -307,6 +367,8 @@ class Gemma4Block(nn.Module):
             cache_index,
             cache_seqlen,
             valid_start,
+            stick_index,
+            do_shift,
         )
         # Sandwich: norm the attention output BEFORE adding the residual.
         h = residual + self.post_attention_layernorm(attn_out)
@@ -317,6 +379,23 @@ class Gemma4Block(nn.Module):
         h = self.post_feedforward_layernorm(h)
         h = residual + h
         return h * layer_scalar, key_cache, value_cache
+
+
+def _gemma4_kv_capacity(
+    layer_types, window_size, layer_index, padded_prompt_len, max_cache_len
+):
+    """Rows to allocate for one layer's KV cache.
+
+    Global layers hold the whole generation. Sliding layers hold only what prefill
+    needs — one window buffer, or the prompt if it is longer — because
+    ``_run_blocks_over_embeds`` compacts them to ``sliding_capacity(window_size)``
+    the moment prefill ends. A module-level function bound with
+    ``functools.partial`` rather than a closure, so a prepared model stays
+    picklable.
+    """
+    if layer_types[layer_index] != "sliding_attention":
+        return max_cache_len
+    return max(sliding_capacity(window_size), padded_prompt_len)
 
 
 def prepare_gemma4_blocks(
@@ -452,12 +531,38 @@ def _run_blocks_over_embeds(
             model, attn_mask, seq_len, bsz, block_base, sliding_band=swa_mode is None
         )
 
-    cache_seqlen = block_base + seq_len if swa_mode else None
-    valid_start = _swa_valid_start(model, bsz) if swa_mode else None
+    if seq_len > 1:
+        # A prefill call starts a new generation: drop any state a previous
+        # generate() on this model left behind.
+        model._spyre_swa_state = None
+    state = getattr(model, "_spyre_swa_state", None)
+
+    if swa_mode and state is not None:
+        # Anchored decode: constant geometry, per-step position in tensors.
+        step = anchored_step(state, cache_index.device)
+        swa_args = {
+            "cache_seqlen": step.cache_seqlen,
+            "valid_start": step.valid_start,
+            "stick_index": step.stick_index,
+            "do_shift": step.do_shift,
+        }
+        sliding_index = step.cache_index
+    elif swa_mode:
+        # Prefill (or the phase-1 harness): the window is read out of the
+        # prompt-sized buffer at its true position.
+        swa_args = {
+            "cache_seqlen": block_base + seq_len,
+            "valid_start": _swa_valid_start(model, bsz),
+        }
+        sliding_index = cache_index
+    else:
+        swa_args = {}
+        sliding_index = cache_index
 
     backbone_layers = backbone.layers
     for i, compiled_block in enumerate(model._spyre_compiled_blocks):
         lt = cfg.layer_types[i]
+        is_sliding = lt == "sliding_attention"
         # Pass the per-layer scalar as a tensor read fresh from the registered,
         # device-moved block — NOT as a Python float — so Dynamo guards on tensor
         # metadata instead of recompiling for each distinct learned value.
@@ -467,11 +572,26 @@ def _run_blocks_over_embeds(
             masks[lt],
             key_caches[i],
             value_caches[i],
-            cache_index,
+            sliding_index if is_sliding else cache_index,
             backbone_layers[i].layer_scalar,
-            cache_seqlen,
-            valid_start,
+            **(swa_args if is_sliding else {}),
         )
+
+    if swa_mode == "anchored":
+        if state is None and seq_len > 1:
+            # Prefill just finished: compact every sliding layer down to the
+            # anchored buffer and let the prompt-sized allocations go.
+            state = SlidingWindowCache.after_prefill(
+                cfg.sliding_window, seq_len, _swa_valid_start(model, bsz)
+            )
+            for i, layer_type in enumerate(cfg.layer_types):
+                if layer_type == "sliding_attention":
+                    key_caches[i], value_caches[i] = compact_after_prefill(
+                        key_caches[i], value_caches[i], state, seq_len
+                    )
+            model._spyre_swa_state = state
+        elif state is not None:
+            state.advance()
 
     h = backbone.norm(h)
     return h
@@ -598,6 +718,16 @@ def prepare_text_decoder_for_spyre(model):
     # LM head: smooth-padded to a stick-aligned vocab whose per-core span fits
     # the 256 MB EAR limit (see hf_common.pad_lm_head).
     pad_lm_head(model)
+
+    # The sliding-window op path is the default; set model._spyre_swa_mode = None
+    # before prepare to fall back to the band-masked SDPA, or "phase1" for the
+    # full-cache harness.
+    if not hasattr(model, "_spyre_swa_mode"):
+        model._spyre_swa_mode = "anchored"
+    if model._spyre_swa_mode:
+        model._spyre_kv_capacity = functools.partial(
+            _gemma4_kv_capacity, tuple(cfg.layer_types), cfg.sliding_window
+        )
 
     model._spyre_compiled_blocks = prepare_gemma4_blocks(
         backbone.layers,

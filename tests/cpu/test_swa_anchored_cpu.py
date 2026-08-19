@@ -1,0 +1,144 @@
+# Copyright 2025 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""CPU integration test for the anchored compact buffer, across a shift.
+
+Drives 70 decode steps through one Gemma 4 sliding layer twice: once against a
+full-length cache behind a band mask (what the adapter does today), once against a
+192-row anchored compact buffer that rolls at token 64. The outputs must agree at
+every step, which is what says the compaction, the stick offsets, the shift and the
+valid_start erosion all line up.
+
+W=128 rather than Gemma 4's 1024 so the test crosses a shift in 70 steps; the
+arithmetic is identical.
+"""
+
+import copy
+
+import torch
+
+from _swa_helpers import identity_freqs, make_sliding_attention
+from hf_adapters.hf_common import (
+    add_causal_sliding_window_band,
+    build_decode_mask,
+    build_prefill_mask,
+    make_cache_index,
+)
+from hf_adapters.swa_attention import (
+    SlidingWindowCache,
+    anchored_step,
+    compact_after_prefill,
+)
+
+WINDOW = 128
+PROMPT = 256
+STEPS = 70  # crosses the shift at token 64
+FULL_CAPACITY = 384  # >= PROMPT + STEPS, stick-aligned
+HEAD_DIM = 64
+Q_HEADS = 4
+KV_HEADS = 2
+
+
+def _band_mask(seqlen, block_base):
+    """What _build_layer_masks builds for a sliding layer today.
+
+    Dispatches the way ``generate`` does: ``build_decode_mask`` for a one-token
+    step at a non-zero cache position, ``build_prefill_mask`` otherwise.
+    ``build_prefill_mask`` masks every column past the query's *relative* row
+    index, so at a non-zero ``block_base`` it allows only column 0 — and the band
+    is additive, so it cannot widen that back. Using it for decode masks every
+    column and fails the comparison for a reason unrelated to the buffer.
+    """
+    if seqlen == 1 and block_base > 0:
+        mask = build_decode_mask(1, FULL_CAPACITY, block_base, 0, dtype=torch.float32)
+    else:
+        mask = build_prefill_mask(1, seqlen, FULL_CAPACITY, 0, dtype=torch.float32)
+    coords = torch.arange(seqlen)[None, :] + block_base
+    return add_causal_sliding_window_band(mask, coords, WINDOW)
+
+
+def test_anchored_decode_matches_the_full_cache_band_path():
+    torch.manual_seed(11)
+    band = make_sliding_attention(
+        Q_HEADS, KV_HEADS, HEAD_DIM, WINDOW, swa_mode=None
+    )
+    op = copy.deepcopy(band)
+    op.swa_mode = "anchored"
+
+    band_k = torch.zeros(1, KV_HEADS, FULL_CAPACITY, HEAD_DIM)
+    band_v = torch.zeros(1, KV_HEADS, FULL_CAPACITY, HEAD_DIM)
+    # Prefill buffer for a sliding layer: max(sliding_capacity(128), PROMPT).
+    op_k = torch.zeros(1, KV_HEADS, PROMPT, HEAD_DIM)
+    op_v = torch.zeros(1, KV_HEADS, PROMPT, HEAD_DIM)
+
+    hidden = torch.randn(1, PROMPT, Q_HEADS * HEAD_DIM)
+    freqs = identity_freqs(1, PROMPT, HEAD_DIM)
+    index = make_cache_index(0, PROMPT)
+
+    band_out, band_k, band_v = band(
+        hidden, freqs, _band_mask(PROMPT, 0), band_k, band_v, index
+    )
+    op_out, op_k, op_v = op(
+        hidden, freqs, None, op_k, op_v, index, cache_seqlen=PROMPT, valid_start=[0]
+    )
+    torch.testing.assert_close(op_out, band_out, rtol=1e-5, atol=1e-6)
+
+    state = SlidingWindowCache.after_prefill(WINDOW, PROMPT, [0])
+    op_k, op_v = compact_after_prefill(op_k, op_v, state, PROMPT)
+    assert op_k.shape[2] == 192
+
+    shifts = 0
+    for step_index in range(STEPS):
+        slot = PROMPT + step_index
+        token = torch.randn(1, 1, Q_HEADS * HEAD_DIM)
+        token_freqs = identity_freqs(1, 1, HEAD_DIM)
+
+        expected, band_k, band_v = band(
+            token, token_freqs, _band_mask(1, slot), band_k, band_v,
+            make_cache_index(slot, 1),
+        )
+
+        step = anchored_step(state, "cpu")
+        shifts += int(step.do_shift)
+        actual, op_k, op_v = op(
+            token,
+            token_freqs,
+            None,
+            op_k,
+            op_v,
+            step.cache_index,
+            cache_seqlen=step.cache_seqlen,
+            valid_start=step.valid_start,
+            stick_index=step.stick_index,
+            do_shift=step.do_shift,
+        )
+        state.advance()
+
+        torch.testing.assert_close(
+            actual, expected, rtol=1e-4, atol=1e-5, msg=f"step {step_index}"
+        )
+
+    assert shifts == 1, "70 steps must cross exactly one 64-row shift"
+    assert op_k.shape[2] == 192, "the compact buffer must never grow"
+
+
+def test_anchored_geometry_is_constant_across_steps():
+    """The whole point: the integers the op sees never change."""
+    state = SlidingWindowCache.after_prefill(1024, 4096, [0])
+    seen = set()
+    for _ in range(200):
+        step = anchored_step(state, "cpu")
+        seen.add((step.cache_seqlen, tuple(step.valid_start)))
+        state.advance()
+    assert seen == {(1088, (0,))}, seen
