@@ -314,3 +314,107 @@ open PR and is not modified uninvited.
    extend the A/B to cover a shift.
 5. Gemma 3 1B control green; Gemma 4 non-gating record.
 6. Upstream the `valid_start` patch with the evidence attached.
+
+## Results
+
+Recorded 2026-08-20 on the `gemma4-swa-op` branch (hf-adapters) against
+torch-spyre `swa-3405-valid-start`. Every number below is a top-1 / max-abs-diff
+measurement on device or a CPU bookkeeping check; **no latency or memory was
+measured**, so the arithmetic in this document stays arithmetic — no performance
+claim should be repeated until it is measured.
+
+### The op is correct at Gemma 4's shapes (the gate)
+
+- **`head_dim=256` gate — PASS** (Task 1, 2026-08-18). torch-spyre
+  `test_prefill_head_dim_256_gqa` (prefill, `head_dim=256`,
+  `seqlen_q=seqlen_kv=512`, `W=1024`, GQA 16/8, fp16) and
+  `test_anchored_decode_stick_gemma4` both pass (`2 passed`). The op and its
+  `kv_window` / `_compact_kv` dependency are correct at the four-sticks-per-row
+  width, so nothing downstream is blocked by a transposed-slice defect.
+
+### Device A/B — SWA op vs the shipped band-masked SDPA
+
+`tests/spyre/test_swa_layer_ab_spyre.py` scores each path against a float32
+reference and gates the op relative to the band path, because the **shipped band
+path itself** cannot hold a fixed fp16 `atol=1e-3` (it errs 0.08–0.10 at these
+shapes). Gate: `op_err <= max(2.0 * band_err, sqrt(terms)·eps·scale) + 5e-3`.
+
+Phase-1 pairs (Task 6, random-weight Gemma 4 sliding layer, output scale ≈2.5):
+
+| case | op err | band err | note |
+|------|--------|----------|------|
+| prefill `Lq=64`  | 0.0749 | 0.0845 | op **better** |
+| prefill `Lq=512` | 0.0885 | 0.0992 | op **better** |
+| decode `Lq=1`    | 0.0289 | 0.0103 | ratio 2.82, fp16-floor-admitted |
+| left-pad         | 0.1038 | 0.0844 | ratio 1.23 |
+
+The op is at least as accurate as what already ships in three of four cases. The
+decode `Lq=1` row is the one standing observation: the op is ~2.8× less accurate
+than SDPA at `M=1`, still inside fp16's floor — carried to Task 12 as an upstream
+note, not a blocker.
+
+Shift A/B across a stick boundary (Task 9 + the 2026-08-20 roll fix,
+`test_anchored_decode_matches_band_mask_across_a_shift`, 70 decode steps,
+`W=128`): **PASS**. Step 64 (the sole shift) op **0.0014** vs band 0.0012 — down
+from **0.2787** under the old in-graph in-place roll, which self-aliased when
+Inductor fused the `index_select` read into the `index_copy_` write. The fix
+lifts the roll out of the graph into an eager fresh-alloc `roll_compact_buffer`
+(different src/dst tensors, the same proven path as `compact_after_prefill`).
+Max op error over all 70 steps is 0.0022 with no outlier; steps 65–69 stay
+0.0014–0.0022, confirming the rolled buffer's pinned layout is correct and the
+post-shift scatter lands on the right rows. The full A/B suite is green.
+
+### Graph / recompile count — bounded by construction, not by a clean count
+
+The design claims decode reuses ≤64 compiled graphs (one per `cache_seqlen` a
+stick sweeps). The 2026-08-19 attempt to *measure* this predated the roll fix and
+could not produce a steady-state anchored-decode graph on the 12B, so
+`grep -ci recompil` (15 lines) counted log lines, not distinct graphs. The
+2026-08-20 fix then **removed the `do_shift` graph branch entirely** — the roll
+is eager now — so the decode path is bounded by construction to the ≤64
+`cache_seqlen` values plus prefill. The bound rests on the verified fact that the
+per-step position and stick index stay tensors and never become graph constants;
+no separate post-fix recompile count was recorded.
+
+### Gemma 3 1B — the green control
+
+`unsloth/gemma-3-1b-it`, device token-compare, 6-token prompt padded to 64,
+prefill + 4 greedy decode:
+
+| run | result | prefill | note |
+|-----|--------|---------|------|
+| band baseline (op off) | **5/5** | ` Paris`, max_diff 19.33 | shipped path |
+| op on, before harness fix | 0/5 | ` a` ≠ HF ` Paris` | see below |
+| op on, after harness fix | **5/5** | ` Paris`, max_diff 19.33 | matches band step-for-step |
+
+The op path reproduces the band path exactly once the harness sets
+`_spyre_prompt_offsets`. The interim 0/5 was **not** an op defect: the
+token-compare harness drove `_run_forward` directly and never set
+`_spyre_prompt_offsets`, so `valid_start` defaulted to `[0]` and the op attended
+the 58 left-pad columns — the argmax flipped while the logit magnitude barely
+moved. The band path was immune (it reads left padding from the additive mask).
+Fixed by mirroring `generate()`'s bookkeeping in the harness. Gemma 3 1B passing
+on device is the correctness proof for the op path.
+
+### Gemma 4 12B — non-gating record
+
+`google/gemma-4-12b`, device token-compare, same harness (with the
+`_spyre_prompt_offsets` fix applied to both runs):
+
+| run | result | prefill | decode-1..3 | decode-4 |
+|-----|--------|---------|-------------|----------|
+| op off (band) | 1/5 XFAIL | ` a` = HF, max 0.28 | `<image\|>` | `A` |
+| op on (SWA)   | 1/5 XFAIL | ` a` = HF, max 0.25 | `<image\|>` | `A` |
+
+The two paths now agree **step-for-step**: prefill correct in both, and the
+*identical* decode divergence. **The SWA replacement introduces no new failure
+mode** — no NaN, no `Unsupported`, no hang (232 s, same order as the band's
+177 s), max_diff the same magnitude as (in fact matching) the band baseline.
+Gemma 4 12B was red before this work and remains red for a decode divergence
+that is present in the shipped band path too and is unrelated to sliding-window
+attention. Smoke test (`test_e2e_smoke_spyre.py`): **XPASS** (non-empty, not
+all-one-token — not a correctness check).
+
+An earlier op-on log showed a max_diff-14 prefill divergence; it was generated
+before the harness fix and is the same `_spyre_prompt_offsets` gap that hit
+Gemma 3, corrected above — not a real op behavior.
