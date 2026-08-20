@@ -375,3 +375,45 @@ def anchored_step(state, device):
         cache_seqlen=state.write_row + 1,
         valid_start=list(state.valid_start),
     )
+
+
+def valid_start_for(model, batch_size):
+    """First attendable cache column per sequence -- ``generate``'s left padding.
+
+    ``generate`` stashes ``_spyre_prompt_offsets``; a caller driving a forward
+    directly (the layer tests) has none. Lives here rather than in one adapter
+    now that both Gemma 3 and Gemma 4 build the op's ``valid_start`` from it.
+    """
+    offsets = getattr(model, "_spyre_prompt_offsets", None)
+    if offsets is None:
+        return [0] * batch_size
+    return [int(offset) for offset in offsets]
+
+
+def roll_sliding_buffers(layer_types, key_caches, value_caches):
+    """Roll every sliding layer's compact buffer down one stick, in place.
+
+    The eager pre-block half of a shift step: replaces each sliding layer's
+    ``(key, value)`` in the caller's lists with freshly-allocated rolled buffers
+    (see ``roll_compact_buffer``). Run before the compiled blocks so the roll
+    never enters the graph. Shared by the Gemma 3 and Gemma 4 drivers.
+    """
+    for i, layer_type in enumerate(layer_types):
+        if layer_type == "sliding_attention":
+            key_caches[i], value_caches[i] = roll_compact_buffer(
+                key_caches[i], value_caches[i]
+            )
+
+
+def compact_sliding_buffers(layer_types, key_caches, value_caches, state, prompt_len):
+    """Compact every sliding layer down to its anchored buffer after prefill.
+
+    The post-prefill half: replaces each sliding layer's prompt-sized ``(key,
+    value)`` with a compact anchored buffer (see ``compact_after_prefill``) and
+    lets the big allocations go. Shared by the Gemma 3 and Gemma 4 drivers.
+    """
+    for i, layer_type in enumerate(layer_types):
+        if layer_type == "sliding_attention":
+            key_caches[i], value_caches[i] = compact_after_prefill(
+                key_caches[i], value_caches[i], state, prompt_len
+            )

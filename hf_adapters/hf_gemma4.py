@@ -90,10 +90,11 @@ from hf_adapters.hf_common import (
 from hf_adapters.swa_attention import (
     SlidingWindowCache,
     anchored_step,
-    compact_after_prefill,
-    roll_compact_buffer,
+    compact_sliding_buffers,
+    roll_sliding_buffers,
     sliding_capacity,
     sliding_window_attention,
+    valid_start_for,
 )
 
 
@@ -429,18 +430,6 @@ def _build_layer_masks(
     return {"full_attention": attn_mask, "sliding_attention": sliding_mask}
 
 
-def _swa_valid_start(model, batch_size):
-    """First attendable cache column per sequence -- ``generate``'s left padding.
-
-    ``generate`` stashes ``_spyre_prompt_offsets``; a caller driving the forward
-    directly (the layer tests) has none.
-    """
-    offsets = getattr(model, "_spyre_prompt_offsets", None)
-    if offsets is None:
-        return [0] * batch_size
-    return [int(offset) for offset in offsets]
-
-
 def _run_blocks_over_embeds(
     model,
     h,
@@ -513,14 +502,10 @@ def _run_blocks_over_embeds(
         if step.do_shift:
             # Roll every sliding layer's compact buffer down one stick BEFORE its
             # compiled block writes this token — eager, into fresh allocations, the
-            # same proven path as compact_after_prefill. Kept out of the graph on
-            # purpose: an in-place roll on the cache self-aliases and the device
-            # fuses the read into the write (see roll_compact_buffer).
-            for i, layer_type in enumerate(cfg.layer_types):
-                if layer_type == "sliding_attention":
-                    key_caches[i], value_caches[i] = roll_compact_buffer(
-                        key_caches[i], value_caches[i]
-                    )
+            # same proven path as compaction. Kept out of the graph on purpose: an
+            # in-place roll on the cache self-aliases and the device fuses the read
+            # into the write (see roll_compact_buffer).
+            roll_sliding_buffers(cfg.layer_types, key_caches, value_caches)
         swa_args = {
             "cache_seqlen": step.cache_seqlen,
             "valid_start": step.valid_start,
@@ -531,7 +516,7 @@ def _run_blocks_over_embeds(
         # prompt-sized buffer at its true position.
         swa_args = {
             "cache_seqlen": block_base + seq_len,
-            "valid_start": _swa_valid_start(model, bsz),
+            "valid_start": valid_start_for(model, bsz),
         }
         sliding_index = cache_index
     else:
@@ -561,13 +546,11 @@ def _run_blocks_over_embeds(
             # Prefill just finished: compact every sliding layer down to the
             # anchored buffer and let the prompt-sized allocations go.
             state = SlidingWindowCache.after_prefill(
-                cfg.sliding_window, seq_len, _swa_valid_start(model, bsz)
+                cfg.sliding_window, seq_len, valid_start_for(model, bsz)
             )
-            for i, layer_type in enumerate(cfg.layer_types):
-                if layer_type == "sliding_attention":
-                    key_caches[i], value_caches[i] = compact_after_prefill(
-                        key_caches[i], value_caches[i], state, seq_len
-                    )
+            compact_sliding_buffers(
+                cfg.layer_types, key_caches, value_caches, state, seq_len
+            )
             model._spyre_swa_state = state
         elif state is not None:
             state.advance()
