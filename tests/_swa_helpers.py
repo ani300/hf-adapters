@@ -26,11 +26,16 @@ import torch.nn as nn
 
 
 class HeadRMSNorm(nn.Module):
-    """Per-head RMSNorm over the last dim, standing in for Gemma4RMSNorm."""
+    """Per-head RMSNorm over the last dim, standing in for Gemma4RMSNorm.
 
-    def __init__(self, head_dim, eps=1e-6):
+    ``weight_init`` sets the (constant) gain. It defaults to 1.0, but the Q/K
+    norms in ``make_sliding_attention`` pass a sub-unit gain to stand in for the
+    real model's learned norms — see there for why.
+    """
+
+    def __init__(self, head_dim, eps=1e-6, weight_init=1.0):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(head_dim))
+        self.weight = nn.Parameter(torch.full((head_dim,), float(weight_init)))
         self.eps = eps
 
     def forward(self, x):
@@ -77,18 +82,30 @@ def make_sliding_attention(
     Gemma 4's sliding layers keep a separate V (``is_kv_eq_v`` is False, which is
     a global-layer property), carry per-head RMSNorm on Q/K/V, and attend
     **unscaled** (``scaling == 1.0``).
+
+    The Q/K norms use a ``head_dim ** -0.25`` gain rather than the identity. With
+    unit gain and iid-normal random weights, ``q . k`` at ``scaling == 1.0`` has
+    std ``sqrt(head_dim)`` — 16 at ``head_dim == 256`` — so the softmax is nearly
+    one-hot and its argmax flips under fp16 rounding, an artifact of *random*
+    weights the real model never sees (its learned norms and correlated
+    activations keep scores moderate). The ``-0.25`` gain makes score std
+    ``sqrt(head_dim) * (head_dim ** -0.25) ** 2 == 1`` for any ``head_dim``,
+    standing in for those learned norms. It leaves V — and therefore the output
+    scale the tolerances are measured against — at unit gain, and keeps
+    ``scaling == 1.0`` so the op is still exercised in the production regime.
     """
     from hf_adapters.hf_gemma4 import Gemma4Attention
 
     torch.manual_seed(seed)
     hidden = num_q_heads * head_dim
+    qk_gain = head_dim ** -0.25
     attn = types.SimpleNamespace(
         q_proj=nn.Linear(hidden, num_q_heads * head_dim, bias=False),
         k_proj=nn.Linear(hidden, num_kv_heads * head_dim, bias=False),
         v_proj=nn.Linear(hidden, num_kv_heads * head_dim, bias=False),
         o_proj=nn.Linear(num_q_heads * head_dim, hidden, bias=False),
-        q_norm=HeadRMSNorm(head_dim),
-        k_norm=HeadRMSNorm(head_dim),
+        q_norm=HeadRMSNorm(head_dim, weight_init=qk_gain),
+        k_norm=HeadRMSNorm(head_dim, weight_init=qk_gain),
         v_norm=HeadRMSNorm(head_dim),
         scaling=1.0,
     )
