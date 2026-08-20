@@ -112,6 +112,17 @@ def adapter_greedy_steps(
     else:
         padded_ids = input_ids
 
+    # Mirror generate()'s per-sequence left-padding bookkeeping (hf_common.py:
+    # model._spyre_prompt_offsets = prompt_offsets). The band path reads its left
+    # padding out of the mask below, but the sliding-window op path cannot — an
+    # offset-and-length window has no way to skip pad columns, so it reads the
+    # padding from valid_start, which valid_start_for() pulls from this attribute.
+    # A harness that drives _run_forward directly must set it or the op attends the
+    # pad K/V (argmax flips while the logit magnitude barely moves).
+    model._spyre_prompt_offsets = torch.full(
+        (batch_size,), prompt_offset, dtype=torch.long
+    )
+
     position_ids = torch.zeros((batch_size, padded_len), dtype=torch.long)
     position_ids[:, prompt_offset:] = torch.arange(seq_len)
 
