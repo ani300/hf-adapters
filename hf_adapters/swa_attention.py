@@ -167,9 +167,21 @@ class SlidingWindowCache:
 
     Why this shape at all: the op takes its geometry as trace-time integers, so
     every distinct ``(cache_seqlen, buffer_origin, seqlen_q)`` is a distinct
-    compiled graph. Anchoring pins all three — ``capacity``, 0, and 64 — for the
-    whole generation, so decode compiles one graph (two, counting the shift
-    branch) instead of one per position.
+    compiled graph. A compact buffer bounds two of them — ``buffer_origin`` at 0
+    and ``cache_seqlen`` to at most ``capacity`` — and bounds memory: without it a
+    sliding layer would carry a KV allocation the size of the whole context,
+    gigabytes across Gemma 4 12B's 40 sliding layers.
+
+    It does **not** pin ``cache_seqlen``. The single query row (``seqlen_q`` is 1)
+    sits at coordinate ``write_row``, so ``cache_seqlen`` is ``write_row + 1`` and
+    sweeps the 64 rows of a stick. Decode therefore compiles up to 64 graphs,
+    reused for the whole generation, rather than the unbounded one-per-position an
+    uncompacted buffer would force. The 64-row roll is an eager driver step (see
+    ``roll_compact_buffer``), not a graph branch. Passing the real query row
+    straight to the op — no 64-row stick — is what makes ``seqlen_q`` 1 here; the
+    stick that once pinned ``cache_seqlen`` at ``capacity`` tripped a layout defect
+    in the compiler (a decode-shaped broadcast Inductor could not project), so the
+    bounded-set-of-graphs trade replaced it.
     """
 
     window_size: int
@@ -281,20 +293,63 @@ def _compact_copy(destination, source, dst_index, src_index):
     return destination
 
 
+def roll_compact_buffer(key_cache, value_cache):
+    """Roll a compact buffer down one 64-row stick, into fresh allocations.
+
+    The shipped shift: rows ``[BLOCK_SIZE, capacity)`` become
+    ``[0, capacity - BLOCK_SIZE)`` of a freshly zeroed buffer, restoring the
+    invariant that ``[0, anchor)`` holds the most recent ``anchor`` tokens; the
+    trailing ``BLOCK_SIZE`` rows stay zero for the next stick of writes.
+
+    Fresh buffers rather than an in-place ``index_copy_`` on the same tensor. The
+    source rows ``[64, capacity)`` and destination rows ``[0, capacity - 64)``
+    overlap, and on device Inductor fuses the out-of-place ``index_select`` into
+    the in-place scatter, so the write clobbers rows still being read — silently,
+    and only on device (CPU eager materializes the select first). Writing into a
+    *different* tensor removes the aliasing, the pattern ``kv_cache_update`` and
+    ``compact_after_prefill`` already rely on. Run eager by the driver once per 64
+    decode steps, like ``compact_after_prefill`` — not inside the compiled block,
+    so ``allocate_kv_cache``'s device-layout pin is applied on the proven eager
+    path rather than under compile, where an unhonored pin would scatter to the
+    wrong rows silently (torch-spyre#3705). Zero-fill in the trailing rows is safe:
+    they sit above the write cursor and the window never reads them before they are
+    overwritten.
+
+    Returns the new ``(key_cache, value_cache)``; the caller must replace its
+    references, since nothing else keeps the rolled buffers alive.
+    """
+    capacity = key_cache.size(2)
+    device = key_cache.device
+    src, dst = shift_indices(capacity, device)
+    batch, num_kv_heads, _, head_dim = key_cache.shape
+    rolled_key = allocate_kv_cache(
+        batch, num_kv_heads, capacity, head_dim, key_cache.dtype, device
+    )
+    rolled_value = allocate_kv_cache(
+        batch, num_kv_heads, capacity, value_cache.shape[3], value_cache.dtype, device
+    )
+    _compact_copy(rolled_key, key_cache, dst, src)
+    _compact_copy(rolled_value, value_cache, dst, src)
+    return rolled_key, rolled_value
+
+
 @dataclasses.dataclass(frozen=True)
 class AnchoredStep:
     """What one anchored decode step passes into a compiled sliding block.
 
-    ``cache_seqlen`` and ``valid_start`` are the same values at every step of a
-    steady-state generation, which is what keeps the block at one compiled graph;
-    ``cache_index``, ``stick_index`` and ``do_shift`` carry the per-step part —
-    the first two as tensors so the write position never becomes a graph constant,
-    the third as a bool because a shift genuinely is a different graph.
+    ``valid_start`` is the same value at every steady-state step; ``cache_seqlen``
+    is the single query row's own coordinate, ``write_row + 1``, so it advances one
+    row per step and sweeps a stick's 64 values (see ``SlidingWindowCache`` for why
+    that is the accepted graph count). ``cache_index`` is a tensor so the write
+    position never becomes a graph constant. ``do_shift`` is the signal that a
+    64-row roll is due this step; the driver acts on it by rolling the buffer with
+    an eager ``roll_compact_buffer`` *before* the compiled block, so the roll never
+    enters the graph — an in-graph in-place self-copy was the aliasing the compiler
+    fused unsafely.
     """
 
     do_shift: bool
     cache_index: torch.Tensor
-    stick_index: torch.Tensor
     cache_seqlen: int
     valid_start: list
 
@@ -302,9 +357,14 @@ class AnchoredStep:
 def anchored_step(state, device):
     """Geometry for the next anchored decode step, rolling the buffer if due.
 
-    Mutates ``state`` when a shift is due — the tensor roll itself happens inside
-    the compiled block, driven by ``do_shift``. The caller must call
-    ``state.advance()`` after the step completes.
+    Mutates ``state`` when a shift is due — the tensor roll itself is a separate
+    eager ``roll_compact_buffer`` the caller runs before the compiled block when
+    ``do_shift`` is set. The caller must call ``state.advance()`` after the step
+    completes.
+
+    ``cache_seqlen`` is ``write_row + 1``: the query is written at physical row
+    ``write_row`` with ``buffer_origin`` 0, so it sits at coordinate ``write_row``
+    and the op places a single query row at ``cache_seqlen - 1``.
     """
     do_shift = state.needs_shift()
     if do_shift:
@@ -312,7 +372,6 @@ def anchored_step(state, device):
     return AnchoredStep(
         do_shift=do_shift,
         cache_index=torch.tensor([state.write_row], dtype=torch.long).to(device),
-        stick_index=torch.tensor([state.stick_offset()], dtype=torch.long).to(device),
-        cache_seqlen=state.capacity,
+        cache_seqlen=state.write_row + 1,
         valid_start=list(state.valid_start),
     )

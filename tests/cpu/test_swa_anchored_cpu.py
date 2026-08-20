@@ -30,6 +30,7 @@ import torch
 from _swa_helpers import identity_freqs, make_sliding_attention
 
 from hf_adapters.hf_common import (
+    BLOCK_SIZE,
     add_causal_sliding_window_band,
     build_decode_mask,
     build_prefill_mask,
@@ -40,6 +41,7 @@ from hf_adapters.swa_attention import (
     SlidingWindowCache,
     anchored_step,
     compact_after_prefill,
+    roll_compact_buffer,
 )
 
 WINDOW = 128
@@ -114,6 +116,8 @@ def test_anchored_decode_matches_the_full_cache_band_path():
 
         step = anchored_step(state, "cpu")
         shifts += int(step.do_shift)
+        if step.do_shift:
+            op_k, op_v = roll_compact_buffer(op_k, op_v)
         actual, op_k, op_v = op(
             token,
             token_freqs,
@@ -123,8 +127,6 @@ def test_anchored_decode_matches_the_full_cache_band_path():
             step.cache_index,
             cache_seqlen=step.cache_seqlen,
             valid_start=step.valid_start,
-            stick_index=step.stick_index,
-            do_shift=step.do_shift,
         )
         state.advance()
 
@@ -136,21 +138,30 @@ def test_anchored_decode_matches_the_full_cache_band_path():
     assert op_k.shape[2] == 192, "the compact buffer must never grow"
 
 
-def test_anchored_geometry_is_constant_across_steps():
-    """The whole point: the integers the op sees never change."""
-    state = SlidingWindowCache.after_prefill(1024, 4096, [0])
+def test_anchored_geometry_stays_in_a_bounded_reused_set():
+    """The stick-free trade: cache_seqlen sweeps a stick's 64 values and no more.
+
+    Dropping the 64-row stick means seqlen_q is 1 and cache_seqlen is the query
+    row's own coordinate, so it is no longer pinned. What the compact buffer still
+    guarantees is that it stays *bounded* — anchor+1 through capacity, 64 distinct
+    values reused for the whole generation, with valid_start at 0 throughout — so
+    decode compiles a bounded, reused set of graphs rather than one per position.
+    """
+    window, prompt = 1024, 4096
+    state = SlidingWindowCache.after_prefill(window, prompt, [0])
+    anchor, capacity = state.anchor, state.capacity
     seen = set()
     for _ in range(200):
         step = anchored_step(state, "cpu")
         assert isinstance(
             step.cache_index, torch.Tensor
         ), "write position must be a tensor"
-        assert isinstance(
-            step.stick_index, torch.Tensor
-        ), "stick index must be a tensor"
         seen.add((step.cache_seqlen, tuple(step.valid_start)))
         state.advance()
-    assert seen == {(1088, (0,))}, seen
+    cache_seqlens = {c for c, _ in seen}
+    assert cache_seqlens == set(range(anchor + 1, capacity + 1)), cache_seqlens
+    assert len(cache_seqlens) == BLOCK_SIZE, len(cache_seqlens)
+    assert {v for _, v in seen} == {(0,)}, seen
 
 
 def test_anchored_shift_at_the_shipped_geometry():
@@ -214,6 +225,8 @@ def test_anchored_shift_at_the_shipped_geometry():
         )
         step = anchored_step(state, "cpu")
         shifts += int(step.do_shift)
+        if step.do_shift:
+            op_k, op_v = roll_compact_buffer(op_k, op_v)
         actual, op_k, op_v = op(
             token,
             token_freqs,
@@ -223,8 +236,6 @@ def test_anchored_shift_at_the_shipped_geometry():
             step.cache_index,
             cache_seqlen=step.cache_seqlen,
             valid_start=step.valid_start,
-            stick_index=step.stick_index,
-            do_shift=step.do_shift,
         )
         state.advance()
         torch.testing.assert_close(

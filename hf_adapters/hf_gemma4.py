@@ -91,7 +91,7 @@ from hf_adapters.swa_attention import (
     SlidingWindowCache,
     anchored_step,
     compact_after_prefill,
-    shift_indices,
+    roll_compact_buffer,
     sliding_capacity,
     sliding_window_attention,
 )
@@ -185,16 +185,6 @@ class Gemma4Attention(nn.Module):
         # so it recompiles once per 64 decode steps without bound.
         self.swa_mode = swa_mode
 
-        # Non-persistent so the roll indices never enter a state_dict. Registered
-        # buffers because prepare_for_spyre runs *before* the device move, so these
-        # travel with the module; int64 survives the dtype cast, which only touches
-        # floating-point buffers.
-        if is_sliding and window_size is not None:
-            capacity = sliding_capacity(window_size)
-            src, dst = shift_indices(capacity, "cpu")
-            self.register_buffer("shift_src", src, persistent=False)
-            self.register_buffer("shift_dst", dst, persistent=False)
-
     def forward(
         self,
         hidden_states,
@@ -205,8 +195,6 @@ class Gemma4Attention(nn.Module):
         cache_index,
         cache_seqlen=None,
         valid_start=None,
-        stick_index=None,
-        do_shift=False,
     ):
         bsz, seq_len, _ = hidden_states.shape
         # Q/K/V projections viewed as [B, L, n_heads, head_dim]; norms are
@@ -236,18 +224,10 @@ class Gemma4Attention(nn.Module):
         q = apply_rope_matmul(q, selected_freqs)
         k = apply_rope_matmul(k, selected_freqs)
 
-        if do_shift:
-            # Roll the compact buffer down one stick so rows [0, anchor) hold the
-            # most recent anchor tokens again. index_select into index_copy_ keeps
-            # the destination's pinned layout, which slice_scatter would not
-            # (torch-spyre#3705); aten::roll has no Spyre lowering at all.
-            key_cache.index_copy_(
-                2, self.shift_dst, key_cache.index_select(2, self.shift_src)
-            )
-            value_cache.index_copy_(
-                2, self.shift_dst, value_cache.index_select(2, self.shift_src)
-            )
-
+        # The 64-row roll that keeps this buffer compact is NOT here: it is an eager
+        # driver step (roll_compact_buffer) run before this compiled block on shift
+        # steps. An in-place roll on this same cache self-aliases — the device fused
+        # its index_select read into its index_copy_ write and clobbered live rows.
         key_cache, value_cache = kv_cache_update(
             k,
             v,
@@ -257,41 +237,23 @@ class Gemma4Attention(nn.Module):
         )
         if self.is_sliding and self.swa_mode is not None:
             # Windowing is an offset plus a length, so attn_mask is unused here and
-            # arrives as None; left padding travels as valid_start instead.
-            if stick_index is None:
-                attn_out = sliding_window_attention(
-                    q,
-                    key_cache,
-                    value_cache,
-                    window_size=self.window_size,
-                    scale=self.scaling,
-                    cache_seqlen=cache_seqlen,
-                    buffer_origin=0,
-                    valid_start=valid_start,
-                )
-            else:
-                # Anchored decode: present the whole 64-row stick with the real
-                # query at stick_index and the rest zeroed, so seqlen_q is 64 at
-                # every step and the op compiles once. The padding rows attend
-                # their own windows and are thrown away; index_copy/index_select
-                # with a tensor index keeps the offset out of the graph.
-                stick = torch.zeros(
-                    (bsz, self.num_q_heads, BLOCK_SIZE, self.head_dim),
-                    dtype=q.dtype,
-                    device=q.device,
-                )
-                stick = stick.index_copy(2, stick_index, q)
-                attn_full = sliding_window_attention(
-                    stick,
-                    key_cache,
-                    value_cache,
-                    window_size=self.window_size,
-                    scale=self.scaling,
-                    cache_seqlen=cache_seqlen,
-                    buffer_origin=0,
-                    valid_start=valid_start,
-                )
-                attn_out = attn_full.index_select(2, stick_index)
+            # arrives as None; left padding travels as valid_start instead. Prefill
+            # and decode both pass the query rows straight in: at decode that is one
+            # row (seqlen_q == 1) and cache_seqlen is its own coordinate, so the op
+            # reads the window behind it directly. No 64-row stick — that pinned
+            # cache_seqlen but tripped a compiler layout defect on the decode-shaped
+            # broadcast; the anchored buffer instead accepts up to 64 graphs as
+            # cache_seqlen sweeps a stick (see SlidingWindowCache).
+            attn_out = sliding_window_attention(
+                q,
+                key_cache,
+                value_cache,
+                window_size=self.window_size,
+                scale=self.scaling,
+                cache_seqlen=cache_seqlen,
+                buffer_origin=0,
+                valid_start=valid_start,
+            )
         else:
             attn_out = F.scaled_dot_product_attention(
                 q,
@@ -354,8 +316,6 @@ class Gemma4Block(nn.Module):
         layer_scalar,
         cache_seqlen=None,
         valid_start=None,
-        stick_index=None,
-        do_shift=False,
     ):
         residual = hidden_states
         h = self.input_layernorm(hidden_states)
@@ -368,8 +328,6 @@ class Gemma4Block(nn.Module):
             cache_index,
             cache_seqlen,
             valid_start,
-            stick_index,
-            do_shift,
         )
         # Sandwich: norm the attention output BEFORE adding the residual.
         h = residual + self.post_attention_layernorm(attn_out)
@@ -552,11 +510,20 @@ def _run_blocks_over_embeds(
     if swa_mode and state is not None:
         # Anchored decode: constant geometry, per-step position in tensors.
         step = anchored_step(state, cache_index.device)
+        if step.do_shift:
+            # Roll every sliding layer's compact buffer down one stick BEFORE its
+            # compiled block writes this token — eager, into fresh allocations, the
+            # same proven path as compact_after_prefill. Kept out of the graph on
+            # purpose: an in-place roll on the cache self-aliases and the device
+            # fuses the read into the write (see roll_compact_buffer).
+            for i, layer_type in enumerate(cfg.layer_types):
+                if layer_type == "sliding_attention":
+                    key_caches[i], value_caches[i] = roll_compact_buffer(
+                        key_caches[i], value_caches[i]
+                    )
         swa_args = {
             "cache_seqlen": step.cache_seqlen,
             "valid_start": step.valid_start,
-            "stick_index": step.stick_index,
-            "do_shift": step.do_shift,
         }
         sliding_index = step.cache_index
     elif swa_mode:

@@ -5,15 +5,21 @@ reasons unrelated to sliding-window attention, so end-to-end output cannot answe
 whether this replacement is correct. This test can: one layer, identical inputs,
 identical cache contents, both paths measured against a common float32 reference.
 
-**Why not compare the two device paths to each other at a tight tolerance.**
-Measured on this hardware at these shapes: against a float32 CPU reference, the
-band-masked path we already ship sits at max abs error 0.049 and the op at 0.067,
-on outputs of scale 2.5; the two differ from each other by 0.064. None of that is
-an op defect — it is fp16 reduction noise, amplified because Gemma 4 attends
-unscaled (``scaling == 1.0``) at ``head_dim=256``, which makes a random-weight
-softmax nearly one-hot. In the real model ``q_norm``/``k_norm`` tame the scores;
-this harness has no such luxury. A device-vs-device tolerance would therefore be a
-statement about fp16, not about the op — and the shipped path would fail it too.
+**Why not compare the two device paths to each other at a tight tolerance.** Both
+paths reduce in fp16 in a different order — the op over a compact buffer, the band
+over the full cache — so they disagree by fp16 reduction noise that is no op
+defect and that the shipped path would fail too. The comparison that is meaningful
+is therefore against a common float32 reference, asserting the op is no less
+accurate than the band path it replaces (plus an fp16 floor; see ``_fp16_floor``).
+
+Gemma 4 attends **unscaled** (``scaling == 1.0``) at ``head_dim == 256``, where
+``q . k`` on iid-random weights would have std ``sqrt(256) == 16`` and drive the
+softmax nearly one-hot — an argmax that flips under fp16 rounding and inflates the
+error at a single element, an artifact of random weights the real model never sees
+(its learned norms keep scores moderate). ``make_sliding_attention`` stands in for
+those learned norms with a ``head_dim ** -0.25`` Q/K gain that pins score std at 1,
+so the softmax here is non-degenerate and the residual gap is ordinary reduction
+noise. ``scaling`` stays 1.0, so the op is still exercised in its production regime.
 
 So the assertion is the one that matters: **the op must be no less accurate than
 the path it replaces.**
@@ -42,6 +48,7 @@ from hf_adapters.swa_attention import (
     SlidingWindowCache,
     anchored_step,
     compact_after_prefill,
+    roll_compact_buffer,
 )
 
 # Gemma 4 12B's sliding layers, at one quarter the head count so a test fits.
@@ -323,10 +330,14 @@ def test_left_padding_op_no_worse_than_band_mask():
 def test_anchored_decode_matches_band_mask_across_a_shift():
     """The shipped geometry, on device, over a 64-row roll.
 
-    The roll reads a cache it then writes (index_select into index_copy_ on the
-    same tensor). If Inductor fuses those so the read sees already-overwritten
-    rows, this is the test that catches it — the CPU lane cannot, and the
-    documented fallback is a pair of ping-pong buffers.
+    Exercises the production shift path: on the shift step the harness rolls the
+    compact buffer with an eager ``roll_compact_buffer`` — fresh allocations, the
+    same proven pattern as ``compact_after_prefill`` — *before* the compiled block,
+    exactly as the driver does. The earlier in-graph roll was an in-place
+    ``index_select`` into ``index_copy_`` on the *same* cache; device Inductor fused
+    the read into the write and clobbered live rows (op 0.28 vs band 0.001 at the
+    shift), while the CPU lane could not catch it because eager materializes the
+    select first. This test is what proved the fresh-allocation roll fixes it.
     """
     torch._dynamo.reset()
     window, prompt, steps = 128, 256, 70
@@ -402,6 +413,8 @@ def test_anchored_decode_matches_band_mask_across_a_shift():
 
         step = anchored_step(state, "spyre")
         shifts += int(step.do_shift)
+        if step.do_shift:
+            op_k, op_v = roll_compact_buffer(op_k, op_v)
         with torch.no_grad():
             expected, band_k, band_v = compiled_band(
                 token,
@@ -420,8 +433,6 @@ def test_anchored_decode_matches_band_mask_across_a_shift():
                 step.cache_index,
                 cache_seqlen=step.cache_seqlen,
                 valid_start=step.valid_start,
-                stick_index=step.stick_index,
-                do_shift=step.do_shift,
             )
             # The float32 twin keeps its own full-length cache through the same
             # token stream, so every step is measured against truth rather than
