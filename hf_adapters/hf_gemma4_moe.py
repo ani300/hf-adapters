@@ -23,46 +23,38 @@ all attention-side Spyre prep (RMSNorm patch, per-type RoPE, KV shapes,
 LM-head padding) are shared with the dense adapter ``hf_gemma4`` — this module
 only adds the sparse FFN and the surrounding block/prepare/forward wiring.
 
-The FFN has four selectable formulations (module flags, mutually exclusive):
+The FFN runs on ONE of two device formulations, chosen per forward by the
+sequence length (``Gemma4MoEBlock.forward`` dispatches on ``seq_len``):
 
-  * ``_MOE_PERSISTENT_ONDEVICE`` -- the router runs once, then the dense
-    all-expert value path lowers through ``spyre::moe_ffn`` to one counted
-    device loop. The activation and output accumulator remain in LX while the
-    gate/up/down weights and routing scalar advance once per expert.
-  * ``_MOE_CHUNKED_ONDEVICE`` (Gate-A5-PROVEN, mean_rel=0.028) -- the WHOLE FFN
-    runs on the device; host does only chunk-loop glue. Sidesteps the routing
-    ops below via the topk-pad fix (pad logits to a non-pow2 width before topk,
-    threshold on the kth VALUE -- no fp16 index) and mask-reduce weighting
-    (``(w*onehot[e]).sum`` into a [T,H] device accumulator -- no gather/scatter).
-    Experts are split into ``ceil(E/_MOE_EC)`` compiled chunks (>32 expert
-    GEMM-chains in one sdsc program crashes the DDC scheduler). See the flag's
-    definition for the full rationale.
-  * ``_MOE_LOOP_ON_TOPK`` -- experts HBM-resident, on-device ``index_select``
-    under a row-tiled ``spyre_hint``. Blocked at E=128 (topk pow2-width abort +
-    P4 slab-gather overflow); kept as scaffold.
-  * default (``_moe_ffn_split``) -- device/host split (spec §2.1, verified in
-    ``repros/gemma4_moe/gate2_route_permute.py``). The routing ops (``topk``,
-    ``argsort``, 1-D index arithmetic, ``index_add``) do not lower, so:
+  * **prefill** (``seq_len > 1``, ``_moe_ffn_persistent``) -- the router runs
+    once, then the dense all-expert value path is emitted as an ordinary hinted
+    PyTorch program: ``x @ gate``/``x @ up`` (SwiGLU) ``@ down`` for every
+    expert, run under a coarse-tile ``spyre_hint(num_tiles_per_dim={"E": E})``
+    so it lowers to one counted device loop (one expert body per trip, the
+    running sum kept in the LX accumulator). No custom op -- plain matmuls named
+    with ``declare_tensor_dim`` / ``name_tensor_dims``; the per-expert routing
+    weight rides in as a named ``[E,T,1]`` operand and the outputs are summed
+    over the expert axis.
+  * **decode** (``seq_len == 1``, ``_moe_ffn_loop`` / ``_compiled_moe_loop_region``)
+    -- experts stay HBM-resident and the top-K rows are gathered on-device with
+    ``index_select`` under a row-tiled ``spyre_hint``, then the per-row expert
+    GEMM (gather ``gate``/``up``/``down`` by expert id, SwiGLU, weight by the
+    routing scalar) runs in ``[T,K,·]`` batch form; the host does only the
+    ``index_add`` scatter-combine back to ``[T,H]``.
 
-      device (torch.compile, spyre):  router projection ; token gather
-                                      ``x[token_of_row]`` ; expert grouped GEMM
-                                      (bmm + gelu_tanh SwiGLU + bmm)
-      host   (eager CPU):             softmax / topk / renorm / per_expert_scale
-                                      ; argsort + ``token_of_row`` arithmetic
-                                      ; weighted ``index_add`` combine
-
-Two load-bearing device-shape rules (verified on-card, gate 2; apply to the
-split / loop bmm paths -- the chunked path uses plain 2D matmuls):
-
-1. The row-batched expert tensors stay **3D ``[N,1,·]``** through the whole
-   expert FFN — the ``squeeze(1)→chunk→unsqueeze(1)`` 2D round-trip breaks
-   Spyre layout propagation ("Incompatible host_size and dim_order"). Squeeze
-   only at the very end.
-2. Expert weights are supplied **pre-transposed** (``gate_up`` as ``[E,H,2M]``,
-   ``down`` as ``[E,M,H]``) so the compiled region has no in-kernel
-   ``.transpose`` of a large weight (which forces a giant-offset restickify:
-   ``L3_ADDEARIMM Immediate value out of boundary``). ``prepare_for_spyre``
-   lays the experts out pre-transposed once.
+Both paths read the **same single expert-weight set**. ``prepare_for_spyre``
+de-fuses the checkpoint's fused ``gate_up`` into separate ``gate``/``up`` and
+lays each of ``gate``/``up``/``down`` out in ONE shared device layout via
+``torch_spyre.model_utils.dma_moe_expert_weight_to_spyre`` -- expert dim
+**outermost** with the free (output) dim on the stick
+(``gate``/``up`` ``[E,H,M]``, ``down`` ``[E,M,H]``, each becoming
+``[E, C, F//eps, eps]`` on device). That one layout is simultaneously the
+gather-source layout the decode ``index_select`` needs (indexed dim outermost)
+and the matmul weight-operand layout the prefill hint-body needs (sticked on
+the free dim), so neither path restickifies. Only ONE weight set is
+materialized (~42.5 GiB / 30 layers, not the old dual ~85 GiB), so it fits the
+card. Router weights (``proj.weight``, ``scale``, ``per_expert_scale``) are
+device-resident too; both paths share the same on-device router.
 
 ``K`` is the checkpoint's real ``config.top_k_experts`` (8 for gemma-4-26B-A4B);
 ``prepare_for_spyre`` asserts only the Spyre topk ceiling ``K <= 128`` (raised
