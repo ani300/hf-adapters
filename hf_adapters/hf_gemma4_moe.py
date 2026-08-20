@@ -100,50 +100,6 @@ _MOE_MAX_K = 128
 # loops over ceil(N/_MOE_TILE) tiles; a tuning knob (scratchpad window size).
 _MOE_TILE = 32
 
-# Device-FFN formulation selector (spec Approach A).
-#   False (default) -> shipped host-split path (_moe_ffn_split): experts
-#       host-resident, per-row weight select on CPU, [N,.] slices to device.
-#   True            -> loop-on-topk path (_moe_ffn_loop): experts HBM-resident
-#       on device, on-device index_select under a row-tiled spyre_hint.
-# Flip to True only after gateA_loop_on_topk.py passes on-card.
-_MOE_LOOP_ON_TOPK = False
-
-# ALL-DEVICE chunked formulation selector (spec Approach A, "nothing but glue
-# on host"). This is the on-card-PROVEN path (Gate A5, mean_rel=0.028 vs CPU
-# fp32): the WHOLE FFN -- router (softmax/topk/renorm/scale), expert GEMMs,
-# gelu-tanh SwiGLU, per-expert weight application, and the sum-over-experts
-# accumulate -- lowers and runs on the device. Host does ONLY glue: a
-# ``_MOE_NCHUNK``-iteration counter that threads a device-resident [T,H]
-# accumulator back into the next chunk. Nothing gather/scatter/FFN runs on
-# host. It sidesteps the two ops that abort ``_moe_ffn_loop`` at E=128:
-#
-#   * ``topk`` on a pow2 stick-multiple width (E=128 = 2 sticks) aborts
-#     ``Incorrect chunk size`` (L3DlOpsScheduler.cpp:1714). FIX: pad the
-#     router logits [T,E]->[T,_MOE_PADW] with -inf before topk, threshold on
-#     the kth VALUE over the original [T,E] (no fp16-index materialize).
-#   * the per-row on-device weight ``index_select`` (P4 L3_ADDEARIMM
-#     immediate overflow) and the ``index_add`` scatter-combine (P5 silently
-#     wrong). FIX: apply the router weight as arithmetic
-#     ``we=(w*onehot[e]).sum(-1,keepdim=True)`` [T,1] and accumulate into a
-#     [T,H] running buffer -- no gather, no scatter.
-#
-# One fused sdsc program with >32 expert GEMM-chains makes the DDC scheduler
-# derive a non-stick-aligned chunk (same 1714 crash), so the E=128 experts are
-# split into ``_MOE_NCHUNK`` compiled regions of ``_MOE_EC`` experts each,
-# threading the device accumulator across them. Per-chunk expert weights are
-# pre-materialized OFFSET-0 contiguous at load (a non-zero storage_offset
-# device-tensor view passed as a compile input reads wrong storage -- see
-# [[project-pr2426-storage-offset-review]]).
-#
-# Flip to True only after gateA5_chunked_ondevice.py passes on-card. Mutually
-# exclusive with _MOE_LOOP_ON_TOPK (asserted in prepare_for_spyre).
-_MOE_CHUNKED_ONDEVICE = False
-
-# Persistent all-expert formulation selector. This is intentionally opt-in:
-# it requires the torch-spyre persistent-expert compiler stack and keeps the
-# existing PR293 paths unchanged when disabled.
-_MOE_PERSISTENT_ONDEVICE = True
-
 # topk-input pad width for the all-device router (topk-pad fix). The router
 # logits width E is padded to this NON-pow2, non-stick-multiple width before
 # topk so the backend's binary-tree tiling stays stick-aligned. For E=128 the
@@ -570,7 +526,12 @@ class Gemma4MoEBlock(nn.Module):
         # ``self`` at call time (like the dense block's layer_scalar).
         flat = residual.reshape(-1, hidden)  # [T,H] RAW -> router
         x_moe = self.pre_feedforward_layernorm_2(flat)  # [T,H] normed -> experts
-        if _MOE_PERSISTENT_ONDEVICE:
+        # Phase dispatch: prefill (seq_len > 1) runs the dense all-experts
+        # persistent path; decode (seq_len == 1) runs the loop-on-topk gather
+        # path. Both compiled regions and both expert-weight sets are built once
+        # (prepare_for_spyre / __init__); the choice is per-forward by shape, not
+        # an import-time flag.
+        if seq_len > 1:
             moe_out = _moe_ffn_persistent(
                 flat,
                 x_moe,
@@ -584,7 +545,7 @@ class Gemma4MoEBlock(nn.Module):
                 self._moe_k,
                 self._moe_rms_eps,
             )  # [T,H]
-        elif _MOE_LOOP_ON_TOPK:
+        else:
             moe_out = _moe_ffn_loop(
                 flat,
                 x_moe,
@@ -657,26 +618,13 @@ def prepare_for_spyre(model):
         f"config hidden_activation={act_fn!r} is unsupported."
     )
 
-    # The device FFN modes lay experts out differently and are mutually
-    # exclusive; guard so a mis-set pair fails loudly at load rather than
-    # reading a stack the active mode's forward never populated.
-    enabled_modes = sum(
-        (
-            _MOE_PERSISTENT_ONDEVICE,
-            _MOE_CHUNKED_ONDEVICE,
-            _MOE_LOOP_ON_TOPK,
-        )
+    # The router pads its logits to a non-pow2 width before topk (topk-pad fix,
+    # shared by the prefill persistent router and the decode loop router).
+    E = cfg.num_experts
+    assert _MOE_PADW > E and (_MOE_PADW & (_MOE_PADW - 1)) != 0, (
+        f"_MOE_PADW ({_MOE_PADW}) must exceed num_experts ({E}) and be "
+        "non-power-of-two (topk-pad fix)."
     )
-    assert enabled_modes <= 1, (
-        "persistent, chunked, and loop-on-topk are mutually exclusive FFN "
-        "modes; enable at most one."
-    )
-    if _MOE_PERSISTENT_ONDEVICE or _MOE_CHUNKED_ONDEVICE:
-        E = cfg.num_experts
-        assert _MOE_PADW > E and (_MOE_PADW & (_MOE_PADW - 1)) != 0, (
-            f"_MOE_PADW ({_MOE_PADW}) must exceed num_experts ({E}) and be "
-            "non-power-of-two (topk-pad fix)."
-        )
 
     num_q_heads_per_layer, kv_shapes, is_kv_eq_v_per_layer = (
         _setup_gemma4_text_decoder(model, allow_moe=True)
@@ -735,66 +683,49 @@ def prepare_for_spyre(model):
         # ``self.router = layer.router``), so router-weight moves below apply to
         # the block's router too.
         router = block.router
-        if _MOE_PERSISTENT_ONDEVICE:
-            # Keep contiguous physical [K,E,N] backing while exposing the
-            # logical [E,K,N] expert-major tensors required by moe_ffn. The
-            # persistent lowering streams one expert bank per loop trip.
-            M = gate_up_t.shape[2] // 2
-            gate_packed = (
-                gate_up_t[:, :, :M]
-                .permute(1, 0, 2)
-                .contiguous()
-                .to("spyre")
-            )
-            up_packed = (
-                gate_up_t[:, :, M:]
-                .permute(1, 0, 2)
-                .contiguous()
-                .to("spyre")
-            )
-            down_packed = down_t.permute(1, 0, 2).contiguous().to("spyre")
-            block._spyre_persistent_gate = gate_packed.permute(1, 0, 2)
-            block._spyre_persistent_up = up_packed.permute(1, 0, 2)
-            block._spyre_persistent_down = down_packed.permute(1, 0, 2)
-            block._spyre_persistent_route_identity = torch.eye(
-                64, dtype=gate_packed.dtype
-            ).to("spyre")
-            router.proj.weight = torch.nn.Parameter(
-                router.proj.weight.data.to("spyre"), requires_grad=False
-            )
-            router.scale = torch.nn.Parameter(
-                router.scale.data.to("spyre"), requires_grad=False
-            )
-            router.per_expert_scale = torch.nn.Parameter(
-                router.per_expert_scale.data.to("spyre"), requires_grad=False
-            )
-        elif _MOE_LOOP_ON_TOPK:
-            # Approach A: experts HBM-RESIDENT on device, E outermost. Row-major
-            # [E,H,2M]/[E,M,H] is E-outermost (enforce_indirect_access: indexed
-            # dim at device position 0) AND stick-correct for the bmm weight
-            # operand (2M / H is the generated dim on the stick) -> zero
-            # restickify. Move explicitly (plain attrs are not in the buffer
-            # sweep).
-            block._spyre_gate_up_dev = gate_up_t.to("spyre")  # [E,H,2M]
-            block._spyre_down_dev = down_t.to("spyre")  # [E,M,H]
-            # The whole router runs on-device in the loop region (scale-free
-            # norm + [H] scale + proj + topk + per_expert_scale gather), so its
-            # weights must be device-resident too. Move them here rather than
-            # rely on a model.to("spyre") sweep -- standalone callers (the gate)
-            # never sweep the model, and the region's normed activation is
-            # device-side. Reassign the Parameter object (a cross-backend
-            # ``param.data = ...`` set_data raises on the type change); the
-            # spyre move stickifies proj.weight [E,H] like any 2D matmul weight.
-            # router.scalar_root_size is a Python float (no move).
-            router.proj.weight = torch.nn.Parameter(
-                router.proj.weight.data.to("spyre"), requires_grad=False
-            )
-            router.scale = torch.nn.Parameter(
-                router.scale.data.to("spyre"), requires_grad=False
-            )
-            router.per_expert_scale = torch.nn.Parameter(
-                router.per_expert_scale.data.to("spyre"), requires_grad=False
-            )
+        # Both FFN methods coexist (dispatch is per-forward by seq_len), so
+        # materialize BOTH expert-weight layouts on every block.
+        #
+        # Persistent (prefill): keep a contiguous physical [K,E,N] backing while
+        # exposing the logical [E,K,N] expert-major views the hinted persistent
+        # body needs (one expert bank streamed per loop trip).
+        M = gate_up_t.shape[2] // 2
+        gate_packed = (
+            gate_up_t[:, :, :M].permute(1, 0, 2).contiguous().to("spyre")
+        )
+        up_packed = (
+            gate_up_t[:, :, M:].permute(1, 0, 2).contiguous().to("spyre")
+        )
+        down_packed = down_t.permute(1, 0, 2).contiguous().to("spyre")
+        block._spyre_persistent_gate = gate_packed.permute(1, 0, 2)
+        block._spyre_persistent_up = up_packed.permute(1, 0, 2)
+        block._spyre_persistent_down = down_packed.permute(1, 0, 2)
+        block._spyre_persistent_route_identity = torch.eye(
+            64, dtype=gate_packed.dtype
+        ).to("spyre")
+
+        # Loop-on-topk (decode): whole stacks HBM-resident, E outermost
+        # ([E,H,2M]/[E,M,H] -- indexed dim at device position 0 for the on-device
+        # index_select, stick-correct for the bmm weight operand -> zero
+        # restickify). Plain attrs are not in the buffer sweep, so move explicitly.
+        block._spyre_gate_up_dev = gate_up_t.to("spyre")  # [E,H,2M]
+        block._spyre_down_dev = down_t.to("spyre")  # [E,M,H]
+
+        # The router runs on-device in BOTH paths (scale-free norm + [H] scale +
+        # proj + padded topk + per_expert_scale gather), so its weights must be
+        # device-resident. Reassign the Parameter object (a cross-backend
+        # ``param.data = ...`` set_data raises on the type change). Done once here
+        # -- both methods share this router. router.scalar_root_size is a Python
+        # float (no move).
+        router.proj.weight = torch.nn.Parameter(
+            router.proj.weight.data.to("spyre"), requires_grad=False
+        )
+        router.scale = torch.nn.Parameter(
+            router.scale.data.to("spyre"), requires_grad=False
+        )
+        router.per_expert_scale = torch.nn.Parameter(
+            router.per_expert_scale.data.to("spyre"), requires_grad=False
+        )
 
         # Register the block back into the backbone (so _run_blocks_over_embeds
         # reads layer_scalar off it), then append the EAGER block to the
