@@ -418,3 +418,18 @@ all-one-token — not a correctness check).
 An earlier op-on log showed a max_diff-14 prefill divergence; it was generated
 before the harness fix and is the same `_spyre_prompt_offsets` gap that hit
 Gemma 3, corrected above — not a real op behavior.
+
+### Upstream offer — `valid_start` returned to torch-spyre #3405
+
+The three torch-spyre commits this work depends on (`valid_start` feature +
+its torch-free band helpers + Gemma-4-geometry op tests) were offered back to
+the SWA PR they build on, `torch-spyre` #3405 (author @abhishekkunuru6-cmyk),
+as a `git am`-ready patch series rather than a competing stacked PR:
+<https://github.com/torch-spyre/torch-spyre/pull/3405#issuecomment-5358950913>.
+Rebased onto the current tip of `swa-window-roll`; the SWA + kv_window op
+suites are 131 passed, with the only two failures
+(`test_query_length_not_a_multiple_of_the_block`,
+`test_ragged_query_and_window_together`) reproducing identically on unmodified
+`swa-window-roll` — pre-existing, not introduced here. The stale
+`test_anchored_decode_stick_gemma4` (a dropped 64-row query stick) was
+rewritten to the shipped `seqlen_q=1` decode geometry before offering.
