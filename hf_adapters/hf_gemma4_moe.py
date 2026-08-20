@@ -95,25 +95,6 @@ __all__ = ["prepare_for_spyre", "_run_forward", "_run_backbone_forward"]
 # gemma-4-26B-A4B) instead of the old bring-up pin, asserting only this ceiling.
 _MOE_MAX_K = 128
 
-# Grouped-GEMM lowering selector (spec §4, Task 9 "Option 4B").
-#
-#   False (default) -> Option 4A: per-row expert-weight gather + row-batched
-#       bmm. This is the SHIPPED, on-card-validated bring-up path (Tasks 2/6/8).
-#   True            -> Option 4B: keep ``gathered`` contiguous (rows already
-#       sorted by expert) and walk the expert segments given by
-#       ``group_off = cumsum(bincount(row_expert, E))``, doing one slab GEMM per
-#       segment (one weight load per expert instead of per row).
-#
-# 4B is EXPERIMENTAL and OFF by default: on the current backend the
-# ``spyre_hint(tiles=...)`` vocabulary cannot express a per-tile operand switch
-# (see ``_grouped_gemm_4b`` docstring), so the on-device weight-load reduction
-# 4B targets is not achievable through the hint API today. 4B is retained as a
-# numerically-identical CPU-reference variant (verified by
-# ``tests/test_gemma4_moe_ffn.py::test_grouped_gemm_4a_4b_agree``) and as the
-# scaffold for a future backend that grows a grouped-GEMM primitive. Flip this
-# flag only after validating 4B end-to-end on-card.
-_MOE_GEMM_4B = False
-
 # Row-tile size for the loop-on-topk device region (spec Approach A). The
 # spyre_hint(tiles={"row": _MOE_TILE}) tiles the N=T*K row axis so the backend
 # loops over ceil(N/_MOE_TILE) tiles; a tuning knob (scratchpad window size).
@@ -162,11 +143,6 @@ _MOE_CHUNKED_ONDEVICE = False
 # it requires the torch-spyre persistent-expert compiler stack and keeps the
 # existing PR293 paths unchanged when disabled.
 _MOE_PERSISTENT_ONDEVICE = True
-
-# Experts per compiled chunk for the all-device path. >32 expert GEMM-chains in
-# one fused sdsc program crashes the DDC scheduler (Incorrect chunk size); <=32
-# compiles clean. E must be divisible by _MOE_EC.
-_MOE_EC = 32
 
 # topk-input pad width for the all-device router (topk-pad fix). The router
 # logits width E is padded to this NON-pow2, non-stick-multiple width before
@@ -380,44 +356,6 @@ def _moe_route_padded(x_router, router_proj_w, router_scale,
     return w * per_expert_scale  # [T,E] dense routing weight
 
 
-def _moe_expert_chunk(x_expert, w, acc, gate_c, up_c, down_c, onehot_c):
-    """All-device expert chunk: per-expert SwiGLU + mask-reduce weight + accum.
-
-    Runs the ``_MOE_EC`` experts of ONE chunk and adds their weighted outputs
-    into the running device accumulator ``acc``. For each chunk-local expert
-    ``j`` (global expert ``lo+j``):
-
-        a  = gelu(x @ gate_c[j], tanh) * (x @ up_c[j])   # [T,F] SwiGLU
-        we = (w * onehot_c[j]).sum(-1, keepdim=True)      # [T,1] mask-reduce
-        acc += (a @ down_c[j]) * we                       # [T,H]
-
-    The mask-reduce ``(w*onehot_c[j]).sum`` picks this expert's dense routing
-    weight out of the full [T,E] ``w`` as ARITHMETIC (onehot_c[j] is one at the
-    global column lo+j), avoiding an index/gather that does not lower on-card.
-    The [T,H] accumulator matches the down-projection output layout AND the
-    reduction layout, so summing over experts needs no stack. Everything stays
-    on the device; ``acc`` is threaded back in by the host glue loop.
-
-    Args:
-        x_expert: pre_ff_ln_2-normed residual [T,H] (expert FFN input).
-        w: Dense routing weight [T,E] from _moe_route_padded.
-        acc: Running device accumulator [T,H] (device-resident across chunks).
-        gate_c: This chunk's gate weights [Ec,H,F] (offset-0 contiguous).
-        up_c: This chunk's up weights [Ec,H,F] (offset-0 contiguous).
-        down_c: This chunk's down weights [Ec,F,H] (offset-0 contiguous).
-        onehot_c: This chunk's one-hot rows [Ec,E] (row j is one at col lo+j).
-
-    Returns:
-        acc: Updated accumulator [T,H] on the device.
-    """
-    Ec = gate_c.shape[0]
-    for j in range(Ec):
-        a = F.gelu(x_expert @ gate_c[j], approximate="tanh") * (x_expert @ up_c[j])
-        we = (w * onehot_c[j]).sum(-1, keepdim=True)  # [T,1]
-        acc = acc + (a @ down_c[j]) * we
-    return acc
-
-
 def _moe_route_persistent_packed(
     x_router,
     router_proj_w,
@@ -510,54 +448,6 @@ def _moe_ffn_persistent(
         )
 
 
-def _moe_ffn_chunked(x_router, x_expert, router, compiled_route,
-                     compiled_chunk, chunks, K, eps):
-    """All-device chunked MoE FFN orchestrator (spec Approach A).
-
-    Runs the router ONCE (its own compiled region) to get the dense [T,E]
-    routing weight, then walks the pre-materialized expert-weight chunks,
-    threading a DEVICE-RESIDENT [T,H] accumulator through each compiled chunk
-    region. The host does ONLY glue: the chunk-loop counter and passing the same
-    device accumulator handle back in. Nothing gather/scatter/FFN runs on host,
-    and the accumulator never round-trips to CPU until the final combine.
-
-    ``chunks`` is the per-layer list built by prepare_for_spyre: each entry is
-    ``(gate_c, up_c, down_c, onehot_c)`` of OFFSET-0 contiguous device tensors
-    for one chunk of ``_MOE_EC`` experts (the storage-offset remat fix -- a
-    non-zero-offset slice passed as a compile input reads wrong storage).
-
-    Args:
-        x_router: RAW flattened residual [T,H] (router input).
-        x_expert: pre_ff_ln_2-normed residual [T,H] (expert input).
-        router: stock Gemma4TextRouter (proj/scale/per_expert_scale device-
-            resident; scalar_root_size is a Python float).
-        compiled_route: torch.compile(_moe_route_padded).
-        compiled_chunk: torch.compile(_moe_expert_chunk).
-        chunks: list of (gate_c, up_c, down_c, onehot_c) device-tensor tuples.
-        K: Top-K experts per token.
-        eps: config.rms_norm_eps.
-
-    Returns:
-        out: MoE FFN output [T,H] on x_expert's device.
-    """
-    T, H = x_expert.shape
-    w = compiled_route(
-        x_router,
-        router.proj.weight,
-        router.scale,
-        router.scalar_root_size,
-        router.per_expert_scale,
-        K,
-        eps,
-        _MOE_PADW,
-        _MOE_PAD_NEG,
-    )  # [T,E] on device
-    acc = torch.zeros(T, H, dtype=x_expert.dtype, device=x_expert.device)
-    for gate_c, up_c, down_c, onehot_c in chunks:  # HOST GLUE: loop counter only
-        acc = compiled_chunk(x_expert, w, acc, gate_c, up_c, down_c, onehot_c)
-    return acc
-
-
 class Gemma4MoEBlock(nn.Module):
     """Registered Gemma 4 **MoE** decoder block used by the Spyre adapter.
 
@@ -632,8 +522,6 @@ class Gemma4MoEBlock(nn.Module):
         self._compiled_loop = torch.compile(
             _compiled_moe_loop_region, dynamic=False
         )
-        self._compiled_route = torch.compile(_moe_route_padded, dynamic=False)
-        self._compiled_chunk = torch.compile(_moe_expert_chunk, dynamic=False)
         self._compiled_persistent_route = torch.compile(
             _moe_route_persistent_packed, dynamic=False
         )
@@ -693,21 +581,6 @@ class Gemma4MoEBlock(nn.Module):
                 self._spyre_persistent_up,
                 self._spyre_persistent_down,
                 self._spyre_persistent_route_identity,
-                self._moe_k,
-                self._moe_rms_eps,
-            )  # [T,H]
-        elif _MOE_CHUNKED_ONDEVICE:
-            # ALL-DEVICE: router + expert GEMMs + weight + sum-over-experts all
-            # lower; host does only the chunk-loop glue (inside _moe_ffn_chunked)
-            # threading a device-resident accumulator. Per-chunk offset-0 expert
-            # weights were pre-materialized in prepare_for_spyre.
-            moe_out = _moe_ffn_chunked(
-                flat,
-                x_moe,
-                self.router,
-                self._compiled_route,
-                self._compiled_chunk,
-                self._spyre_moe_chunks,
                 self._moe_k,
                 self._moe_rms_eps,
             )  # [T,H]
@@ -804,11 +677,6 @@ def prepare_for_spyre(model):
             f"_MOE_PADW ({_MOE_PADW}) must exceed num_experts ({E}) and be "
             "non-power-of-two (topk-pad fix)."
         )
-    if _MOE_CHUNKED_ONDEVICE:
-        assert E % _MOE_EC == 0, (
-            f"all-device chunked MoE needs num_experts ({E}) divisible by "
-            f"_MOE_EC ({_MOE_EC})."
-        )
 
     num_q_heads_per_layer, kv_shapes, is_kv_eq_v_per_layer = (
         _setup_gemma4_text_decoder(model, allow_moe=True)
@@ -891,50 +759,6 @@ def prepare_for_spyre(model):
             block._spyre_persistent_route_identity = torch.eye(
                 64, dtype=gate_packed.dtype
             ).to("spyre")
-            router.proj.weight = torch.nn.Parameter(
-                router.proj.weight.data.to("spyre"), requires_grad=False
-            )
-            router.scale = torch.nn.Parameter(
-                router.scale.data.to("spyre"), requires_grad=False
-            )
-            router.per_expert_scale = torch.nn.Parameter(
-                router.per_expert_scale.data.to("spyre"), requires_grad=False
-            )
-        elif _MOE_CHUNKED_ONDEVICE:
-            # ALL-DEVICE chunked path (spec Approach A, "nothing but glue on
-            # host"). De-fuse the packed gate_up [E,H,2M] into separate gate /
-            # up [E,H,M] halves (matching x@Wg (gate) and x@Wu (up) in
-            # _moe_expert_chunk: the fused SwiGLU is gelu(g)*u with
-            # g,u = chunk(2, dim=-1), so cols [:M] are gate, [M:] are up), then
-            # slice the E experts into ceil(E/_MOE_EC) chunks of _MOE_EC and
-            # move each chunk to the device as an OFFSET-0 CONTIGUOUS tensor.
-            #
-            # The offset-0 remat is load-bearing: a non-zero storage_offset
-            # device-tensor view (e.g. gate_dev[lo:lo+Ec]) passed as a compile
-            # input reads the WRONG storage on-card (proven in
-            # slice_input_iso.py; related to [[project-pr2426-storage-offset-
-            # review]]). Slicing on the HOST tensor then ``.to("spyre")`` gives
-            # each chunk its own offset-0 device tensor -- pure glue, done once
-            # here, not per-forward.
-            E = gate_up_t.shape[0]
-            M = gate_up_t.shape[2] // 2
-            gate_t = gate_up_t[:, :, :M].contiguous()  # [E,H,M] gate half
-            up_t = gate_up_t[:, :, M:].contiguous()  # [E,H,M] up half
-            onehot = torch.eye(E, dtype=gate_t.dtype)  # [E,E] one-hot rows
-            chunks = []
-            for lo in range(0, E, _MOE_EC):
-                hi = lo + _MOE_EC
-                chunks.append((
-                    gate_t[lo:hi].contiguous().to("spyre"),   # [Ec,H,M]
-                    up_t[lo:hi].contiguous().to("spyre"),      # [Ec,H,M]
-                    down_t[lo:hi].contiguous().to("spyre"),    # [Ec,M,H]
-                    onehot[lo:hi].contiguous().to("spyre"),    # [Ec,E]
-                ))
-            block._spyre_moe_chunks = chunks
-            # The router runs entirely on-device (scale-free norm + [H] scale +
-            # proj + softmax + padded topk + per_expert_scale), so its weights
-            # must be device-resident. Reassign the Parameter (a cross-backend
-            # ``param.data = ...`` raises on the type change).
             router.proj.weight = torch.nn.Parameter(
                 router.proj.weight.data.to("spyre"), requires_grad=False
             )
