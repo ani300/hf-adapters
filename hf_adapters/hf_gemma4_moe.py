@@ -301,11 +301,11 @@ def _moe_route_padded(x_router, router_proj_w, router_scale,
     padded = torch.cat([probs, pad], dim=-1)  # [T,pad_w]
     wv, _ = torch.topk(padded, K, dim=-1)  # [T,K]; idx<E, never materialized
     kth = wv[..., -1:]  # [T,1] kth-largest VALUE threshold
-    # index_mask keeps probs where probs >= kth (the selected top-K experts) and
-    # zeroes the rest -- the device op form of the old
-    # torch.where(probs >= kth, probs, 0) threshold, with the [T,1] kth
-    # broadcast over the [T,E] probs.
-    mask = torch.ops.spyre.index_mask(probs, kth)  # [T,E]
+    # torch.where threshold: keep probs where probs >= kth (the selected top-K
+    # experts), zero the rest. Equivalent to the torch.ops.spyre.index_mask(probs,
+    # kth) device op, which is not yet registered in torch-spyre -- switch to
+    # index_mask once it lands; until then this form traces on-device fine.
+    mask = torch.where(probs >= kth, probs, torch.zeros_like(probs))  # [T,E]
     w = mask / mask.sum(-1, keepdim=True)  # renorm top-K to sum 1
     return w * per_expert_scale  # [T,E] dense routing weight
 
