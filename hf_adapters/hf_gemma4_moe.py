@@ -126,9 +126,9 @@ def _compiled_moe_loop_region(
     single spyre_hint(tiles={"row": tile}) that tiles the [T,K] row axis (the
     hint IS the loop -- no Python for), broadcast the expert-input rows from
     x_expert over K, index_select the per-(token,expert) weights from the
-    HBM-resident E-outermost stacks with the B5-B8 address-prep index
-    (idx_addr [T,K,32] fp32; the backend's idx2Addr turns it into weight base
-    addresses when it lowers the index_selects), two batched matmuls
+    HBM-resident E-outermost stacks with the topk index prepared via the B5-B8
+    chain (identity/expand-64 -> compiler-inserted restickify -> fp32 widen ->
+    slice-to-32 -> int32), two batched matmuls
     ([T,K,1,*] throughout) with a gelu-tanh SwiGLU, and weight by the router
     weight.
 
@@ -155,35 +155,52 @@ def _compiled_moe_loop_region(
     normed = normed * router_scale * router_scalar_root_size  # scale is [H]
     logits = F.linear(normed, router_proj_w)  # [T,E]
     probs = torch.softmax(logits, dim=-1)
-    # topk's index is kept in its native [T,K] shape (no reshape to N). The
-    # spyre_topk decomposition leaves the index in fp16 (the device reduction
-    # materializes positions in the input dtype; Spyre has no native int64), so
-    # idx is an fp16 value that "lies" it is an index. Before it can drive an
-    # on-device indirect gather it must be put in the address-prep form the
-    # backend's idx2Addr step consumes (moe-implementation-notes-aug2026.md
-    # B5-B8): replicate the index across a dummy 64-lane stick (B5 identity),
-    # restickify that lane onto the stick (B6), widen fp16 -> fp32 for the
-    # address arithmetic (B7), then slice to the 32 elements an fp32 stick holds
-    # (B8). idx2Addr itself (B9-B11) is inserted by the backend when it lowers
-    # the index_selects below -- we produce only the B5-B8 index, not addresses.
-    w, idx = torch.topk(probs, K, dim=-1)  # [T,K] values, [T,K] fp16 indices
+    # Decode index prep -- the B5-B8 chain from moe-implementation-notes-
+    # aug2026.md Path B (decode), expressed in PLAIN traceable tensor ops so the
+    # COMPILER inserts the restickify itself (B6). We do NOT call
+    # torch.ops.spyre.restickify -- that op is pass-inserted-only (customops.py
+    # ~line 400: empty body, no fake impl), so Dynamo cannot trace it from user
+    # code (the original decode abort). Instead we drive the layout transition
+    # with a permute/contiguous the layout pass realizes as a restickify.
+    #
+    #   B4 topk_index [T,K] df16    -- spyre_topk keeps the index in the INPUT
+    #                                  dtype (fp16); Spyre's reduction returns
+    #                                  positions as fp16, not int64.
+    #   B5 identity   [T,K] -> [T,K,64]  introduce a dummy dim of 64 (= S at
+    #                                  df16); index replicated across it.
+    #   B6 restickify [T,K,64]      bring the dummy-64 dim INTO the stick (stick
+    #                                  dim T -> dummy(64); one full stick per
+    #                                  (token,expert) pair) -- compiler-inserted.
+    #   B7 df16tofp32 [T,K,64] fp32  widen for address arithmetic.
+    #   B8 slice      [T,K,64] -> [T,K,32]  fp32 stick holds only 32 elems.
+    #
+    # Only AFTER B8 do we cast to int32: PyTorch's advanced-indexing meta-check
+    # rejects a float index ("indices must be long, int, byte or bool"), so the
+    # index must arrive at the gathers as an integer. int32 is the device index
+    # width the backend relabels SENUINT32.
+    w, idx = torch.topk(probs, K, dim=-1)  # [T,K] values, [T,K] fp16 positions
     w = w / w.sum(-1, keepdim=True)
 
-    # B5-B8 index address-prep, shared by every indirect consumer below.
-    idx_stick = idx[..., None].expand(T, K, 64)  # B5: replicate over dummy 64
-    idx_stick = torch.ops.spyre.restickify(idx_stick)  # B6: dummy dim -> stick
-    idx_addr = idx_stick.to(torch.float32)[..., :32]  # B7 widen, B8 slice -> fp32
+    # B5 identity + B6 restickify: expand a trailing dummy-64 axis (stride-0
+    # broadcast, index replicated) then force a physical relayout with
+    # .contiguous(), which the layout pass emits as the restickify that moves
+    # the stick dim onto the size-64 axis.
+    idx_stick = idx[..., None].expand(T, K, 64).contiguous()  # [T,K,64] df16
+    idx_stick = idx_stick.to(torch.float32)  # B7 df16 -> fp32 widen
+    idx_addr = idx_stick[..., :32]  # B8 slice to one fp32 stick -> [T,K,32]
+    idx = idx_addr[..., 0].to(torch.int32)  # post-B8 -> int32 [T,K] gather idx
 
-    w = w * per_expert_scale[idx_addr]  # [T,K]
+    w = w * per_expert_scale[idx]  # [T,K] on-device gather
 
     # The K rows for one token all read the SAME token embedding, so broadcast
     # x_expert over the K axis instead of gathering with a flattened index. The
-    # expert-weight index_selects consume the B5-B8 idx_addr in [T,K,32] form.
+    # expert-weight gathers take the plain [T,K] index; the compiler builds the
+    # index/value address encoding when it lowers these index_selects.
     with spyre_hint(tiles={"row": tile}):
         gathered = x_expert[:, None, :].expand(T, K, H)  # [T,K,H]
-        W_g = gate_dev[idx_addr]  # [T,K,H,M] on-device index_select
-        W_u = up_dev[idx_addr]  # [T,K,H,M]
-        W_dn = down_dev[idx_addr]  # [T,K,M,H]
+        W_g = gate_dev[idx]  # [T,K,H,M] on-device index_select
+        W_u = up_dev[idx]  # [T,K,H,M]
+        W_dn = down_dev[idx]  # [T,K,M,H]
         g = torch.matmul(gathered.unsqueeze(-2), W_g)  # [T,K,1,M] batched
         u = torch.matmul(gathered.unsqueeze(-2), W_u)  # [T,K,1,M]
         act = F.gelu(g, approximate="tanh") * u  # [T,K,1,M]
