@@ -114,12 +114,11 @@ def _compiled_moe_loop_region(
     gate_dev,
     up_dev,
     down_dev,
-    token_ids,
     K,
     tile,
     eps,
 ):
-    """Whole MoE FFN on-device except the scatter-combine (spec Approach A).
+    """Whole MoE FFN on device, combine included (spec Approach A).
 
     Router (inlined SCALE-FREE RMSNorm on the RAW residual x_router with eps
     INSIDE the sqrt, then * router_scale[H] * router_scalar_root_size, then
@@ -141,7 +140,9 @@ def _compiled_moe_loop_region(
     gate_dev/up_dev: [E,H,M] (stick=M), down_dev: [E,M,H] (stick=H), E outermost
     in all three -- the same shared device layout _moe_ffn_persistent reads.
     tile must be >= 2 (single-row P=1 gather SIGABRTs in dxp_standalone).
-    Returns (row_out[T,K,H], token_of_row[T,K]) for the host index_add combine.
+    Returns the combined [T,H] MoE output -- the per-token sum over the K
+    expert rows is reduced on device (row_out.sum(dim=1)), so there is no
+    host scatter-combine.
     """
     from torch_spyre._inductor.propagate_hints import spyre_hint
 
@@ -188,21 +189,29 @@ def _compiled_moe_loop_region(
         act = F.gelu(g, approximate="tanh") * u  # [T,K,1,M]
         row_out = torch.matmul(act, W_dn).squeeze(-2)  # [T,K,H]
         row_out = row_out * w[..., None]  # [T,K,1] broadcast
-    # token_of_row[t,k] = t (each of a token's K rows scatters back to token t);
-    # kept in [T,K] here, flattened host-side for the eager index_add combine.
-    token_of_row = token_ids[:, None].expand(T, K)  # [T,K]
-    return row_out, token_of_row
+        # Combine a token's K expert outputs by reducing over the K axis right
+        # here on device. This is the same K-reduction the host index_add used
+        # to do -- token_of_row[t,k]==t sent all K rows of token t to slot t, a
+        # pure per-token sum over K -- but as a plain reduction it needs no
+        # scatter. (An on-device index_add is NOT usable for this: upstream's
+        # spyre_index_add (#3753) is a read-modify-write with a no-duplicate-
+        # index precondition, and the K rows per token are all duplicate index
+        # t, which it gets silently wrong.) Mirrors the persistent path's
+        # proven (down_out * route).sum(dim=0) device reduction.
+        moe_out = row_out.sum(dim=1)  # [T,K,H] -> [T,H]
+    return moe_out
 
 
 def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_dev, up_dev,
                   down_dev, K, tile, eps):
     """Loop-on-topk MoE FFN orchestrator (spec Approach A).
 
-    Unpacks the router's tensors, calls the compiled loop region (router +
-    gather + on-device expert-weight index_select + bmms, row-tiled), then does
-    the host index_add scatter-combine (scatter does not lower on device). The
-    expert stacks are DEVICE-resident here (unlike _moe_ffn_split's host-
-    resident stacks) -- the whole point of Approach A is the on-device select.
+    Unpacks the router's tensors and calls the compiled loop region (router +
+    gather + on-device expert-weight index_select + bmms, row-tiled), which now
+    also reduces each token's K expert rows over the K axis on device and
+    returns the combined [T,H] output -- no host scatter-combine. The expert
+    stacks are DEVICE-resident here (unlike _moe_ffn_split's host-resident
+    stacks) -- the whole point of Approach A is the on-device select.
 
     Router surface (preflight-corrected): router.norm has NO .weight; the
     region applies a scale-free RMSNorm (eps INSIDE sqrt) then the [H]
@@ -211,12 +220,12 @@ def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_dev, up_dev,
 
     Returns the combined [T,H] MoE output on x_expert's device.
     """
-    T, H = x_expert.shape
-    token_ids = torch.arange(T, device=x_expert.device, dtype=torch.int32)
     # The router's proj.weight / scale / per_expert_scale are moved onto the
     # device in prepare_for_spyre (Approach-A flag branch) so they are already
-    # device-resident here -- pass them straight through as region inputs.
-    row_out, token_of_row = compiled_loop(
+    # device-resident here -- pass them straight through as region inputs. The
+    # region returns the combined [T,H] output (K reduced on device), so there
+    # is nothing left to scatter host-side.
+    moe_out = compiled_loop(
         x_router,
         x_expert,
         router.proj.weight,
@@ -226,20 +235,11 @@ def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_dev, up_dev,
         gate_dev,
         up_dev,
         down_dev,
-        token_ids,
         K,
         tile,
         eps,
     )
-    # The region returns [T,K,H] / [T,K] (topk shape kept on device). Flatten to
-    # [N,H] / [N] HOST-side for the eager index_add scatter-combine -- this is
-    # host glue, not the device/topk-consumption path the "no reshape" rule
-    # governs, and index_add does not lower on device anyway.
-    row_out = row_out.cpu().float().reshape(-1, H)  # [N,H]
-    token_of_row = token_of_row.cpu().long().reshape(-1)  # [N]
-    out = torch.zeros(T, H, dtype=torch.float32)
-    out = out.index_add(0, token_of_row, row_out)
-    return out.to(dtype=x_expert.dtype, device=x_expert.device)
+    return moe_out.to(dtype=x_expert.dtype)
 
 
 # ---------------------------------------------------------------------------
