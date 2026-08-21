@@ -190,22 +190,61 @@ def _compiled_moe_loop_region(
     idx_addr = idx_stick[..., :32]  # B8 slice to one fp32 stick -> [T,K,32]
     idx = idx_addr[..., 0].to(torch.int32)  # post-B8 -> int32 [T,K] gather idx
 
-    w = w * per_expert_scale[idx]  # [T,K] on-device gather
+    # per_expert_scale is applied NOT here but folded into the H-carrying row_out
+    # multiply below. A bare `w * per_expert_scale[idx]` gathers a 1-D [E] source
+    # by idx[T,K] -> [T,K]: the indexed dim lands innermost and there is no
+    # feature axis for indirect-access to sit a stick on, so layout-prop aborts
+    # ("Multi-arg pointwise: no supported output layout, size=[1,8]"). K=8 is not
+    # stick-divisible and there is no same-frame reuse target, so no legal layout
+    # exists for the bare product. Deferring the scale to row_out[T,K,H] (H on the
+    # stick) sidesteps this -- see the pscale gather below.
 
     # The K rows for one token all read the SAME token embedding, so broadcast
     # x_expert over the K axis instead of gathering with a flattened index. The
     # expert-weight gathers take the plain [T,K] index; the compiler builds the
     # index/value address encoding when it lowers these index_selects.
     with spyre_hint(tiles={"row": tile}):
-        gathered = x_expert[:, None, :].expand(T, K, H)  # [T,K,H]
+        # .contiguous() materializes the K-batch stride. Without it the expand's
+        # stride-0 batch makes the batched-matmul LHS (inp0) drop its batch dim
+        # from layoutDimOrder_, so the backend scheduler's getMinParamBmm sees
+        # inp0_reuse_dim = {mb, out} (size 2) and DT_CHECK(inp0_reuse_dim==1)
+        # aborts at L3DlOpsScheduler.cpp:945. Materializing gives inp0 a real mb
+        # stride -> reuse dim = {out} only.
+        gathered = x_expert[:, None, :].expand(T, K, H).contiguous()  # [T,K,H]
         W_g = gate_dev[idx]  # [T,K,H,M] on-device index_select
         W_u = up_dev[idx]  # [T,K,H,M]
         W_dn = down_dev[idx]  # [T,K,M,H]
-        g = torch.matmul(gathered.unsqueeze(-2), W_g)  # [T,K,1,M] batched
-        u = torch.matmul(gathered.unsqueeze(-2), W_u)  # [T,K,1,M]
-        act = F.gelu(g, approximate="tanh") * u  # [T,K,1,M]
-        row_out = torch.matmul(act, W_dn).squeeze(-2)  # [T,K,H]
-        row_out = row_out * w[..., None]  # [T,K,1] broadcast
+        # Gate/up as an explicit broadcast-multiply-then-reduce, NOT a matmul and
+        # NOT einsum. Each (t,k) row is a distinct [1,H]x[H,M] product (its own
+        # gathered expert weight), so the batch is (T,K) and the contraction is a
+        # vector x matrix -- there is no shared-weight bmm form, and matmul's only
+        # rank-3-preserving shape needs a unit M-slot. So compute it directly:
+        #   gathered[T,K,H,1] * W_g[T,K,H,M] -> [T,K,H,M], then .sum(dim=2) over H.
+        # .sum(dim=2) is a GENUINE reduction op that physically collapses H, giving
+        # a rank-3 [T,K,M] buffer -- unlike a squeeze/reshape of a matmul's
+        # [T,K,1,M] result, which folds to a VIEW leaving the buffer rank-4 and
+        # tripping "Incompatible host_size and dim_order" (rank_diff=-1) at the
+        # downstream scale pointwise (propagate_layouts.py:1125). It also sidesteps
+        # einsum's internal reshape decomposition, which mis-derives the output as
+        # [T,K,M] over the un-reduced [T,K,H,M] product ("shape '[1,8,704]' invalid
+        # for input of size 15859712" at fake-tensor inference). Verified to compile
+        # through Stage-7 in isolation (/tmp/decode_bmm_probe.py sumreduce: 120
+        # patches, output_size=16896).
+        g = (gathered[..., None] * W_g).sum(dim=2)  # [T,K,H,1]*[T,K,H,M]->sum H->[T,K,M]
+        u = (gathered[..., None] * W_u).sum(dim=2)  # [T,K,M]
+        act = F.gelu(g, approximate="tanh") * u  # [T,K,M] rank-3
+        # Down-proj the same way: act[T,K,M,1] * W_dn[T,K,M,H] -> [T,K,M,H], reduce
+        # M via .sum(dim=2) -> a genuinely rank-3 [T,K,H] buffer directly.
+        row_out = (act[..., None] * W_dn).sum(dim=2)  # [T,K,M,1]*[T,K,M,H]->sum M->[T,K,H]
+        # per_expert_scale gather: give the 1-D [E] source a real 64-wide innermost
+        # feature ([E]->[E,64], value replicated across the stick) so indirect-
+        # access has a stick to sit on, gather -> [T,K,64], recover the per-
+        # (token,expert) scalar via a SAME-FRAME mean over the identical lanes.
+        pes_stick = per_expert_scale[:, None].expand(-1, 64).contiguous()  # [E,64]
+        pscale = pes_stick[idx].mean(-1, keepdim=True)  # [T,K,1]
+        # Fold both scale factors into the H-carrying row_out (H=2816 on the stick);
+        # no bare [T,K] product materializes (that aborts layout-prop size=[1,8]).
+        row_out = row_out * w[..., None] * pscale  # [T,K,H] * [T,K,1] * [T,K,1]
         # Combine a token's K expert outputs by reducing over the K axis right
         # here on device. This is the same K-reduction the host index_add used
         # to do -- token_of_row[t,k]==t sent all K rows of token t to slot t, a
