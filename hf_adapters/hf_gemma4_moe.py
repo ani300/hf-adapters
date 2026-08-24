@@ -12,60 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-HuggingFace Transformers adapter for the Gemma 4 **MoE** causal-LM on Spyre.
+"""HuggingFace adapter for the sparse Gemma 4 MoE causal-LM on Spyre.
 
-Targets the sparse ``google/gemma-4-26B-A4B-it`` variant, whose
-``Gemma4TextDecoderLayer`` runs a dense MLP **in parallel** with a top-K
-mixture-of-experts FFN when ``config.enable_moe_block=True`` (see stock
-``transformers.models.gemma4.modeling_gemma4``). The dense attention half and
-all attention-side Spyre prep (RMSNorm patch, per-type RoPE, KV shapes,
-LM-head padding) are shared with the dense adapter ``hf_gemma4`` — this module
-only adds the sparse FFN and the surrounding block/prepare/forward wiring.
+Targets ``google/gemma-4-26B-A4B-it``, whose ``Gemma4TextDecoderLayer`` runs a
+dense MLP in parallel with a top-K MoE FFN. Everything attention-side is shared
+with the dense ``hf_gemma4`` adapter; this module adds only the sparse FFN and
+its block/prepare/forward wiring. All MoE compute runs on device.
 
-The FFN runs on ONE of two device formulations, chosen per forward by the
-sequence length (``Gemma4MoEBlock.forward`` dispatches on ``seq_len``):
+The FFN has two device formulations, chosen per forward by sequence length:
 
-  * **prefill** (``seq_len > 1``, ``_moe_ffn_persistent``) -- the router runs
-    once, then the dense all-expert value path is emitted as an ordinary hinted
-    PyTorch program: ``x @ gate``/``x @ up`` (SwiGLU) ``@ down`` for every
-    expert, run under a coarse-tile ``spyre_hint(num_tiles_per_dim={"E": E})``
-    so it lowers to one counted device loop (one expert body per trip, the
-    running sum kept in the LX accumulator). No custom op -- plain matmuls named
-    with ``declare_tensor_dim`` / ``name_tensor_dims``; the per-expert routing
-    weight rides in as a named ``[E,T,1]`` operand and the outputs are summed
-    over the expert axis.
-  * **decode** (``seq_len == 1``, ``_moe_ffn_loop`` / ``_compiled_moe_loop_region``)
-    -- experts stay HBM-resident and the top-K rows are gathered on-device with
-    ``index_select`` under a row-tiled ``spyre_hint``, then the per-row expert
-    GEMM (gather ``gate``/``up``/``down`` by expert id, SwiGLU, weight by the
-    routing scalar) runs in ``[T,K,·]`` batch form; the host does only the
-    ``index_add`` scatter-combine back to ``[T,H]``.
+  * prefill (``seq_len > 1``, ``_moe_ffn_persistent``): route once, then run the
+    dense all-expert value path under a coarse-tile
+    ``spyre_hint(num_tiles_per_dim={"E": E})`` so it lowers to one counted
+    device loop that accumulates over experts.
+  * decode (``seq_len == 1``, ``_moe_ffn_loop``): experts stay HBM-resident;
+    the top-K rows are gathered on-device by expert id, run through the
+    per-row expert GEMM in ``[T,K,·]`` batch form, and combined by an on-device
+    reduction over K.
 
-Both paths read the **same single expert-weight set**. ``prepare_for_spyre``
-de-fuses the checkpoint's fused ``gate_up`` into separate ``gate``/``up`` and
-lays each of ``gate``/``up``/``down`` out in ONE shared device layout via
-``torch_spyre.model_utils.dma_moe_expert_weight_to_spyre`` -- expert dim
-**outermost** with the free (output) dim on the stick
-(``gate``/``up`` ``[E,H,M]``, ``down`` ``[E,M,H]``, each becoming
-``[E, C, F//eps, eps]`` on device). That one layout is simultaneously the
-gather-source layout the decode ``index_select`` needs (indexed dim outermost)
-and the matmul weight-operand layout the prefill hint-body needs (sticked on
-the free dim), so neither path restickifies. Only ONE weight set is
-materialized (~42.5 GiB / 30 layers, not the old dual ~85 GiB), so it fits the
-card. Router weights (``proj.weight``, ``scale``, ``per_expert_scale``) are
-device-resident too; both paths share the same on-device router.
-
-``K`` is the checkpoint's real ``config.top_k_experts`` (8 for gemma-4-26B-A4B);
-``prepare_for_spyre`` asserts only the Spyre topk ceiling ``K <= 128`` (raised
-from 4 by torch-spyre #3782, which splits topk's k across cores).
+Both paths read the same single expert-weight set (~42.5 GiB / 30 layers), laid
+out expert-dim-outermost with the free dim on the stick by
+``prepare_for_spyre`` -- simultaneously the decode gather-source layout and the
+prefill matmul weight-operand layout, so neither path restickifies. Router
+weights are device-resident and shared by both paths.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
+from torch_spyre.model_utils import (
+    dma_moe_expert_weight_to_spyre,
+    dma_moe_per_expert_scale_to_spyre,
+)
 
 from hf_adapters.hf_common import text_config
 from hf_adapters.hf_gemma4 import (
@@ -76,30 +55,22 @@ from hf_adapters.hf_gemma4 import (
     _setup_gemma4_text_decoder,
 )
 
-# ``_run_forward`` / ``_run_backbone_forward`` are re-exported from ``hf_gemma4``
-# unchanged: since #350 they drive ``model._spyre_compiled_blocks`` and read
-# ``layer_scalar`` off each registered block, so they are block-AGNOSTIC — the
-# MoE blocks slot in transparently. Kept in this module's namespace because
-# ``resolve_adapter_module`` / ``generate`` look them up on the resolved adapter.
+# Block-agnostic (drive ``model._spyre_compiled_blocks``); re-exported from
+# ``hf_gemma4`` because ``resolve_adapter_module`` / ``generate`` look them up
+# on the resolved adapter.
 __all__ = ["prepare_for_spyre", "_run_forward", "_run_backbone_forward"]
 
-# Upper bound on the top-K the Spyre topk reduction can serve. torch-spyre
-# #3782 split topk's k across cores and raised the ceiling from 4 to 128, so
-# the adapter now uses the checkpoint's real ``top_k_experts`` (8 for
-# gemma-4-26B-A4B) instead of the old bring-up pin, asserting only this ceiling.
+# Ceiling of the Spyre topk reduction (torch-spyre #3782 raised it 4 -> 128).
 _MOE_MAX_K = 128
 
-# Row-tile size for the loop-on-topk device region (spec Approach A). The
-# spyre_hint(tiles={"row": _MOE_TILE}) tiles the N=T*K row axis so the backend
-# loops over ceil(N/_MOE_TILE) tiles; a tuning knob (scratchpad window size).
+# Row-tile size for the decode loop region's ``spyre_hint(tiles={"row": ...})``.
 _MOE_TILE = 32
 
-# topk-input pad width for the all-device router (topk-pad fix). The router
-# logits width E is padded to this NON-pow2, non-stick-multiple width before
-# topk so the backend's binary-tree tiling stays stick-aligned. For E=128 the
-# proven value is 160 (=E+32). Pad columns are -inf so they never win top-K.
+# Router logits are padded to a non-pow2, non-stick-multiple width before topk
+# so the backend's binary-tree tiling stays stick-aligned; pad columns are
+# ~-inf so they never win top-K. 160 (=E+32) is the proven value for E=128.
 _MOE_PADW = 160
-_MOE_PAD_NEG = -30000.0  # ~ -inf in fp16 (< any real softmax-prob logit)
+_MOE_PAD_NEG = -30000.0  # ~ -inf in fp16
 
 
 
@@ -118,176 +89,99 @@ def _compiled_moe_loop_region(
     tile,
     eps,
 ):
-    """Whole MoE FFN on device, combine included (spec Approach A).
+    """Whole decode MoE FFN on device, combine included.
 
-    Router (inlined SCALE-FREE RMSNorm on the RAW residual x_router with eps
-    INSIDE the sqrt, then * router_scale[H] * router_scalar_root_size, then
-    proj) -> softmax -> topk(K) -> renorm -> per_expert_scale; then, under a
-    single spyre_hint(tiles={"row": tile}) that tiles the [T,K] row axis (the
-    hint IS the loop -- no Python for), broadcast the expert-input rows from
-    x_expert over K, index_select the per-(token,expert) weights from the
-    HBM-resident E-outermost stacks with the topk index prepared via the B5-B8
-    chain (identity/expand-64 -> compiler-inserted restickify -> fp32 widen ->
-    slice-to-32 -> int32), two batched matmuls
-    ([T,K,1,*] throughout) with a gelu-tanh SwiGLU, and weight by the router
-    weight.
+    Router (scale-free RMSNorm on the raw residual x_router, then router_scale[H]
+    and the root-size scalar, then proj) -> softmax -> topk(K) -> renorm; then,
+    under one ``spyre_hint(tiles={"row": tile})`` that tiles the [T,K] row axis,
+    gather the per-(token,expert) weights from the HBM-resident E-outermost
+    stacks, run the SwiGLU expert GEMM in [T,K,·] batch form, weight by the
+    routing scalar, and reduce over K.
 
-    Preflight-corrected router surface: the stock router.norm has NO .weight
-    (Gemma4RMSNorm with_scale=False); the learnable gain is router_scale, an
-    [H] vector applied AFTER the scale-free norm. router_scalar_root_size is a
-    Python float (hidden_size ** -0.5). eps is config.rms_norm_eps.
+    Router surface: the stock router.norm is scale-free (no .weight); the gain
+    is router_scale [H], applied after the norm. router_scalar_root_size is
+    ``hidden_size ** -0.5`` (float); eps is config.rms_norm_eps.
 
-    gate_dev/up_dev: [E,H,M] (stick=M), down_dev: [E,M,H] (stick=H), E outermost
-    in all three -- the same shared device layout _moe_ffn_persistent reads.
-    tile must be >= 2 (single-row P=1 gather SIGABRTs in dxp_standalone).
-    Returns the combined [T,H] MoE output -- the per-token sum over the K
-    expert rows is reduced on device (row_out.sum(dim=1)), so there is no
-    host scatter-combine.
+    gate_dev/up_dev [E,H,M], down_dev [E,M,H], E outermost -- the shared layout
+    _moe_ffn_persistent reads. tile must be >= 2 (single-row gather SIGABRTs).
+    Returns [T,H].
     """
     from torch_spyre._inductor.propagate_hints import spyre_hint
 
     T, H = x_expert.shape
 
-    # --- router (all device-lowerable): SCALE-FREE RMSNorm (eps inside sqrt)
-    # on the RAW residual, then the [H] scale vector and the root-size scalar.
     var = x_router.pow(2).mean(-1, keepdim=True)
-    normed = x_router * torch.rsqrt(var + eps)  # scale-free (no gain in norm)
-    normed = normed * router_scale * router_scalar_root_size  # scale is [H]
-    logits = F.linear(normed, router_proj_w)  # [T,E]
-    probs = torch.softmax(logits, dim=-1)
-    # Decode index prep -- the B5-B8 chain from moe-implementation-notes-
-    # aug2026.md Path B (decode), expressed in PLAIN traceable tensor ops so the
-    # COMPILER inserts the restickify itself (B6). We do NOT call
-    # torch.ops.spyre.restickify -- that op is pass-inserted-only (customops.py
-    # ~line 400: empty body, no fake impl), so Dynamo cannot trace it from user
-    # code (the original decode abort). Instead we drive the layout transition
-    # with a permute/contiguous the layout pass realizes as a restickify.
-    #
-    #   B4 topk_index [T,K] df16    -- spyre_topk keeps the index in the INPUT
-    #                                  dtype (fp16); Spyre's reduction returns
-    #                                  positions as fp16, not int64.
-    #   B5 identity   [T,K] -> [T,K,64]  introduce a dummy dim of 64 (= S at
-    #                                  df16); index replicated across it.
-    #   B6 restickify [T,K,64]      bring the dummy-64 dim INTO the stick (stick
-    #                                  dim T -> dummy(64); one full stick per
-    #                                  (token,expert) pair) -- compiler-inserted.
-    #   B7 df16tofp32 [T,K,64] fp32  widen for address arithmetic.
-    #   B8 slice      [T,K,64] -> [T,K,32]  fp32 stick holds only 32 elems.
-    #
-    # Only AFTER B8 do we cast to int32: PyTorch's advanced-indexing meta-check
-    # rejects a float index ("indices must be long, int, byte or bool"), so the
-    # index must arrive at the gathers as an integer. int32 is the device index
-    # width the backend relabels SENUINT32.
-    w, idx = torch.topk(probs, K, dim=-1)  # [T,K] values, [T,K] fp16 positions
+    normed = x_router * torch.rsqrt(var + eps)  # scale-free RMSNorm
+    normed = normed * router_scale * router_scalar_root_size
+    probs = torch.softmax(F.linear(normed, router_proj_w), dim=-1)  # [T,E]
+    w, idx = torch.topk(probs, K, dim=-1)  # values, fp16 positions [T,K]
     w = w / w.sum(-1, keepdim=True)
 
-    # B5 identity + B6 restickify: expand a trailing dummy-64 axis (stride-0
-    # broadcast, index replicated) then force a physical relayout with
-    # .contiguous(), which the layout pass emits as the restickify that moves
-    # the stick dim onto the size-64 axis.
-    idx_stick = idx[..., None].expand(T, K, 64).contiguous()  # [T,K,64] df16
-    idx_stick = idx_stick.to(torch.float32)  # B7 df16 -> fp32 widen
-    idx_addr = idx_stick[..., :32]  # B8 slice to one fp32 stick -> [T,K,32]
-    idx = idx_addr[..., 0].to(torch.int32)  # post-B8 -> int32 [T,K] gather idx
+    # Decode index prep. topk returns positions in the input dtype (fp16), but
+    # advanced indexing needs an integer index, and the backend wants the gather
+    # index widened onto a stick. Expand a dummy-64 axis and .contiguous() so the
+    # layout pass inserts the restickify (torch.ops.spyre.restickify is
+    # pass-inserted-only and cannot be traced from user code); widen to fp32,
+    # slice to one stick, take lane 0, cast to int32 (the device index width).
+    idx_stick = idx[..., None].expand(T, K, 64).contiguous()  # [T,K,64] fp16
+    idx_stick = idx_stick.to(torch.float32)
+    idx_addr = idx_stick[..., :32]  # one fp32 stick
+    idx = idx_addr[..., 0].to(torch.int32)  # [T,K] gather index
 
-    # per_expert_scale is applied NOT here but folded into the H-carrying row_out
-    # multiply below. A bare `w * per_expert_scale[idx]` gathers a 1-D [E] source
-    # by idx[T,K] -> [T,K]: the indexed dim lands innermost and there is no
-    # feature axis for indirect-access to sit a stick on, so layout-prop aborts
-    # ("Multi-arg pointwise: no supported output layout, size=[1,8]"). K=8 is not
-    # stick-divisible and there is no same-frame reuse target, so no legal layout
-    # exists for the bare product. Deferring the scale to row_out[T,K,H] (H on the
-    # stick) sidesteps this -- see the pscale gather below.
-
-    # The K rows for one token all read the SAME token embedding, so broadcast
-    # x_expert over the K axis instead of gathering with a flattened index. The
-    # expert-weight gathers take the plain [T,K] index; the compiler builds the
-    # index/value address encoding when it lowers these index_selects.
     with spyre_hint(tiles={"row": tile}):
-        # .contiguous() materializes the K-batch stride. Without it the expand's
-        # stride-0 batch makes the batched-matmul LHS (inp0) drop its batch dim
-        # from layoutDimOrder_, so the backend scheduler's getMinParamBmm sees
-        # inp0_reuse_dim = {mb, out} (size 2) and DT_CHECK(inp0_reuse_dim==1)
-        # aborts at L3DlOpsScheduler.cpp:945. Materializing gives inp0 a real mb
-        # stride -> reuse dim = {out} only.
+        # The K rows for one token read the same embedding, so broadcast over K.
+        # .contiguous() materializes the K-batch stride; without it the matmul
+        # LHS drops its batch dim and the backend scheduler aborts on
+        # inp0_reuse_dim != 1 (L3DlOpsScheduler.cpp:945).
         gathered = x_expert[:, None, :].expand(T, K, H).contiguous()  # [T,K,H]
         W_g = gate_dev[idx]  # [T,K,H,M] on-device index_select
         W_u = up_dev[idx]  # [T,K,H,M]
         W_dn = down_dev[idx]  # [T,K,M,H]
-        # Gate/up as an explicit broadcast-multiply-then-reduce, NOT a matmul and
-        # NOT einsum. Each (t,k) row is a distinct [1,H]x[H,M] product (its own
-        # gathered expert weight), so the batch is (T,K) and the contraction is a
-        # vector x matrix -- there is no shared-weight bmm form, and matmul's only
-        # rank-3-preserving shape needs a unit M-slot. So compute it directly:
-        #   gathered[T,K,H,1] * W_g[T,K,H,M] -> [T,K,H,M], then .sum(dim=2) over H.
-        # .sum(dim=2) is a GENUINE reduction op that physically collapses H, giving
-        # a rank-3 [T,K,M] buffer -- unlike a squeeze/reshape of a matmul's
-        # [T,K,1,M] result, which folds to a VIEW leaving the buffer rank-4 and
-        # tripping "Incompatible host_size and dim_order" (rank_diff=-1) at the
-        # downstream scale pointwise (propagate_layouts.py:1125). It also sidesteps
-        # einsum's internal reshape decomposition, which mis-derives the output as
-        # [T,K,M] over the un-reduced [T,K,H,M] product ("shape '[1,8,704]' invalid
-        # for input of size 15859712" at fake-tensor inference). Verified to compile
-        # through Stage-7 in isolation (/tmp/decode_bmm_probe.py sumreduce: 120
-        # patches, output_size=16896).
-        g = (gathered[..., None] * W_g).sum(dim=2)  # [T,K,H,1]*[T,K,H,M]->sum H->[T,K,M]
+        # Each (t,k) row is a distinct vector x gathered-matrix product with no
+        # shared-weight bmm form. Express it as broadcast-multiply + a GENUINE
+        # .sum reduction: the reduction physically collapses the contracted axis
+        # to a rank-3 buffer, whereas a matmul's [T,K,1,M] result squeezed to
+        # rank-3 stays a rank-4 view and trips "Incompatible host_size and
+        # dim_order" at the downstream scale (and einsum mis-derives the output
+        # shape at fake-tensor inference).
+        g = (gathered[..., None] * W_g).sum(dim=2)  # [T,K,M]
         u = (gathered[..., None] * W_u).sum(dim=2)  # [T,K,M]
-        act = F.gelu(g, approximate="tanh") * u  # [T,K,M] rank-3
-        # Down-proj the same way: act[T,K,M,1] * W_dn[T,K,M,H] -> [T,K,M,H], reduce
-        # M via .sum(dim=2) -> a genuinely rank-3 [T,K,H] buffer directly.
-        row_out = (act[..., None] * W_dn).sum(dim=2)  # [T,K,M,1]*[T,K,M,H]->sum M->[T,K,H]
-        # per_expert_scale gather: give the 1-D [E] source a real 64-wide innermost
-        # feature ([E]->[E,64], value replicated across the stick) so indirect-
-        # access has a stick to sit on, gather -> [T,K,64], recover the per-
-        # (token,expert) scalar via a SAME-FRAME mean over the identical lanes.
-        pes_stick = per_expert_scale[:, None].expand(-1, 64).contiguous()  # [E,64]
-        pscale = pes_stick[idx].mean(-1, keepdim=True)  # [T,K,1]
-        # Fold both scale factors into the H-carrying row_out (H=2816 on the stick);
-        # no bare [T,K] product materializes (that aborts layout-prop size=[1,8]).
-        row_out = row_out * w[..., None] * pscale  # [T,K,H] * [T,K,1] * [T,K,1]
-        # Combine a token's K expert outputs by reducing over the K axis right
-        # here on device. This is the same K-reduction the host index_add used
-        # to do -- token_of_row[t,k]==t sent all K rows of token t to slot t, a
-        # pure per-token sum over K -- but as a plain reduction it needs no
-        # scatter. (An on-device index_add is NOT usable for this: upstream's
-        # spyre_index_add (#3753) is a read-modify-write with a no-duplicate-
-        # index precondition, and the K rows per token are all duplicate index
-        # t, which it gets silently wrong.) Mirrors the persistent path's
-        # proven (down_out * route).sum(dim=0) device reduction.
-        moe_out = row_out.sum(dim=1)  # [T,K,H] -> [T,H]
+        act = F.gelu(g, approximate="tanh") * u  # [T,K,M]
+        row_out = (act[..., None] * W_dn).sum(dim=2)  # [T,K,H]
+        # per_expert_scale arrives host-widened to a sticked [E,64] device tensor
+        # (see dma_moe_per_expert_scale_to_spyre) so indirect access has a stick
+        # to gather; every lane is the same scalar, so slice lane 0 rather than
+        # reduce (a reduction over a gathered stick's innermost dim mis-lowers to
+        # inf on device).
+        pscale = per_expert_scale[idx][..., :1]  # [T,K,1]
+        # Fold both scales into the H-carrying row_out (H on the stick); a bare
+        # [T,K] product has no legal layout (K=8 not stick-divisible).
+        row_out = row_out * w[..., None] * pscale  # [T,K,H]
+        # Combine a token's K expert rows by an on-device reduction over K. A
+        # plain sum, not a scatter: an on-device index_add is unusable here
+        # (spyre_index_add requires no duplicate indices, but all K rows of a
+        # token share index t).
+        moe_out = row_out.sum(dim=1)  # [T,H]
     return moe_out
 
 
 def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_dev, up_dev,
                   down_dev, K, tile, eps):
-    """Loop-on-topk MoE FFN orchestrator (spec Approach A).
+    """Decode loop-on-topk MoE FFN orchestrator.
 
-    Unpacks the router's tensors and calls the compiled loop region (router +
-    gather + on-device expert-weight index_select + bmms, row-tiled), which now
-    also reduces each token's K expert rows over the K axis on device and
-    returns the combined [T,H] output -- no host scatter-combine. The expert
-    stacks are DEVICE-resident here (unlike _moe_ffn_split's host-resident
-    stacks) -- the whole point of Approach A is the on-device select.
-
-    Router surface (preflight-corrected): router.norm has NO .weight; the
-    region applies a scale-free RMSNorm (eps INSIDE sqrt) then the [H]
-    router.scale vector and the router.scalar_root_size float. Pass
-    eps=config.rms_norm_eps.
-
-    Returns the combined [T,H] MoE output on x_expert's device.
+    Unpacks the router's device-resident tensors and calls the compiled loop
+    region, which returns the combined [T,H] output (K reduced on device).
+    Pass eps=config.rms_norm_eps.
     """
-    # The router's proj.weight / scale / per_expert_scale are moved onto the
-    # device in prepare_for_spyre (Approach-A flag branch) so they are already
-    # device-resident here -- pass them straight through as region inputs. The
-    # region returns the combined [T,H] output (K reduced on device), so there
-    # is nothing left to scatter host-side.
     moe_out = compiled_loop(
         x_router,
         x_expert,
         router.proj.weight,
         router.scale,
         router.scalar_root_size,
-        router.per_expert_scale,
+        # Decode gathers per_expert_scale by expert id, so pass the host-widened
+        # sticked [E,64] source, not the 1-D [E] the persistent router uses.
+        router.per_expert_scale_stick,
         gate_dev,
         up_dev,
         down_dev,
@@ -298,72 +192,33 @@ def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_dev, up_dev,
     return moe_out.to(dtype=x_expert.dtype)
 
 
-# ---------------------------------------------------------------------------
-# ALL-DEVICE chunked FFN (spec Approach A, "nothing but glue on host").
-# Gate-A5-proven (gateA5_chunked_ondevice.py, mean_rel=0.028). See the
-# _MOE_CHUNKED_ONDEVICE flag docstring for the two backend workarounds this
-# encodes (topk-pad + mask-reduce/accumulate instead of gather/scatter).
-# ---------------------------------------------------------------------------
-
-
 def _moe_route_padded(x_router, router_proj_w, router_scale,
                       router_scalar_root_size, per_expert_scale, K, eps,
                       pad_w, pad_neg):
-    """All-device router: full dense [T,E] routing-weight (topk-pad fix).
+    """All-device router producing a dense [T,E] routing weight.
 
-    Router surface matches _compiled_moe_loop_region (preflight-corrected): the
-    stock ``router.norm`` is a SCALE-FREE Gemma4RMSNorm (no ``.weight``; eps
-    INSIDE the sqrt) applied to the RAW residual ``x_router``, then the [H]
-    ``router_scale`` vector and the ``router_scalar_root_size`` float, then the
-    router projection.
-
-    topk over a pow2 stick-multiple width (E=128) aborts on-card
-    (``Incorrect chunk size``), so the logits are padded to ``pad_w`` (non-pow2)
-    with ``pad_neg`` (-inf) BEFORE topk; the pad columns never win top-K. Only
-    the kth topk VALUE is used (``wv[..., -1:]``) as a threshold, applied over
-    the ORIGINAL [T,E] probs via ``torch.ops.spyre.index_mask(probs, kth)`` --
-    the fp16 index is never materialized (no ``customops.py`` fp16->int32 CPU
-    fallback). The result is a DENSE [T,E] routing weight: zero for non-selected
-    experts, ``renorm*per_expert_scale`` for the top-K. Downstream expert chunks
-    turn per-expert selection into arithmetic (``(w*onehot[e]).sum``), so no
-    index/gather is needed.
-
-    Args:
-        x_router: RAW flattened residual [T,H] (router's own norm applied here).
-        router_proj_w: Router projection weight [E,H].
-        router_scale: Post-norm gain vector [H] (router.scale).
-        router_scalar_root_size: hidden_size ** -0.5 (Python float).
-        per_expert_scale: Per-expert scale [E] (router.per_expert_scale).
-        K: Top-K experts per token.
-        eps: config.rms_norm_eps (inside the sqrt).
-        pad_w: Padded topk-input width (>E, non-pow2; e.g. 160 for E=128).
-        pad_neg: Pad-column fill (~ -inf fp16; e.g. -30000.0).
-
-    Returns:
-        w: Dense routing weight [T,E] (renormed top-K * per_expert_scale, zero
-           elsewhere), on x_router's device.
+    Router surface matches _compiled_moe_loop_region (scale-free norm on the raw
+    residual, then [H] router_scale, then the root-size float, then proj). topk
+    over the pow2 stick-multiple width E aborts on-card ("Incorrect chunk
+    size"), so the logits are padded to the non-pow2 pad_w with pad_neg (~-inf)
+    before topk; the pad columns never win. keep_by_index keeps probs at the
+    top-K expert coordinates and zeros the rest -- POSITIONAL selection by topk
+    index, so ties at the kth value cannot leak extra experts. Returns the
+    renormed top-K scaled by per_expert_scale, zero elsewhere.
     """
     T, _ = x_router.shape
     E = router_proj_w.shape[0]
-    # scale-free RMSNorm (eps inside sqrt) on the raw residual, then [H] gain.
     var = x_router.pow(2).mean(-1, keepdim=True)
-    normed = x_router * torch.rsqrt(var + eps)
+    normed = x_router * torch.rsqrt(var + eps)  # scale-free RMSNorm
     normed = normed * router_scale * router_scalar_root_size
     probs = torch.softmax(F.linear(normed, router_proj_w), dim=-1)  # [T,E]
-    # topk-pad: widen to a non-pow2 width so the backend tiling stays
-    # stick-aligned; pad cols are -inf -> never selected.
     pad = torch.full((T, pad_w - E), pad_neg, dtype=probs.dtype,
                      device=probs.device)
     padded = torch.cat([probs, pad], dim=-1)  # [T,pad_w]
-    wv, _ = torch.topk(padded, K, dim=-1)  # [T,K]; idx<E, never materialized
-    kth = wv[..., -1:]  # [T,1] kth-largest VALUE threshold
-    # torch.where threshold: keep probs where probs >= kth (the selected top-K
-    # experts), zero the rest. Equivalent to the torch.ops.spyre.index_mask(probs,
-    # kth) device op, which is not yet registered in torch-spyre -- switch to
-    # index_mask once it lands; until then this form traces on-device fine.
-    mask = torch.where(probs >= kth, probs, torch.zeros_like(probs))  # [T,E]
+    _, sel = torch.topk(padded, K, dim=-1)  # [T,K] expert ids (< E)
+    mask = torch.ops.spyre.keep_by_index(probs, sel, -1, 0.0)  # [T,E]
     w = mask / mask.sum(-1, keepdim=True)  # renorm top-K to sum 1
-    return w * per_expert_scale  # [T,E] dense routing weight
+    return w * per_expert_scale  # [T,E]
 
 
 def _moe_route_persistent_packed(
@@ -390,25 +245,22 @@ def _moe_route_persistent_packed(
         pad_w,
         pad_neg,
     )
-    # Materialize the logical expansion first in the router's natural layout,
-    # then use an ordinary BMM to put the broadcast lane on the physical stick.
-    # The semantic values are unchanged because route_identity is I64.
+    # Put the broadcast lane on the physical stick via a BMM against the
+    # identity (values unchanged, route_identity is I64).
     expanded = torch.relu(token_major.unsqueeze(-1).expand(-1, -1, 64))
     return expanded @ route_identity
 
 
 def _moe_expert_persistent(x_expert, routing_weight, gate, up, down, K):
-    """Run the dense expert body as one hinted, ordinary PyTorch program.
+    """Run the dense all-expert body as one coarse-tile-hinted program.
 
-    The dims are declared and each operand is named, then the matmuls run under
-    a coarse-tile ``spyre_hint(num_tiles_per_dim={"E": E})`` (one tile per
-    expert): coarse-tiling emits one expert body inside one counted device loop
-    -- stage ``[T,H]`` once, advance gate/up/down/route per expert, keep the
-    running sum in the LX accumulator, drain once. No custom op.
+    Declares the dims, names each operand, then runs the matmuls under
+    ``spyre_hint(num_tiles_per_dim={"E": E})`` (one tile per expert) so they
+    lower to one counted device loop accumulating over experts.
 
-    Shapes: ``x_expert`` [T,H]; ``gate``/``up`` logical [E,H,M]; ``down`` logical
-    [E,M,H]; ``routing_weight`` [T,E,1]. gate/up/down arrive already in the
-    shared device layout (E outermost, free dim on stick) from prepare_for_spyre.
+    Shapes: x_expert [T,H]; gate/up [E,H,M]; down [E,M,H]; routing_weight
+    [T,E,1]. gate/up/down arrive in the shared device layout (E outermost, free
+    dim on stick) from prepare_for_spyre.
     """
     from torch_spyre._inductor.propagate_hints import spyre_hint
     from torch_spyre._inductor.wsr.propagate_named_dims import (
@@ -428,15 +280,11 @@ def _moe_expert_persistent(x_expert, routing_weight, gate, up, down, K):
         declare_tensor_dim(name, extent)
 
     x_singleton = x_expert.unsqueeze(0)
-    # routing_weight arrives as routing_sticks[..., :1]: a size-1 NARROWING slice
-    # over a physically 64-wide broadcast stick, so its logical [T,E,1] view still
-    # carries the 64-lane strides. Fed into the coarse-tile read-copy that way, the
-    # outermost-dim size derivation (total_elems // stride) under-counts T by the
-    # dropped 64 factor and rejects the T=512 tile. Materialize a genuinely dense,
-    # owned [E,T,1] buffer so the derivation recovers E / T correctly. .contiguous()
-    # alone on the permuted slice can be elided upstream; .clone() forces an owned
-    # contiguous copy.
-    route = routing_weight.permute(1, 0, 2).contiguous().clone()  # [T,E,1]->[E,T,ONE]
+    # routing_weight is a size-1 slice over a 64-wide broadcast stick, so its
+    # [T,E,1] view still carries 64-lane strides and the coarse-tile size
+    # derivation under-counts T. .clone() forces an owned dense [E,T,1] buffer
+    # (.contiguous() alone can be elided upstream).
+    route = routing_weight.permute(1, 0, 2).contiguous().clone()  # [E,T,ONE]
     name_tensor_dims(x_expert, ["T", "H"])
     name_tensor_dims(gate, ["E", "H", "M"])
     name_tensor_dims(up, ["E", "H", "M"])
@@ -463,7 +311,7 @@ def _moe_ffn_persistent(
     K,
     eps,
 ):
-    """Run PR293 routing once, then one persistent all-expert value path."""
+    """Route once, then run the persistent all-expert value path (prefill)."""
     from torch_spyre._inductor import config as spyre_config
 
     routing_sticks = compiled_route(
@@ -478,9 +326,7 @@ def _moe_ffn_persistent(
         _MOE_PAD_NEG,
         route_identity,
     )
-    # The semantic op consumes logical [T,E,1]. Lane zero is a zero-copy view
-    # over one full broadcast stick per token/expert scalar.
-    routing_weight = routing_sticks[..., :1]
+    routing_weight = routing_sticks[..., :1]  # zero-copy lane-0 view, [T,E,1]
     with spyre_config.patch(
         {
             "sencores": 32,
@@ -499,38 +345,21 @@ def _moe_ffn_persistent(
 
 
 class Gemma4MoEBlock(nn.Module):
-    """Registered Gemma 4 **MoE** decoder block used by the Spyre adapter.
+    """Registered Gemma 4 MoE decoder block.
 
-    Mirrors the dense ``hf_gemma4.Gemma4Block`` (same class shape, same 7-arg
-    ``cache_index`` call signature, same ``layer_scalar`` buffer idiom) but its
-    ``forward`` reproduces the ``enable_moe_block=True`` branch of the stock
-    ``Gemma4TextDecoderLayer.forward``: a dense MLP **in parallel** with a
-    top-K MoE FFN, combined ``post_feedforward_layernorm(h_dense + h_moe)``.
+    Mirrors the dense ``hf_gemma4.Gemma4Block`` (same class shape, 7-arg call
+    signature, ``layer_scalar`` idiom) but its forward reproduces the
+    ``enable_moe_block=True`` branch of ``Gemma4TextDecoderLayer.forward``: a
+    dense MLP in parallel with a top-K MoE FFN, combined via
+    ``post_feedforward_layernorm(h_dense + h_moe)``.
 
-    Attention is the upstream ``Gemma4Attention`` module composed VERBATIM
-    (exactly as ``Gemma4Block`` does), so KV handling (in-place
-    ``kv_cache_update`` indirect scatter, #330) is the same code path the dense
-    adapter is tested on. The block is NOT a single ``torch.compile`` — the MoE
-    routing is host-side in the default/split mode — so it composes several
-    per-region ``torch.compile`` handles built once in ``__init__``:
-
-        # attention half -> post-attn-norm sandwich -> residual add
-        residual = h
-        h_dense = post_feedforward_layernorm_1(mlp(pre_feedforward_layernorm(h)))
-        flat    = residual.reshape(-1, H)          # RAW residual
-        # router reads flat (its own scale-free norm inside the FFN region);
-        # experts read a SEPARATE pre_ff_ln_2 norm of the same flat.
-        h_moe   = post_feedforward_layernorm_2(<ffn mode>(flat, pre_ff_ln_2(flat), ...))
-        h       = post_feedforward_layernorm(h_dense + h_moe)
-        h       = residual + h
-        h       = h * layer_scalar
-
-    The pre/post ``_2`` norms run on-device on the flattened ``[T,H]`` tensor;
-    the router's internal norm runs on the raw ``flat`` (NOT the pre_ff_ln_2
-    output), so the host only ever sees the small routing tensors plus the
-    ``[T*K,H]`` gathered / expert-out buffers. Mode-specific expert weights
-    (set by ``prepare_for_spyre``) are read fresh from ``self`` at call time,
-    the same call-time-read rule the dense block uses for ``layer_scalar``.
+    Attention is ``Gemma4Attention`` composed verbatim (same KV path the dense
+    adapter is tested on). The block is not a single ``torch.compile`` -- the
+    dense MLP and the two FFN-phase regions are each compiled once in
+    ``__init__`` and dispatched per forward. The router reads the RAW flattened
+    residual (its own norm is inside the FFN region); the experts read a
+    SEPARATE pre_ff_ln_2 norm of that residual. Expert weights (set by
+    ``prepare_for_spyre``) are read fresh off ``self`` at call time.
     """
 
     def __init__(self, layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
@@ -557,17 +386,11 @@ class Gemma4MoEBlock(nn.Module):
             layer.layer_scalar,
             persistent="layer_scalar" not in layer._non_persistent_buffers_set,
         )
-        # Captured knobs. K + eps are per-layer scalars; the mode-specific
-        # expert stacks are read fresh off ``self`` at call time (populated by
-        # prepare_for_spyre), NOT captured here.
         self._moe_k = layer._spyre_moe_k
-        # Gemma4RMSNorm exposes ``.eps`` (== config.rms_norm_eps).
         self._moe_rms_eps = self.pre_feedforward_layernorm_2.eps
 
-        # Compiled device regions (built once per block). The dense MLP is
-        # compiled as its own region so the dense branch lowers; the router,
-        # gather, expert GEMM, loop, and per-chunk regions are each compiled
-        # for whichever FFN mode is active.
+        # Compiled device regions, built once: dense MLP, plus the prefill
+        # (persistent) and decode (loop) FFN regions.
         self._compiled_mlp = torch.compile(self.mlp, dynamic=False)
         self._compiled_loop = torch.compile(
             _compiled_moe_loop_region, dynamic=False
@@ -611,20 +434,14 @@ class Gemma4MoEBlock(nn.Module):
             self._compiled_mlp(self.pre_feedforward_layernorm(residual))
         )
 
-        # Sparse branch: the router reads the RAW flattened residual (its own
-        # scale-free norm is applied inside the FFN region), while the experts
-        # consume a SEPARATE pre_ff_ln_2 normalization of that same residual
-        # (stock modeling_gemma4.py). Thread them as two tensors so the router
-        # input is not double-normalized. The per-layer expert weights
-        # (mode-specific layout, set by prepare_for_spyre) are read fresh off
-        # ``self`` at call time (like the dense block's layer_scalar).
+        # Sparse branch: the router reads the RAW residual (its own norm is
+        # inside the FFN region); the experts read a SEPARATE pre_ff_ln_2 norm
+        # of that same residual. Thread both so the router isn't
+        # double-normalized.
         flat = residual.reshape(-1, hidden)  # [T,H] RAW -> router
         x_moe = self.pre_feedforward_layernorm_2(flat)  # [T,H] normed -> experts
-        # Phase dispatch: prefill (seq_len > 1) runs the dense all-experts
-        # persistent path; decode (seq_len == 1) runs the loop-on-topk gather
-        # path. Both compiled regions and both expert-weight sets are built once
-        # (prepare_for_spyre / __init__); the choice is per-forward by shape, not
-        # an import-time flag.
+        # Phase dispatch by shape: prefill runs the persistent all-experts path,
+        # decode the loop-on-topk gather path.
         if seq_len > 1:
             moe_out = _moe_ffn_persistent(
                 flat,
@@ -662,29 +479,14 @@ class Gemma4MoEBlock(nn.Module):
 
 
 def prepare_for_spyre(model):
-    """Apply Spyre adaptations to a Gemma 4 **MoE** causal-LM model in-place.
+    """Apply Spyre adaptations to a Gemma 4 MoE causal-LM in-place.
 
-    Reuses the shared attention-side prep (``_setup_gemma4_text_decoder``:
-    RMSNorm patch, per-type RoPE, KV shapes, ``pad_lm_head``) and adds the MoE
-    layout / bring-up steps:
-
-      * assert ``enable_moe_block=True`` and use the checkpoint's real
-        ``top_k_experts`` (asserting only the Spyre topk ceiling ``<= 128``);
-      * de-fuse ``gate_up`` into ``gate``/``up`` and lay each of the three
-        packed expert weights out in ONE SHARED device layout, expert-dim-
-        outermost with the free dim on the stick (``gate``/``up``
-        ``[E,2M,H]``-derived -> ``[E,H,M]``, ``down`` ``[E,H,M]`` ->
-        ``[E,M,H]``; shape rule 2 + spec §3.5), via
-        ``dma_moe_expert_weight_to_spyre``. This single set is simultaneously
-        the gather-source layout (expert dim outermost, consumed by the decode
-        loop-on-topk index_select) and the matmul weight-operand layout
-        (sticked on the free dim, consumed by the prefill persistent
-        hint-body) -- both FFN paths read the SAME device-resident
-        ``layer._spyre_gate`` / ``_spyre_up`` / ``_spyre_down``; router weights
-        are also device-resident. Only ONE weight set is ever materialized
-        (no dual/mode-dependent copies), so it fits the card; the original
-        ``gate_up_proj`` / ``down_proj`` parameters are deleted;
-      * build ``model._spyre_compiled_blocks`` from the MoE block factory.
+    Reuses the shared attention-side prep (``_setup_gemma4_text_decoder``) and
+    adds the MoE steps: assert ``enable_moe_block=True`` and the topk ceiling;
+    de-fuse ``gate_up`` into ``gate``/``up`` and lay all three out in one shared
+    device layout (expert dim outermost, free dim on stick) read by both FFN
+    paths; move the router weights to device; build
+    ``model._spyre_compiled_blocks``.
     """
     backbone = _gemma4_backbone(model)
     cfg = text_config(model.config)
@@ -693,25 +495,19 @@ def prepare_for_spyre(model):
         "hf_gemma4_moe requires an MoE checkpoint (enable_moe_block=True); "
         "use hf_gemma4 for the dense variants."
     )
-    # Use the checkpoint's real top_k_experts (no bring-up pin). The Spyre topk
-    # reduction serves up to k=128 (torch-spyre #3782), so only assert that
-    # ceiling; the router's topk and the device value path both run at this K.
     moe_k = int(cfg.top_k_experts)
     assert 1 <= moe_k <= _MOE_MAX_K, (
         f"top_k_experts ({moe_k}) must be in [1, {_MOE_MAX_K}]; the Spyre topk "
         f"reduction caps k at {_MOE_MAX_K}."
     )
-    # The expert SwiGLU hardcodes gelu(approximate="tanh") to match this
-    # checkpoint's hidden_activation. Guard so a variant with a different
-    # activation fails loudly instead of computing silently-wrong output.
+    # The expert SwiGLU hardcodes gelu(approximate="tanh"); guard so a variant
+    # with a different activation fails loudly.
     act_fn = getattr(cfg, "hidden_activation", None)
     assert act_fn == "gelu_pytorch_tanh", (
         "hf_gemma4_moe expert SwiGLU is fixed to gelu(approximate='tanh'); "
         f"config hidden_activation={act_fn!r} is unsupported."
     )
 
-    # The router pads its logits to a non-pow2 width before topk (topk-pad fix,
-    # shared by the prefill persistent router and the decode loop router).
     E = cfg.num_experts
     assert _MOE_PADW > E and (_MOE_PADW & (_MOE_PADW - 1)) != 0, (
         f"_MOE_PADW ({_MOE_PADW}) must exceed num_experts ({E}) and be "
@@ -722,42 +518,12 @@ def prepare_for_spyre(model):
         _setup_gemma4_text_decoder(model, allow_moe=True)
     )
 
-    # Lay out expert weights: expert-dim-outermost (already, [E,...]) and
-    # PRE-TRANSPOSED so the compiled expert region needs no in-kernel transpose
-    # of a large weight (shape rule 2).
-    #
-    # The pre-transposed expert stacks are kept on the HOST (CPU), NOT moved to
-    # the device, for two reasons that both surfaced on-card at 26B:
-    #
-    #   1. The per-row weight select ``gate_up_t[row_expert]`` is an eager
-    #      ``aten::index.Tensor`` — unsupported on the spyre backend
-    #      (``NotImplementedError``). Only plain ``gather``/``bmm`` lower
-    #      (spec §2.1); fancy indexing must run on CPU. Gate 2 selects on host
-    #      for exactly this reason, then moves the ``[N,·]`` slice to the device.
-    #   2. Even if the select lowered, keeping all 128 experts × 30 layers
-    #      resident is ~46 GB fp16; the [N,H,2M]/[N,M,H] per-row gathers plus
-    #      the rest of the model exhaust the card (FlexAllocator OOM).
-    #
-    # They are stored as PLAIN ATTRIBUTES (not ``register_buffer``) so
-    # ``_move_to_spyre_with_layout``'s ``named_buffers()`` sweep never moves them
-    # to the device — they stay on CPU. ``_moe_ffn_split`` selects the per-row
-    # weights here on the host and moves only the small ``[N,·]`` slices to the
-    # device for the compiled expert GEMM. The ORIGINAL ``gate_up_proj`` /
-    # ``down_proj`` parameters are deleted (the stock ``Gemma4TextExperts.forward``
-    # never runs; the split FFN uses only the transposed CPU stacks), so the
-    # experts are not paid for twice on the host either.
-    # One pass per layer: build the MoE block (composing upstream Gemma4Attention
-    # verbatim), attach its mode-specific expert weights, register it back into
-    # ``backbone.layers[i]`` (so ``_run_blocks_over_embeds`` can read
-    # ``layer_scalar`` off it, exactly as ``prepare_gemma4_blocks`` does for the
-    # dense path), and compile it. The expert-weight layout below targets the
-    # BLOCK instance (``block._spyre_*``), read fresh by ``Gemma4MoEBlock.forward``
-    # — the same call-time-read rule the dense block uses for ``layer_scalar``.
+    # One pass per layer: build the MoE block, attach its device-resident expert
+    # weights, register it back into backbone.layers[i] (so
+    # _run_blocks_over_embeds reads layer_scalar off it), and collect it.
     compiled_blocks = []
     for i, layer in enumerate(list(backbone.layers)):
-        # Stash the checkpoint's K on the layer so Gemma4MoEBlock.__init__ can
-        # capture it (validated <= _MOE_MAX_K above).
-        layer._spyre_moe_k = moe_k
+        layer._spyre_moe_k = moe_k  # captured by Gemma4MoEBlock.__init__
         block = Gemma4MoEBlock(
             layer,
             num_q_heads_per_layer[i],
@@ -771,17 +537,10 @@ def prepare_for_spyre(model):
         down_t = experts.down_proj.data.transpose(1, 2).contiguous()
         del experts.gate_up_proj
         del experts.down_proj
-        # The router is shared between ``layer`` and ``block`` (composed as
-        # ``self.router = layer.router``), so router-weight moves below apply to
-        # the block's router too.
-        router = block.router
-        # ONE shared expert-weight set, read by BOTH the prefill persistent
-        # hint-body and the decode loop-on-topk gather. De-fuse gate_up into
-        # separate gate/up, then lay each out E-outermost with the free dim on
-        # the stick (dma_moe_expert_weight_to_spyre): simultaneously the
-        # gather-source layout (expert dim outermost) and the matmul
-        # weight-operand layout (sticked on free dim). ~42.5 GiB / 30 layers
-        # (one set, not two) -- fits the card.
+        router = block.router  # shared with layer; moves below apply to both
+        # De-fuse gate_up and lay all three out E-outermost with the free dim on
+        # the stick (dma_moe_expert_weight_to_spyre): one shared set read by both
+        # FFN paths, ~42.5 GiB / 30 layers.
         M = gate_up_t.shape[2] // 2
         gate_l = gate_up_t[:, :, :M].contiguous()  # [E,H,M]
         up_l = gate_up_t[:, :, M:].contiguous()  # [E,H,M]
@@ -789,7 +548,7 @@ def prepare_for_spyre(model):
         block._spyre_up = dma_moe_expert_weight_to_spyre(up_l)  # [E,H,M]
         block._spyre_down = dma_moe_expert_weight_to_spyre(down_t)  # [E,M,H]
         # Fall back to a plain device move if the free dim doesn't tile into
-        # sticks (should not happen for gemma-4: M=704, H=2816 both divide 64).
+        # sticks (won't happen for gemma-4: M=704, H=2816 both divide 64).
         if block._spyre_gate is None:
             block._spyre_gate = gate_l.to("spyre")
         if block._spyre_up is None:
@@ -797,49 +556,45 @@ def prepare_for_spyre(model):
         if block._spyre_down is None:
             block._spyre_down = down_t.to("spyre")
 
-        # Persistent routing identity (unrelated to expert-weight layout; the
-        # packed router expands its one-hot rows against this eye).
+        # Identity the packed router BMMs against to move the broadcast lane
+        # onto the stick.
         block._spyre_persistent_route_identity = torch.eye(
             64, dtype=gate_up_t.dtype
         ).to("spyre")
 
-        # The router runs on-device in BOTH paths (scale-free norm + [H] scale +
-        # proj + padded topk + per_expert_scale gather), so its weights must be
-        # device-resident. Reassign the Parameter object (a cross-backend
-        # ``param.data = ...`` set_data raises on the type change). Done once here
-        # -- both methods share this router. router.scalar_root_size is a Python
-        # float (no move).
+        # The router runs on-device in both paths, so its weights must be
+        # device-resident. Reassign the Parameter (cross-backend param.data=...
+        # raises on the type change). scalar_root_size is a float (no move).
         router.proj.weight = torch.nn.Parameter(
             router.proj.weight.data.to("spyre"), requires_grad=False
         )
         router.scale = torch.nn.Parameter(
             router.scale.data.to("spyre"), requires_grad=False
         )
+        # per_expert_scale is used two ways: the prefill router broadcasts the
+        # 1-D [E] tensor ([T,E]*[E]); the decode loop gathers it by expert id,
+        # which needs a sticked [E,64] source (widening [E]->[E,64] in-graph is a
+        # broadcast-into-stick the layout pass can't express, so widen on host).
+        pes_cpu = router.per_expert_scale.data  # still on host here
+        pes_stick = dma_moe_per_expert_scale_to_spyre(pes_cpu)
+        if pes_stick is None:
+            pes_stick = pes_cpu[:, None].expand(-1, 64).contiguous().to("spyre")
         router.per_expert_scale = torch.nn.Parameter(
-            router.per_expert_scale.data.to("spyre"), requires_grad=False
+            pes_cpu.to("spyre"), requires_grad=False
+        )
+        router.per_expert_scale_stick = torch.nn.Parameter(
+            pes_stick, requires_grad=False
         )
 
-        # Register the block back into the backbone (so _run_blocks_over_embeds
-        # reads layer_scalar off it), then append the EAGER block to the
-        # compiled-blocks list. Unlike the dense Gemma4Block (a pure-device
-        # forward that prepare_gemma4_blocks wraps in torch.compile), the MoE
-        # block's forward is a HYBRID: eager host orchestration (topk/argsort/
-        # index_add/chunk-loop glue, all outside any spyre graph per the
-        # all-device Global Constraint) around several inner torch.compile'd
-        # device regions built in __init__. Wrapping the whole block in
-        # torch.compile would try to trace that host work into one spyre graph.
-        # So _run_blocks_over_embeds invokes the eager block, which dispatches to
-        # its inner compiled regions.
+        # The block's forward is eager glue that dispatches to the inner
+        # compiled device regions (per-phase); it is not itself torch.compile'd,
+        # so register the block as-is and invoke it directly.
         backbone.layers[i] = block
         compiled_blocks.append(block)
 
     model._spyre_compiled_blocks = compiled_blocks
 
 
-# ``_run_backbone_forward`` and ``_run_forward`` are NOT defined here — they are
-# re-exported from ``hf_gemma4`` (see the import block at the top of this file).
-# Since #350 both are block-AGNOSTIC: they drive ``model._spyre_compiled_blocks``
-# and read ``layer_scalar`` off each registered block, so the MoE blocks slot in
-# with no MoE-specific forward. This removes the last carrier of the pre-#330
-# ``is_filling/token_index/cache_position`` triple and guarantees the MoE forward
-# tracks any future dense-forward change.
+# _run_backbone_forward / _run_forward are re-exported from hf_gemma4 (see the
+# top import block); they are block-agnostic, so the MoE blocks need no
+# MoE-specific forward.
