@@ -50,13 +50,11 @@ def _router_probs(x, weight, scale, root_size, eps):
     return torch.softmax(F.linear(x * scale * root_size, weight), dim=-1)
 
 
-def _select_experts(probs, top_k):
+def _topk(probs, top_k):
     tokens = probs.shape[0]
     topk_input = probs.expand(2, -1).contiguous() if tokens == 1 else probs
     weights, expert_indices = torch.topk(topk_input, top_k, dim=-1)
-    weights = weights[:tokens]
-    expert_indices = expert_indices[:tokens]
-    return weights / weights.sum(-1, keepdim=True), expert_indices
+    return weights[:tokens], expert_indices[:tokens]
 
 
 def _compiled_moe_loop_region(
@@ -84,7 +82,8 @@ def _compiled_moe_loop_region(
         router_scalar_root_size,
         eps,
     )
-    weights, expert_indices = _select_experts(probs, top_k)
+    weights, expert_indices = _topk(probs, top_k)
+    weights = weights / weights.sum(-1, keepdim=True)
 
     # Widen topk's fp16 indices onto a stick before converting them to the
     # device's int32 gather indices. The layout pass inserts the restickify.
@@ -132,7 +131,7 @@ def _moe_route_persistent_packed(
         router_scalar_root_size,
         eps,
     )
-    _, selected = _select_experts(probs, top_k)
+    _, selected = _topk(probs, top_k)
     weights = torch.ops.spyre.keep_by_index(probs, selected, -1, 0.0)
     weights = weights / weights.sum(-1, keepdim=True)
     weights = weights * per_expert_scale
@@ -145,30 +144,32 @@ def _moe_route_persistent_packed(
 def _moe_expert_persistent(x_expert, routing_weight, gate, up, down):
     """Evaluate every expert and sum their routed outputs on device."""
     from torch_spyre._inductor.propagate_hints import spyre_hint
-    from torch_spyre._inductor.wsr.propagate_named_dims import (
-        declare_tensor_dim,
-        name_tensor_dims,
-    )
 
     experts, hidden, intermediate = gate.shape
     tokens = x_expert.shape[0]
-    for name, extent in (
-        ("E", experts),
-        ("T", tokens),
-        ("H", hidden),
-        ("M", intermediate),
-        ("ONE", 1),
-    ):
-        declare_tensor_dim(name, extent)
 
     # clone() turns the stick slice into an owned dense [E,T,1] buffer.
     x = x_expert.unsqueeze(0)
     route = routing_weight.permute(1, 0, 2).contiguous().clone()
-    name_tensor_dims(x_expert, ["T", "H"])
-    name_tensor_dims(gate, ["E", "H", "M"])
-    name_tensor_dims(up, ["E", "H", "M"])
-    name_tensor_dims(down, ["E", "M", "H"])
-    name_tensor_dims(route, ["E", "T", "ONE"])
+    if x_expert.device.type == "spyre":
+        from torch_spyre._inductor.wsr.propagate_named_dims import (
+            declare_tensor_dim,
+            name_tensor_dims,
+        )
+
+        for name, extent in (
+            ("E", experts),
+            ("T", tokens),
+            ("H", hidden),
+            ("M", intermediate),
+            ("ONE", 1),
+        ):
+            declare_tensor_dim(name, extent)
+        name_tensor_dims(x_expert, ["T", "H"])
+        name_tensor_dims(gate, ["E", "H", "M"])
+        name_tensor_dims(up, ["E", "H", "M"])
+        name_tensor_dims(down, ["E", "M", "H"])
+        name_tensor_dims(route, ["E", "T", "ONE"])
 
     with spyre_hint(num_tiles_per_dim={"E": experts}, work_div={"T": 32}):
         gate_out = torch.matmul(x, gate)

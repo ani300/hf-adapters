@@ -38,7 +38,7 @@ from hf_adapters.hf_gemma4_moe import (
     _moe_expert_persistent,
     _moe_route_persistent_packed,
     _prepare_experts,
-    _select_experts,
+    _topk,
 )
 
 _DTYPE = torch.float16
@@ -179,7 +179,7 @@ def test_prefill_route_packed_selects_and_broadcasts():
     assert (routing_sticks[..., 0] > 0).sum(-1).tolist() == [K] * T
 
 
-def test_prefill_expert_persistent_matches_dense_reference():
+def test_prefill_expert_persistent_matches_dense_reference(monkeypatch):
     """``_moe_expert_persistent`` == routing-weighted sum over ALL experts.
 
     The persistent path runs every expert densely and folds in the [T,E,1]
@@ -192,6 +192,18 @@ def test_prefill_expert_persistent_matches_dense_reference():
     up = torch.randn(E, H, M, dtype=_DTYPE)
     down = torch.randn(E, M, H, dtype=_DTYPE)
     routing_weight = torch.rand(T, E, 1, dtype=_DTYPE)  # renormed/masked upstream
+
+    def fail_on_named_dim_registration(*args, **kwargs):
+        raise AssertionError("CPU eager execution registered Spyre named dimensions")
+
+    monkeypatch.setattr(
+        "torch_spyre._inductor.wsr.propagate_named_dims.declare_tensor_dim",
+        fail_on_named_dim_registration,
+    )
+    monkeypatch.setattr(
+        "torch_spyre._inductor.wsr.propagate_named_dims.name_tensor_dims",
+        fail_on_named_dim_registration,
+    )
 
     got = _moe_expert_persistent(x_expert, routing_weight, gate, up, down)
 
@@ -255,9 +267,8 @@ def test_single_token_topk_matches_direct_topk():
     logits = torch.arange(128, dtype=_DTYPE)[None] / 16
     probs = torch.softmax(logits, dim=-1)
 
-    weights, indices = _select_experts(probs, 8)
+    weights, indices = _topk(probs, 8)
     ref_weights, ref_indices = torch.topk(probs, 8, dim=-1)
-    ref_weights = ref_weights / ref_weights.sum(-1, keepdim=True)
 
     torch.testing.assert_close(weights, ref_weights)
     assert torch.equal(indices, ref_indices)

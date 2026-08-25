@@ -20,7 +20,7 @@ from hf_adapters.hf_gemma4_moe import (
     _STICK_SIZE,
     _moe_route_persistent_packed,
     _router_probs,
-    _select_experts,
+    _topk,
 )
 
 pytestmark = pytest.mark.requires_spyre
@@ -55,7 +55,8 @@ def test_decode_router_real_shape():
 
     def route(x, proj, router_scale):
         probabilities = _router_probs(x, proj, router_scale, 1.0, 1e-6)
-        return _select_experts(probabilities, _TOP_K)
+        topk_weights, indices = _topk(probabilities, _TOP_K)
+        return topk_weights / topk_weights.sum(-1, keepdim=True), indices
 
     actual_weights, actual_indices = torch.compile(route, dynamic=False)(
         inputs.to("spyre"), weights.to("spyre"), scale.to("spyre")
