@@ -89,8 +89,8 @@ def _compiled_moe_loop_region(
     # device's int32 gather indices. The layout pass inserts the restickify.
     index_stick = expert_indices[..., None].expand(T, top_k, _STICK_SIZE).contiguous()
     index_stick = index_stick.to(torch.float32)
-    index_address = index_stick[..., : _STICK_SIZE // 2]
-    expert_indices = index_address[..., 0].to(torch.int32)
+    index_address = index_stick[..., : _STICK_SIZE // 2].to(torch.int32)
+    expert_indices = index_address[..., 0]
 
     with spyre_hint(tiles={"row": tile}):
         rows = T * top_k

@@ -15,9 +15,14 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from torch_spyre.model_utils import (
+    dma_moe_expert_weight_to_spyre,
+    dma_moe_per_expert_scale_to_spyre,
+)
 
 from hf_adapters.hf_gemma4_moe import (
     _STICK_SIZE,
+    _compiled_moe_loop_region,
     _moe_route_persistent_packed,
     _router_probs,
     _topk,
@@ -66,6 +71,52 @@ def test_decode_router_real_shape():
         actual_weights.cpu(), expected_weights, atol=1e-2, rtol=1e-2
     )
     assert torch.equal(actual_indices.cpu().to(torch.int64), expected_indices)
+
+
+def test_decode_moe_matches_cpu():
+    hidden, experts, intermediate, top_k = 64, 16, 64, 8
+    inputs = torch.ones(1, hidden, dtype=_DTYPE)
+    levels = torch.arange(experts, dtype=_DTYPE) / 16
+    router_weight = levels[:, None].expand(experts, hidden).contiguous() / hidden
+    router_scale = torch.ones(hidden, dtype=_DTYPE)
+    expert_input = torch.randn(1, hidden, dtype=_DTYPE) * 0.1
+    expert_scale = torch.rand(experts, dtype=_DTYPE) + 0.5
+    expert_scale_stick = expert_scale[:, None].expand(-1, _STICK_SIZE).contiguous()
+    gate = torch.randn(experts, hidden, intermediate, dtype=_DTYPE) * 0.05
+    up = torch.randn(experts, hidden, intermediate, dtype=_DTYPE) * 0.05
+    down = torch.randn(experts, intermediate, hidden, dtype=_DTYPE) * 0.05
+
+    args = (
+        inputs,
+        expert_input,
+        router_weight,
+        router_scale,
+        1.0,
+        expert_scale_stick,
+        gate,
+        up,
+        down,
+        top_k,
+        32,
+        1e-6,
+    )
+    expected = _compiled_moe_loop_region(*args)
+    actual = torch.compile(_compiled_moe_loop_region, dynamic=False)(
+        inputs.to("spyre"),
+        expert_input.to("spyre"),
+        router_weight.to("spyre"),
+        router_scale.to("spyre"),
+        1.0,
+        dma_moe_per_expert_scale_to_spyre(expert_scale),
+        dma_moe_expert_weight_to_spyre(gate),
+        dma_moe_expert_weight_to_spyre(up),
+        dma_moe_expert_weight_to_spyre(down),
+        top_k,
+        32,
+        1e-6,
+    ).cpu()
+
+    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
 
 
 def test_prefill_router_real_shape():
