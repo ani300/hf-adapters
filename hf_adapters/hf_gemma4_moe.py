@@ -19,16 +19,21 @@ dense MLP in parallel with a top-K MoE FFN. Everything attention-side is shared
 with the dense ``hf_gemma4`` adapter; this module adds only the sparse FFN and
 its block/prepare/forward wiring. All MoE compute runs on device.
 
-The FFN has two device formulations, chosen per forward by sequence length:
+The FFN has two device formulations, chosen per forward by sequence length
+directly in ``Gemma4MoEBlock.forward``:
 
-  * prefill (``seq_len > 1``, ``_moe_ffn_persistent``): route once, then run the
-    dense all-expert value path under a coarse-tile
-    ``spyre_hint(num_tiles_per_dim={"E": E})`` so it lowers to one counted
-    device loop that accumulates over experts.
-  * decode (``seq_len == 1``, ``_moe_ffn_loop``): experts stay HBM-resident;
-    the top-K rows are gathered on-device by expert id, run through the
-    per-row expert GEMM in ``[T,K,·]`` batch form, and combined by an on-device
-    reduction over K.
+  * prefill (``seq_len > 1``): route once (``_moe_route_persistent_packed``),
+    then run the dense all-expert value path (``_moe_expert_persistent``) under
+    a coarse-tile ``spyre_hint(num_tiles_per_dim={"E": E})`` so it lowers to one
+    counted device loop that accumulates over experts.
+  * decode (``seq_len == 1``, ``_compiled_moe_loop_region``): experts stay
+    HBM-resident; the top-K rows are gathered on-device by expert id, run
+    through the per-row expert GEMM in ``[T,K,·]`` batch form, and combined by
+    an on-device reduction over K.
+
+Each of those three is compiled once in ``Gemma4MoEBlock.__init__`` and called
+inline from ``forward``; the router surface lives inside every region so the
+raw residual is routed without double-normalization.
 
 Both paths read the same single expert-weight set (~42.5 GiB / 30 layers), laid
 out expert-dim-outermost with the free dim on the stick by
@@ -41,6 +46,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre.model_utils import (
     dma_moe_expert_weight_to_spyre,
     dma_moe_per_expert_scale_to_spyre,
@@ -103,8 +109,8 @@ def _compiled_moe_loop_region(
     ``hidden_size ** -0.5`` (float); eps is config.rms_norm_eps.
 
     gate_dev/up_dev [E,H,M], down_dev [E,M,H], E outermost -- the shared layout
-    _moe_ffn_persistent reads. tile must be >= 2 (single-row gather SIGABRTs).
-    Returns [T,H].
+    _moe_expert_persistent reads. tile must be >= 2 (single-row gather
+    SIGABRTs). Returns [T,H].
     """
     from torch_spyre._inductor.propagate_hints import spyre_hint
 
@@ -165,37 +171,19 @@ def _compiled_moe_loop_region(
     return moe_out
 
 
-def _moe_ffn_loop(x_router, x_expert, router, compiled_loop, gate_dev, up_dev,
-                  down_dev, K, tile, eps):
-    """Decode loop-on-topk MoE FFN orchestrator.
-
-    Unpacks the router's device-resident tensors and calls the compiled loop
-    region, which returns the combined [T,H] output (K reduced on device).
-    Pass eps=config.rms_norm_eps.
-    """
-    moe_out = compiled_loop(
-        x_router,
-        x_expert,
-        router.proj.weight,
-        router.scale,
-        router.scalar_root_size,
-        # Decode gathers per_expert_scale by expert id, so pass the host-widened
-        # sticked [E,64] source, not the 1-D [E] the persistent router uses.
-        router.per_expert_scale_stick,
-        gate_dev,
-        up_dev,
-        down_dev,
-        K,
-        tile,
-        eps,
-    )
-    return moe_out.to(dtype=x_expert.dtype)
-
-
-def _moe_route_padded(x_router, router_proj_w, router_scale,
-                      router_scalar_root_size, per_expert_scale, K, eps,
-                      pad_w, pad_neg):
-    """All-device router producing a dense [T,E] routing weight.
+def _moe_route_persistent_packed(
+    x_router,
+    router_proj_w,
+    router_scale,
+    router_scalar_root_size,
+    per_expert_scale,
+    K,
+    eps,
+    pad_w,
+    pad_neg,
+    route_identity,
+):
+    """All-device prefill router: one broadcast-ready stick per route scalar.
 
     Router surface matches _compiled_moe_loop_region (scale-free norm on the raw
     residual, then [H] router_scale, then the root-size float, then proj). topk
@@ -203,8 +191,10 @@ def _moe_route_padded(x_router, router_proj_w, router_scale,
     size"), so the logits are padded to the non-pow2 pad_w with pad_neg (~-inf)
     before topk; the pad columns never win. keep_by_index keeps probs at the
     top-K expert coordinates and zeros the rest -- POSITIONAL selection by topk
-    index, so ties at the kth value cannot leak extra experts. Returns the
-    renormed top-K scaled by per_expert_scale, zero elsewhere.
+    index, so ties at the kth value cannot leak extra experts. The renormed
+    top-K (scaled by per_expert_scale, zero elsewhere) is then broadcast onto a
+    physical stick via a BMM against route_identity (I64) so the persistent
+    expert path can read it lane-major. Returns [T,E,64].
     """
     T, _ = x_router.shape
     E = router_proj_w.shape[0]
@@ -218,33 +208,7 @@ def _moe_route_padded(x_router, router_proj_w, router_scale,
     _, sel = torch.topk(padded, K, dim=-1)  # [T,K] expert ids (< E)
     mask = torch.ops.spyre.keep_by_index(probs, sel, -1, 0.0)  # [T,E]
     w = mask / mask.sum(-1, keepdim=True)  # renorm top-K to sum 1
-    return w * per_expert_scale  # [T,E]
-
-
-def _moe_route_persistent_packed(
-    x_router,
-    router_proj_w,
-    router_scale,
-    router_scalar_root_size,
-    per_expert_scale,
-    K,
-    eps,
-    pad_w,
-    pad_neg,
-    route_identity,
-):
-    """Produce one broadcast-ready stick per token/expert route scalar."""
-    token_major = _moe_route_padded(
-        x_router,
-        router_proj_w,
-        router_scale,
-        router_scalar_root_size,
-        per_expert_scale,
-        K,
-        eps,
-        pad_w,
-        pad_neg,
-    )
+    token_major = w * per_expert_scale  # [T,E]
     # Put the broadcast lane on the physical stick via a BMM against the
     # identity (values unchanged, route_identity is I64).
     expanded = torch.relu(token_major.unsqueeze(-1).expand(-1, -1, 64))
@@ -296,52 +260,6 @@ def _moe_expert_persistent(x_expert, routing_weight, gate, up, down, K):
         activated = F.gelu(gate_out, approximate="tanh") * up_out
         down_out = torch.matmul(activated, down)  # [E,T,M]@[E,M,H]->[E,T,H]
         return (down_out * route).sum(dim=0)  # [T,H]
-
-
-def _moe_ffn_persistent(
-    x_router,
-    x_expert,
-    router,
-    compiled_route,
-    compiled_persistent,
-    gate,
-    up,
-    down,
-    route_identity,
-    K,
-    eps,
-):
-    """Route once, then run the persistent all-expert value path (prefill)."""
-    from torch_spyre._inductor import config as spyre_config
-
-    routing_sticks = compiled_route(
-        x_router,
-        router.proj.weight,
-        router.scale,
-        router.scalar_root_size,
-        router.per_expert_scale,
-        K,
-        eps,
-        _MOE_PADW,
-        _MOE_PAD_NEG,
-        route_identity,
-    )
-    routing_weight = routing_sticks[..., :1]  # zero-copy lane-0 view, [T,E,1]
-    with spyre_config.patch(
-        {
-            "sencores": 32,
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    ):
-        return compiled_persistent(
-            x_expert,
-            routing_weight,
-            gate,
-            up,
-            down,
-            K,
-        )
 
 
 class Gemma4MoEBlock(nn.Module):
@@ -440,35 +358,62 @@ class Gemma4MoEBlock(nn.Module):
         # double-normalized.
         flat = residual.reshape(-1, hidden)  # [T,H] RAW -> router
         x_moe = self.pre_feedforward_layernorm_2(flat)  # [T,H] normed -> experts
-        # Phase dispatch by shape: prefill runs the persistent all-experts path,
-        # decode the loop-on-topk gather path.
+        # Phase dispatch by shape. Both paths read the same E-outermost expert
+        # stacks and the device-resident router; the router surface (scale-free
+        # RMSNorm on the RAW residual, then [H] scale, then the root-size float,
+        # then proj) lives inside each compiled region.
+        router = self.router
         if seq_len > 1:
-            moe_out = _moe_ffn_persistent(
+            # Prefill: route once to a broadcast stick, then run the persistent
+            # all-expert value path (one E-counted device loop). routing_sticks
+            # is [T,E,64]; slice lane 0 to the [T,E,1] the expert path reads.
+            routing_sticks = self._compiled_persistent_route(
                 flat,
-                x_moe,
-                self.router,
-                self._compiled_persistent_route,
-                self._compiled_persistent,
-                self._spyre_gate,
-                self._spyre_up,
-                self._spyre_down,
-                self._spyre_persistent_route_identity,
+                router.proj.weight,
+                router.scale,
+                router.scalar_root_size,
+                router.per_expert_scale,
                 self._moe_k,
                 self._moe_rms_eps,
-            )  # [T,H]
+                _MOE_PADW,
+                _MOE_PAD_NEG,
+                self._spyre_persistent_route_identity,
+            )
+            routing_weight = routing_sticks[..., :1]  # [T,E,1] lane-0 view
+            with spyre_config.patch(
+                {
+                    "sencores": 32,
+                    "lx_planning": True,
+                    "allow_all_ops_in_lx_planning": True,
+                }
+            ):
+                moe_out = self._compiled_persistent(
+                    x_moe,
+                    routing_weight,
+                    self._spyre_gate,
+                    self._spyre_up,
+                    self._spyre_down,
+                    self._moe_k,
+                )  # [T,H]
         else:
-            moe_out = _moe_ffn_loop(
+            # Decode: experts stay HBM-resident; the loop region gathers the
+            # top-K rows by expert id and reduces over K on device. Decode
+            # gathers per_expert_scale by expert id, so pass the host-widened
+            # sticked [E,64] source, not the 1-D [E] the prefill router uses.
+            moe_out = self._compiled_loop(
                 flat,
                 x_moe,
-                self.router,
-                self._compiled_loop,
+                router.proj.weight,
+                router.scale,
+                router.scalar_root_size,
+                router.per_expert_scale_stick,
                 self._spyre_gate,
                 self._spyre_up,
                 self._spyre_down,
                 self._moe_k,
                 _MOE_TILE,
                 self._moe_rms_eps,
-            )  # [T,H]
+            ).to(dtype=x_moe.dtype)  # [T,H]
         moe_out = moe_out.reshape(bsz, seq_len, hidden)
         h_moe = self.post_feedforward_layernorm_2(moe_out)
 
