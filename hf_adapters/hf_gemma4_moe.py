@@ -32,7 +32,9 @@ from torch_spyre.model_utils import (
 from hf_adapters.hf_common import text_config
 from hf_adapters.hf_gemma4 import (
     Gemma4Attention,
+    _compiled_gemma4_rms_norm,
     _gemma4_backbone,
+    _gemma4_rms_norm,
     _run_backbone_forward,
     _run_forward,
     _setup_gemma4_text_decoder,
@@ -45,8 +47,7 @@ _STICK_SIZE = get_elem_in_stick(torch.float16)
 
 
 def _router_probs(x, weight, scale, root_size, eps):
-    variance = x.pow(2).mean(-1, keepdim=True)
-    x = x * torch.rsqrt(variance + eps)
+    x = _gemma4_rms_norm(x, None, eps)
     return torch.softmax(F.linear(x * scale * root_size, weight), dim=-1)
 
 
@@ -200,6 +201,7 @@ class Gemma4MoEBlock(nn.Module):
             head_dim,
             is_kv_eq_v,
         )
+        self.self_attn._use_compiled_rms_norm = True
         self.mlp = layer.mlp
         self.input_layernorm = layer.input_layernorm
         self.post_attention_layernorm = layer.post_attention_layernorm
@@ -238,7 +240,9 @@ class Gemma4MoEBlock(nn.Module):
         layer_scalar,
     ):
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = _compiled_gemma4_rms_norm(
+            hidden_states, self.input_layernorm.weight, self.input_layernorm.eps
+        )
         attn_out, key_cache, value_cache = self.self_attn(
             hidden_states,
             selected_freqs,
@@ -247,17 +251,32 @@ class Gemma4MoEBlock(nn.Module):
             value_cache,
             cache_index,
         )
-        hidden_states = residual + self.post_attention_layernorm(attn_out)
+        hidden_states = residual + _compiled_gemma4_rms_norm(
+            attn_out,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
 
         residual = hidden_states
         batch_size, seq_len, hidden_size = residual.shape
-        dense_out = self.post_feedforward_layernorm_1(
-            self._compiled_mlp(self.pre_feedforward_layernorm(residual))
+        dense_input = _compiled_gemma4_rms_norm(
+            residual,
+            self.pre_feedforward_layernorm.weight,
+            self.pre_feedforward_layernorm.eps,
+        )
+        dense_out = _compiled_gemma4_rms_norm(
+            self._compiled_mlp(dense_input),
+            self.post_feedforward_layernorm_1.weight,
+            self.post_feedforward_layernorm_1.eps,
         )
 
         # The router reads the raw residual; experts use their own normalization.
         router_input = residual.reshape(-1, hidden_size)
-        expert_input = self.pre_feedforward_layernorm_2(router_input)
+        expert_input = _compiled_gemma4_rms_norm(
+            router_input,
+            self.pre_feedforward_layernorm_2.weight,
+            self.pre_feedforward_layernorm_2.eps,
+        )
         experts = self.experts
         router = self.router
 
@@ -305,8 +324,16 @@ class Gemma4MoEBlock(nn.Module):
         moe_out = moe_out.to(expert_input.dtype).reshape(
             batch_size, seq_len, hidden_size
         )
-        moe_out = self.post_feedforward_layernorm_2(moe_out)
-        ffn_out = self.post_feedforward_layernorm(dense_out + moe_out)
+        moe_out = _compiled_gemma4_rms_norm(
+            moe_out,
+            self.post_feedforward_layernorm_2.weight,
+            self.post_feedforward_layernorm_2.eps,
+        )
+        ffn_out = _compiled_gemma4_rms_norm(
+            dense_out + moe_out,
+            self.post_feedforward_layernorm.weight,
+            self.post_feedforward_layernorm.eps,
+        )
         return (residual + ffn_out) * layer_scalar, key_cache, value_cache
 
 

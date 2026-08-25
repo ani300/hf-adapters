@@ -20,6 +20,7 @@ from torch_spyre.model_utils import (
     dma_moe_per_expert_scale_to_spyre,
 )
 
+from hf_adapters.hf_gemma4 import _gemma4_rms_norm
 from hf_adapters.hf_gemma4_moe import (
     _STICK_SIZE,
     _compiled_moe_loop_region,
@@ -46,12 +47,27 @@ def _router_inputs(tokens):
 
 
 def _reference(inputs, weights, scale):
-    variance = inputs.pow(2).mean(-1, keepdim=True)
-    logits = F.linear(inputs * torch.rsqrt(variance + 1e-6) * scale, weights)
+    inputs_fp32 = inputs.to(torch.float32)
+    variance = inputs_fp32.pow(2).mean(-1, keepdim=True)
+    normalized = (inputs_fp32 * torch.rsqrt(variance + 1e-6)).to(inputs.dtype)
+    logits = F.linear(normalized * scale, weights)
     probabilities = torch.softmax(logits, dim=-1)
     topk_weights, indices = torch.topk(probabilities, _TOP_K, dim=-1)
     topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
     return probabilities, topk_weights, indices
+
+
+def test_rms_norm_large_inputs():
+    inputs = torch.randn(64, 16, 256, dtype=_DTYPE) * 300
+    weight = torch.randn(256, dtype=_DTYPE)
+    expected = _gemma4_rms_norm(inputs, weight, 1e-6)
+
+    actual = torch.compile(_gemma4_rms_norm, dynamic=False)(
+        inputs.to("spyre"), weight.to("spyre"), 1e-6
+    ).cpu()
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
 
 
 def test_decode_router_real_shape():

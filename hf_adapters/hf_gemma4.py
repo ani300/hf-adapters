@@ -100,29 +100,23 @@ def _gemma4_backbone(model):
     return get_backbone(model)
 
 
+def _gemma4_rms_norm(hidden_states, weight, eps):
+    x = hidden_states.to(torch.float32)
+    variance = x.pow(2).mean(-1, keepdim=True)
+    normed = (x * torch.rsqrt(variance + eps)).to(hidden_states.dtype)
+    return normed if weight is None else normed * weight
+
+
+_compiled_gemma4_rms_norm = torch.compile(_gemma4_rms_norm, dynamic=False)
+
+
 def _patch_gemma4_rmsnorm(rmsnorm_cls):
-    """Patch a Gemma4 ``RMSNorm`` class to stay in fp16 on Spyre.
-
-    Mirrors ``hf_common.patch_rmsnorm`` but for Gemma4's RMSNorm, which:
-      - uses ``self.eps`` (not ``variance_epsilon``),
-      - is optionally scale-free (``with_scale=False`` for V-norm and a couple
-        of MoE/router norms — those carry no ``weight``),
-      - computes ``x * pow(meansq + eps, -0.5)`` (equivalent to
-        ``rsqrt(meansq + eps)``).
-
-    On Spyre we keep the reduction at input dtype; on CPU we upcast to fp32 to
-    match stock HF. ``rmsnorm_cls`` is the concrete class the loaded model uses
-    (``Gemma4RMSNorm`` or ``Gemma4UnifiedRMSNorm``) so the patch lands on the
-    type the instances actually dispatch through.
-    """
+    """Patch Gemma 4 RMSNorm for Spyre."""
 
     def _forward_fp16(self, hidden_states):
         if hidden_states.device.type == "spyre":
-            variance = (hidden_states * hidden_states).mean(-1, keepdim=True)
-            normed = hidden_states * torch.rsqrt(variance + self.eps)
-            if self.with_scale:
-                normed = normed * self.weight
-            return normed
+            weight = self.weight if self.with_scale else None
+            return _gemma4_rms_norm(hidden_states, weight, self.eps)
         # CPU path: fp32 for numerical parity with stock HF.
         xf = hidden_states.float()
         variance = (xf * xf).mean(-1, keepdim=True)
@@ -156,6 +150,13 @@ class Gemma4Attention(nn.Module):
         self.head_dim = head_dim
         self.is_kv_eq_v = is_kv_eq_v
         self.scaling = attn.scaling  # 1.0 for Gemma 4
+        self._use_compiled_rms_norm = False
+
+    def _rms_norm(self, hidden_states, norm):
+        if self._use_compiled_rms_norm:
+            weight = norm.weight if norm.with_scale else None
+            return _compiled_gemma4_rms_norm(hidden_states, weight, norm.eps)
+        return norm(hidden_states)
 
     def forward(
         self,
@@ -182,15 +183,15 @@ class Gemma4Attention(nn.Module):
             # *before* k_norm/RoPE, then applies self.v_norm(value_states)
             # unconditionally (modeling_gemma4 Gemma4TextAttention.forward). The
             # norm exists on these layers even though v_proj is None.
-            v = self.v_norm(k_lin).transpose(1, 2)
+            v = self._rms_norm(k_lin, self.v_norm).transpose(1, 2)
         else:
             v = self.v_proj(hidden_states).view(
                 bsz, seq_len, self.num_kv_heads, self.head_dim
             )
-            v = self.v_norm(v).transpose(1, 2)
+            v = self._rms_norm(v, self.v_norm).transpose(1, 2)
 
-        q = self.q_norm(q).transpose(1, 2)
-        k = self.k_norm(k_lin).transpose(1, 2)
+        q = self._rms_norm(q, self.q_norm).transpose(1, 2)
+        k = self._rms_norm(k_lin, self.k_norm).transpose(1, 2)
         q = apply_rope_matmul(q, selected_freqs)
         k = apply_rope_matmul(k, selected_freqs)
 
@@ -534,8 +535,8 @@ def prepare_text_decoder_for_spyre(model):
     compiles its own MoE blocks instead.
     """
     backbone = _gemma4_backbone(model)
-    num_q_heads_per_layer, kv_shapes, is_kv_eq_v_per_layer = (
-        _setup_gemma4_text_decoder(model, allow_moe=False)
+    num_q_heads_per_layer, kv_shapes, is_kv_eq_v_per_layer = _setup_gemma4_text_decoder(
+        model, allow_moe=False
     )
 
     model._spyre_compiled_blocks = prepare_gemma4_blocks(
