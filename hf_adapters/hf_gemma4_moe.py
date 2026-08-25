@@ -50,6 +50,15 @@ def _router_probs(x, weight, scale, root_size, eps):
     return torch.softmax(F.linear(x * scale * root_size, weight), dim=-1)
 
 
+def _select_experts(probs, top_k):
+    tokens = probs.shape[0]
+    topk_input = probs.expand(2, -1).contiguous() if tokens == 1 else probs
+    weights, expert_indices = torch.topk(topk_input, top_k, dim=-1)
+    weights = weights[:tokens]
+    expert_indices = expert_indices[:tokens]
+    return weights / weights.sum(-1, keepdim=True), expert_indices
+
+
 def _compiled_moe_loop_region(
     x_router,
     x_expert,
@@ -75,8 +84,7 @@ def _compiled_moe_loop_region(
         router_scalar_root_size,
         eps,
     )
-    weights, expert_indices = torch.topk(probs, top_k, dim=-1)
-    weights = weights / weights.sum(-1, keepdim=True)
+    weights, expert_indices = _select_experts(probs, top_k)
 
     # Widen topk's fp16 indices onto a stick before converting them to the
     # device's int32 gather indices. The layout pass inserts the restickify.
@@ -124,8 +132,7 @@ def _moe_route_persistent_packed(
         router_scalar_root_size,
         eps,
     )
-
-    _, selected = torch.topk(probs, top_k, dim=-1)
+    _, selected = _select_experts(probs, top_k)
     weights = torch.ops.spyre.keep_by_index(probs, selected, -1, 0.0)
     weights = weights / weights.sum(-1, keepdim=True)
     weights = weights * per_expert_scale
@@ -207,7 +214,7 @@ class Gemma4MoEBlock(nn.Module):
             persistent="layer_scalar" not in layer._non_persistent_buffers_set,
         )
         self._moe_k = moe_k
-        self._moe_rms_eps = self.pre_feedforward_layernorm_2.eps
+        self._moe_rms_eps = self.router.eps
         self._compiled_mlp = torch.compile(self.mlp, dynamic=False)
         self._compiled_decode = torch.compile(_compiled_moe_loop_region, dynamic=False)
         self._compiled_prefill_router = torch.compile(
@@ -273,9 +280,9 @@ class Gemma4MoEBlock(nn.Module):
                 moe_out = self._compiled_prefill_experts(
                     expert_input,
                     routing_weight,
-                    experts.gate,
-                    experts.up,
-                    experts.down,
+                    experts.gate_proj,
+                    experts.up_proj,
+                    experts.down_proj,
                 )
         else:
             moe_out = self._compiled_decode(
@@ -285,15 +292,17 @@ class Gemma4MoEBlock(nn.Module):
                 router.scale,
                 router.scalar_root_size,
                 router.per_expert_scale_stick,
-                experts.gate,
-                experts.up,
-                experts.down,
+                experts.gate_proj,
+                experts.up_proj,
+                experts.down_proj,
                 self._moe_k,
                 _MOE_TILE,
                 self._moe_rms_eps,
-            ).to(dtype=expert_input.dtype)
+            )
 
-        moe_out = moe_out.reshape(batch_size, seq_len, hidden_size)
+        moe_out = moe_out.to(expert_input.dtype).reshape(
+            batch_size, seq_len, hidden_size
+        )
         moe_out = self.post_feedforward_layernorm_2(moe_out)
         ffn_out = self.post_feedforward_layernorm(dense_out + moe_out)
         return (residual + ffn_out) * layer_scalar, key_cache, value_cache
@@ -313,16 +322,9 @@ def _prepare_experts(experts):
     intermediate_size = gate_up.shape[2] // 2
     gate = gate_up[:, :, :intermediate_size].contiguous()
     up = gate_up[:, :, intermediate_size:].contiguous()
-    experts.gate = _move_expert_weight(gate)
-    experts.up = _move_expert_weight(up)
-    experts.down = _move_expert_weight(down)
-
-
-def _prepare_router(router):
-    expert_scale = router.per_expert_scale.detach()
-    router.route_identity = torch.eye(_STICK_SIZE, dtype=expert_scale.dtype).to("spyre")
-    # Decode gathers by expert id and therefore needs a physical stick.
-    router.per_expert_scale_stick = dma_moe_per_expert_scale_to_spyre(expert_scale)
+    experts.gate_proj = _move_expert_weight(gate)
+    experts.up_proj = _move_expert_weight(up)
+    experts.down_proj = _move_expert_weight(down)
 
 
 def prepare_for_spyre(model):
@@ -349,8 +351,14 @@ def prepare_for_spyre(model):
             kv_equals_v[i],
             moe_k,
         )
+        expert_scale = block.router.per_expert_scale.detach()
+        block.router.route_identity = torch.eye(
+            _STICK_SIZE, dtype=expert_scale.dtype
+        ).to("spyre")
+        block.router.per_expert_scale_stick = dma_moe_per_expert_scale_to_spyre(
+            expert_scale
+        )
         _prepare_experts(block.experts)
-        _prepare_router(block.router)
         backbone.layers[i] = block
         blocks.append(block)
 
