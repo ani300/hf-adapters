@@ -93,18 +93,19 @@ def _compiled_moe_loop_region(
     expert_indices = index_address[..., 0].to(torch.int32)
 
     with spyre_hint(tiles={"row": tile}):
-        # A real K-batch stride is required by the backend scheduler.
-        inputs = x_expert[:, None, :].expand(T, top_k, H).contiguous()
-        gate = gate_dev[expert_indices]
-        up = up_dev[expert_indices]
-        down = down_dev[expert_indices]
+        rows = T * top_k
+        intermediate = gate_dev.shape[-1]
+        inputs = (
+            x_expert[:, None, :].expand(T, top_k, H).contiguous().reshape(rows, 1, H)
+        )
+        gate = gate_dev[expert_indices].reshape(rows, H, intermediate)
+        up = up_dev[expert_indices].reshape(rows, H, intermediate)
+        down = down_dev[expert_indices].reshape(rows, intermediate, H)
 
-        # Explicit reductions produce rank-3 buffers; equivalent batched
-        # matmuls leave rank-4 views that the layout pass cannot consume.
-        gate_out = (inputs[..., None] * gate).sum(dim=2)
-        up_out = (inputs[..., None] * up).sum(dim=2)
+        gate_out = torch.bmm(inputs, gate)
+        up_out = torch.bmm(inputs, up)
         activated = F.gelu(gate_out, approximate="tanh") * up_out
-        expert_out = (activated[..., None] * down).sum(dim=2)
+        expert_out = torch.bmm(activated, down).reshape(T, top_k, H)
 
         # Scale on the H-carrying tensor because bare [T,K] products have no
         # legal layout. The widened source gives the gather a physical stick.
