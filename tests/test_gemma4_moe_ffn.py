@@ -33,8 +33,7 @@ import torch
 import torch.nn.functional as F
 
 from hf_adapters.hf_gemma4_moe import (
-    _MOE_PAD_NEG,
-    _MOE_PADW,
+    _STICK_SIZE,
     _compiled_moe_loop_region,
     _moe_expert_persistent,
     _moe_route_persistent_packed,
@@ -67,12 +66,24 @@ def test_decode_loop_region_matches_dense_reference():
     down = torch.randn(E, M, H)  # [E,M,H] device layout
     per_expert_scale = torch.rand(E) + 0.5
     # Decode gathers per_expert_scale by expert id, so the region reads the
-    # host-widened sticked [E,64] source (every lane the same scalar).
-    per_expert_scale_stick = per_expert_scale[:, None].expand(-1, 64).contiguous()
+    # host-widened sticked source (every lane has the same scalar).
+    per_expert_scale_stick = (
+        per_expert_scale[:, None].expand(-1, _STICK_SIZE).contiguous()
+    )
 
     got = _compiled_moe_loop_region(
-        x_router, x_expert, router_proj_w, router_scale, 1.0,
-        per_expert_scale_stick, gate, up, down, K, 4, 1e-6,
+        x_router,
+        x_expert,
+        router_proj_w,
+        router_scale,
+        1.0,
+        per_expert_scale_stick,
+        gate,
+        up,
+        down,
+        K,
+        4,
+        1e-6,
     )
 
     # Dense reference: route, then for each token sum its K weighted experts.
@@ -94,9 +105,9 @@ def test_decode_loop_region_matches_dense_reference():
 def test_prefill_route_packed_selects_and_broadcasts():
     """``_moe_route_persistent_packed`` (prefill router) == renormed top-K.
 
-    Returns [T,E,64]: the renormed top-K weight scaled by per_expert_scale
-    (zero off the top-K), broadcast across all 64 stick lanes. keep_by_index
-    is a POSITIONAL selection by the padded-topk indices.
+    Returns [T,E,S]: the renormed top-K weight scaled by per_expert_scale
+    (zero off the top-K), broadcast across all stick lanes. keep_by_index
+    is a positional selection by the top-k indices.
     """
     torch.manual_seed(1)
     T, H, E, K = 6, 16, 8, 4
@@ -104,18 +115,23 @@ def test_prefill_route_packed_selects_and_broadcasts():
     router_proj_w = torch.randn(E, H)
     router_scale = torch.ones(H)
     per_expert_scale = torch.rand(E) + 0.5
-    route_identity = torch.eye(64)
+    route_identity = torch.eye(_STICK_SIZE)
 
     routing_sticks = _moe_route_persistent_packed(
-        x_router, router_proj_w, router_scale, 1.0, per_expert_scale,
-        K, 1e-6, _MOE_PADW, _MOE_PAD_NEG, route_identity,
+        x_router,
+        router_proj_w,
+        router_scale,
+        1.0,
+        per_expert_scale,
+        K,
+        1e-6,
+        route_identity,
     )
-    assert routing_sticks.shape == (T, E, 64)
+    assert routing_sticks.shape == (T, E, _STICK_SIZE)
 
-    # Reference: pad -> topk -> keep_by_index -> renorm -> per_expert_scale.
+    # Reference: topk -> keep_by_index -> renorm -> per_expert_scale.
     probs = _router_probs(x_router, router_proj_w, router_scale, 1.0, 1e-6)
-    pad = torch.full((T, _MOE_PADW - E), _MOE_PAD_NEG)
-    _, sel = torch.topk(torch.cat([probs, pad], dim=-1), K, dim=-1)
+    _, sel = torch.topk(probs, K, dim=-1)
     mask = torch.ops.spyre.keep_by_index(probs, sel, -1, 0.0)
     w = mask / mask.sum(-1, keepdim=True)
     token_major = torch.relu(w * per_expert_scale)  # relu of nonneg == identity
@@ -125,8 +141,10 @@ def test_prefill_route_packed_selects_and_broadcasts():
         routing_sticks[..., 0], token_major, atol=1e-4, rtol=1e-4
     )
     torch.testing.assert_close(
-        routing_sticks, token_major[..., None].expand(-1, -1, 64),
-        atol=1e-5, rtol=1e-5,
+        routing_sticks,
+        token_major[..., None].expand(-1, -1, _STICK_SIZE),
+        atol=1e-5,
+        rtol=1e-5,
     )
     # Exactly K experts per token are nonzero (positional selection, no leak).
     assert (routing_sticks[..., 0] > 0).sum(-1).tolist() == [K] * T
@@ -139,14 +157,14 @@ def test_prefill_expert_persistent_matches_dense_reference():
     routing weight (zero off the top-K), so it equals the weighted expert sum.
     """
     torch.manual_seed(2)
-    T, H, E, M, K = 6, 16, 8, 12, 4
+    T, H, E, M = 6, 16, 8, 12
     x_expert = torch.randn(T, H)
     gate = torch.randn(E, H, M)
     up = torch.randn(E, H, M)
     down = torch.randn(E, M, H)
     routing_weight = torch.rand(T, E, 1)  # already renormed/masked upstream
 
-    got = _moe_expert_persistent(x_expert, routing_weight, gate, up, down, K)
+    got = _moe_expert_persistent(x_expert, routing_weight, gate, up, down)
 
     ref = torch.zeros(T, H)
     for e in range(E):
@@ -162,7 +180,7 @@ def test_prefill_pipeline_matches_dense_topk_reference():
     """End-to-end prefill (route packed -> persistent experts) == dense top-K.
 
     Chains the two prefill regions exactly as ``Gemma4MoEBlock.forward`` does
-    (slice lane 0 of the [T,E,64] router output to the [T,E,1] the expert path
+    (slice lane 0 of the [T,E,S] router output to the [T,E,1] the expert path
     reads) and compares to an independent dense top-K FFN reference.
     """
     torch.manual_seed(3)
@@ -177,14 +195,19 @@ def test_prefill_pipeline_matches_dense_topk_reference():
     per_expert_scale = torch.rand(E) + 0.5
 
     routing_sticks = _moe_route_persistent_packed(
-        x_router, router_proj_w, router_scale, 1.0, per_expert_scale,
-        K, 1e-6, _MOE_PADW, _MOE_PAD_NEG, torch.eye(64),
+        x_router,
+        router_proj_w,
+        router_scale,
+        1.0,
+        per_expert_scale,
+        K,
+        1e-6,
+        torch.eye(_STICK_SIZE),
     )
     routing_weight = routing_sticks[..., :1]  # [T,E,1] lane-0 view
-    got = _moe_expert_persistent(x_expert, routing_weight, gate, up, down, K)
+    got = _moe_expert_persistent(x_expert, routing_weight, gate, up, down)
 
-    # Dense reference: route (padded topk == plain topk since pads never win),
-    # renorm the top-K, scale by per_expert_scale, sum the selected experts.
+    # Dense reference: renorm the top-K, scale by per-expert scale, and sum.
     probs = _router_probs(x_router, router_proj_w, router_scale, 1.0, 1e-6)
     w, idx = torch.topk(probs, K, dim=-1)
     w = w / w.sum(-1, keepdim=True)
