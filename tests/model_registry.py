@@ -683,7 +683,6 @@ NON_BLOCKING_CAUSAL_MODELS: dict[str, str] = _non_blocking(
     (
         "gemma4_google",  # gemma4 responds poorly to prompt without template
         "gemma4_base",
-        "gemma4_moe",
         "smollm3",
     ),
 )
