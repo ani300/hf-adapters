@@ -383,7 +383,9 @@ def _run_blocks_over_embeds(
             backbone_layers[i].layer_scalar,
         )
 
-    h = backbone.norm(h)
+    norm = backbone.norm
+    weight = norm.weight if norm.with_scale else None
+    h = _compiled_gemma4_rms_norm(h, weight, norm.eps)
     return h
 
 
