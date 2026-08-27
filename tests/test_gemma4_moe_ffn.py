@@ -12,22 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU-eager equivalence tests for the Gemma 4 MoE device regions.
-
-``hf_gemma4_moe`` compiles three device regions, dispatched per forward by
-sequence length (see the module docstring):
-
-  * decode  -- ``_compiled_moe_loop_region`` (whole FFN, combine included)
-  * prefill -- ``_moe_route_persistent_packed`` then ``_moe_expert_persistent``
-
-Every region is plain PyTorch that also runs eagerly on CPU (``keep_by_index``
-and ``spyre_hint`` are available / no-ops off device), so each test runs the
-real region on CPU and compares it to an independent dense reference. The
-router surface is shared by both paths: a scale-free RMSNorm on the RAW
-residual, then an ``[H]`` ``router_scale``, then the ``root_size`` float, then
-the projection. Passing ``router_scale=ones(H)`` and ``root_size=1.0`` reduces
-that to a plain scale-free RMSNorm the references reproduce directly.
-"""
+"""CPU equivalence tests for the Gemma 4 MoE helpers."""
 
 import torch
 import torch.nn.functional as F

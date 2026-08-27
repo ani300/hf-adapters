@@ -46,6 +46,10 @@ _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
 _STICK_SIZE = get_elem_in_stick(torch.float16)
 
 
+def _materialize(x):
+    return torch.ops.spyre.opaque_copy_(x, torch.empty_like(x))
+
+
 def _router_probs(x, weight, scale, root_size, eps):
     x = _gemma4_rms_norm(x, None, eps)
     return torch.softmax(F.linear(x * scale * root_size, weight), dim=-1)
@@ -219,7 +223,6 @@ class Gemma4MoEBlock(nn.Module):
         )
         self._moe_k = moe_k
         self._moe_rms_eps = self.router.eps
-        self._compiled_dense_forward = torch.compile(self._dense_forward, dynamic=False)
         self._compiled_decode = torch.compile(self._decode_forward, dynamic=False)
         self._compiled_prefill = torch.compile(self._prefill_forward, dynamic=False)
         self.train(layer.training)
@@ -274,8 +277,7 @@ class Gemma4MoEBlock(nn.Module):
         )
         return (residual + ffn_out) * layer_scalar
 
-    def _prefill_forward(self, residual):
-        router_input = residual.reshape(-1, residual.shape[-1])
+    def _prefill_core(self, router_input):
         expert_input = _gemma4_rms_norm(
             router_input,
             self.pre_feedforward_layernorm_2.weight,
@@ -293,14 +295,34 @@ class Gemma4MoEBlock(nn.Module):
             router.route_identity,
         )[..., :1]
         experts = self.experts
-        moe_out = _moe_expert_persistent(
+        return _moe_expert_persistent(
             expert_input,
             routing_weight,
             experts.gate_proj,
             experts.up_proj,
             experts.down_proj,
         )
-        return moe_out
+
+    def _prefill_forward(self, residual, layer_scalar):
+        router_input = residual.reshape(-1, residual.shape[-1])
+        dense_out = self._dense_forward(residual)
+        moe_out = self._prefill_core(router_input)
+        moe_out = _materialize(
+            _gemma4_rms_norm(
+                moe_out.to(residual.dtype).reshape_as(residual),
+                self.post_feedforward_layernorm_2.weight,
+                self.post_feedforward_layernorm_2.eps,
+            )
+        )
+        ffn_input = _materialize(dense_out + moe_out)
+        ffn_out = _materialize(
+            _gemma4_rms_norm(
+                ffn_input,
+                self.post_feedforward_layernorm.weight,
+                self.post_feedforward_layernorm.eps,
+            )
+        )
+        return (residual + ffn_out) * layer_scalar
 
     def forward(
         self,
@@ -338,7 +360,7 @@ class Gemma4MoEBlock(nn.Module):
                     "allow_all_ops_in_lx_planning": True,
                 }
             ):
-                moe_out = self._compiled_prefill(hidden_states)
+                hidden_states = self._compiled_prefill(hidden_states, layer_scalar)
         else:
             hidden_states = self._compiled_decode(
                 hidden_states,
@@ -346,18 +368,6 @@ class Gemma4MoEBlock(nn.Module):
             )
             return hidden_states, key_cache, value_cache
 
-        dense_out = self._compiled_dense_forward(hidden_states)
-        moe_out = _compiled_gemma4_rms_norm(
-            moe_out.to(hidden_states.dtype).reshape_as(hidden_states),
-            self.post_feedforward_layernorm_2.weight,
-            self.post_feedforward_layernorm_2.eps,
-        )
-        ffn_out = _compiled_gemma4_rms_norm(
-            dense_out + moe_out,
-            self.post_feedforward_layernorm.weight,
-            self.post_feedforward_layernorm.eps,
-        )
-        hidden_states = (hidden_states + ffn_out) * layer_scalar
         return hidden_states, key_cache, value_cache
 
 
