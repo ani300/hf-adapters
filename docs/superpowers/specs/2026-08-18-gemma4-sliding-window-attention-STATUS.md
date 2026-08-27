@@ -1,5 +1,13 @@
 # Gemma 4 sliding-window attention — status
 
+> **SUPERSEDED (2026-08-20).** The blocker described below (§ "The blocker") is
+> **resolved.** The design pivoted to a `seqlen_q=1` decode (the 64-row in-graph
+> query stick was dropped), which was the trigger for `out_reuse_dim.size() == 1`.
+> Gemma 3 1B now runs the op end-to-end on device (5/5 token-compare) and all 12
+> tasks are done. For the current state and the upstream landing order, read
+> **`2026-08-18-gemma4-sliding-window-attention-HANDOFF.md`**. The rest of this
+> file is kept as the record of the blocker investigation that motivated the pivot.
+
 **Status:** paused. Phase 1 (op over the full-length cache) is **device-validated and
 working**. Phase 2 (the anchored compact buffer) is **logic-complete and CPU-verified but
 blocked on device by a torch-spyre compiler limitation**, characterised below.
