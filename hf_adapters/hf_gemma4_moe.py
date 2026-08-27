@@ -221,12 +221,7 @@ class Gemma4MoEBlock(nn.Module):
         self._moe_rms_eps = self.router.eps
         self._compiled_dense_forward = torch.compile(self._dense_forward, dynamic=False)
         self._compiled_decode = torch.compile(self._decode_forward, dynamic=False)
-        self._compiled_prefill_router = torch.compile(
-            _moe_route_persistent_packed, dynamic=False
-        )
-        self._compiled_prefill_experts = torch.compile(
-            _moe_expert_persistent, dynamic=False
-        )
+        self._compiled_prefill = torch.compile(self._prefill_forward, dynamic=False)
         self.train(layer.training)
 
     def _dense_forward(self, residual):
@@ -241,9 +236,15 @@ class Gemma4MoEBlock(nn.Module):
             self.post_feedforward_layernorm_1.eps,
         )
 
-    def _decode_forward(self, residual, dense_out, expert_input, layer_scalar):
+    def _decode_forward(self, residual, layer_scalar):
         hidden_size = residual.shape[-1]
+        dense_out = self._dense_forward(residual)
         router_input = residual.reshape(-1, hidden_size)
+        expert_input = _gemma4_rms_norm(
+            router_input,
+            self.pre_feedforward_layernorm_2.weight,
+            self.pre_feedforward_layernorm_2.eps,
+        )
         experts = self.experts
         router = self.router
         moe_out = _compiled_moe_loop_region(
@@ -273,6 +274,34 @@ class Gemma4MoEBlock(nn.Module):
         )
         return (residual + ffn_out) * layer_scalar
 
+    def _prefill_forward(self, residual):
+        router_input = residual.reshape(-1, residual.shape[-1])
+        expert_input = _gemma4_rms_norm(
+            router_input,
+            self.pre_feedforward_layernorm_2.weight,
+            self.pre_feedforward_layernorm_2.eps,
+        )
+        router = self.router
+        routing_weight = _moe_route_persistent_packed(
+            router_input,
+            router.proj.weight,
+            router.scale,
+            router.scalar_root_size,
+            router.per_expert_scale,
+            self._moe_k,
+            self._moe_rms_eps,
+            router.route_identity,
+        )[..., :1]
+        experts = self.experts
+        moe_out = _moe_expert_persistent(
+            expert_input,
+            routing_weight,
+            experts.gate_proj,
+            experts.up_proj,
+            experts.down_proj,
+        )
+        return moe_out
+
     def forward(
         self,
         hidden_states,
@@ -301,25 +330,7 @@ class Gemma4MoEBlock(nn.Module):
             self.post_attention_layernorm.eps,
         )
 
-        dense_out = self._compiled_dense_forward(hidden_states)
-        router_input = hidden_states.reshape(-1, hidden_states.shape[-1])
-        expert_input = _compiled_gemma4_rms_norm(
-            router_input,
-            self.pre_feedforward_layernorm_2.weight,
-            self.pre_feedforward_layernorm_2.eps,
-        )
         if hidden_states.shape[1] > 1:
-            router = self.router
-            routing_weight = self._compiled_prefill_router(
-                router_input,
-                router.proj.weight,
-                router.scale,
-                router.scalar_root_size,
-                router.per_expert_scale,
-                self._moe_k,
-                self._moe_rms_eps,
-                router.route_identity,
-            )[..., :1]
             with spyre_config.patch(
                 {
                     "sencores": 32,
@@ -327,26 +338,17 @@ class Gemma4MoEBlock(nn.Module):
                     "allow_all_ops_in_lx_planning": True,
                 }
             ):
-                experts = self.experts
-                moe_out = self._compiled_prefill_experts(
-                    expert_input,
-                    routing_weight,
-                    experts.gate_proj,
-                    experts.up_proj,
-                    experts.down_proj,
-                )
+                moe_out = self._compiled_prefill(hidden_states)
         else:
             hidden_states = self._compiled_decode(
                 hidden_states,
-                dense_out,
-                expert_input,
                 layer_scalar,
             )
             return hidden_states, key_cache, value_cache
 
-        moe_out = moe_out.to(expert_input.dtype).reshape_as(hidden_states)
+        dense_out = self._compiled_dense_forward(hidden_states)
         moe_out = _compiled_gemma4_rms_norm(
-            moe_out,
+            moe_out.to(hidden_states.dtype).reshape_as(hidden_states),
             self.post_feedforward_layernorm_2.weight,
             self.post_feedforward_layernorm_2.eps,
         )
