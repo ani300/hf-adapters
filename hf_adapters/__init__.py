@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+import torch  # noqa: F401  (should happen before first torch_spyre import)
+
+try:
+    from torch_spyre._inductor import (  # type: ignore[import-not-found]
+        config as spyre_config,
+    )
+
+    # There is currently an issue with SDSC cache for some models
+    spyre_config.sdsc_cache = False
+except ImportError:
+    pass
+
+
 from hf_adapters.auto_spyre_model import (
     AutoSpyreModel,
     AutoSpyreModelForCausalLM,
@@ -19,6 +33,7 @@ from hf_adapters.auto_spyre_model import (
     AutoSpyreModelForMaskedLM,
     AutoSpyreModelForQuestionAnswering,
     AutoSpyreModelForSequenceClassification,
+    AutoSpyreModelForTokenClassification,
 )
 
 __all__ = [
@@ -28,4 +43,5 @@ __all__ = [
     "AutoSpyreModelForMaskedLM",
     "AutoSpyreModelForQuestionAnswering",
     "AutoSpyreModelForSequenceClassification",
+    "AutoSpyreModelForTokenClassification",
 ]

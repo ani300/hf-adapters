@@ -1002,7 +1002,7 @@ def build_prefill_mask_right_padded(
     return mask
 
 
-def add_sliding_window_band(mask, sliding_window, dtype=torch.float16):
+def add_sliding_window_band(mask, sliding_window):
     """Restrict an additive bidirectional mask to a local ``±sliding_window`` band.
 
     ModernBERT alternates global (full) attention layers with local
@@ -1022,7 +1022,7 @@ def add_sliding_window_band(mask, sliding_window, dtype=torch.float16):
     padded_len = mask.shape[-1]
     idx = torch.arange(padded_len)
     off_band = (idx[:, None] - idx[None, :]).abs() > sliding_window  # [L, L]
-    band = torch.zeros((padded_len, padded_len), dtype=dtype)
+    band = torch.zeros((padded_len, padded_len), dtype=mask.dtype)
     band[off_band] = -torch.inf
     return mask + band[None, None, :, :]
 
@@ -2578,9 +2578,14 @@ def prefill_encoder(
             else token_type_ids
         )
 
-    # Bidirectional mask: real tokens attend to all other real tokens
+    # Bidirectional mask: real tokens attend to all other real tokens. Match the
+    # model dtype because SDPA requires a floating-point mask to match q/k/v.
     mask = build_prefill_mask_right_padded(
-        bsz, padded_len, actual_lengths, is_causal=False
+        bsz,
+        padded_len,
+        actual_lengths,
+        is_causal=False,
+        dtype=get_model_dtype(model),
     )
 
     h = run_encoder_forward_fn(
@@ -2713,6 +2718,54 @@ def prefill_reranker(
     scores = classifier(last_hidden_state.to(cls_device))  # [B, 1]
 
     return scores[:, 0].to("cpu")  # [B] raw logits on CPU
+
+
+# ---------------------------------------------------------------------------
+# Token-classification prefill driver (NER / POS / chunking families)
+# ---------------------------------------------------------------------------
+
+
+def prefill_token_classification(
+    run_encoder_forward_fn: Callable,
+    model,
+    input_ids,
+    attention_mask,
+    token_type_ids=None,
+) -> torch.Tensor:
+    """Run an encoder on Spyre and its token-classification head on CPU.
+
+    Drives the encoder backbone via ``prefill_encoder``, then applies
+    ``model.classifier`` (a single linear layer whose output dim equals
+    ``config.num_labels``) to every token position.  The head is kept on
+    CPU (via ``_spyre_cpu_submodules``) to avoid:
+
+    - ``aten.slice`` (index operations that don't lower on Spyre).
+    - Any Dropout path that uses ``torch.bernoulli``.
+
+    Args:
+        run_encoder_forward_fn: ``fn(model, input_ids, attn_mask, position_ids,
+            token_type_ids) -> [B, padded_len, H]``.
+        model: Prepared ``BertForTokenClassification`` (or compatible) on Spyre.
+        input_ids: ``[B, L]`` token ids on CPU. Right-padded by the tokenizer.
+        attention_mask: ``[B, L]`` mask on CPU; 1 for real tokens, 0 for pad.
+        token_type_ids: Optional ``[B, L]`` on CPU. Defaults to all-zeros when
+            None.
+
+    Returns:
+        ``logits``: ``[B, L, num_labels]`` float32 tensor on CPU.
+    """
+    last_hidden_state = prefill_encoder(
+        run_encoder_forward_fn,
+        model,
+        input_ids,
+        attention_mask,
+        token_type_ids=token_type_ids,
+    )
+
+    classifier = model.classifier
+    head_device = next(classifier.parameters()).device
+    logits: torch.Tensor = classifier(last_hidden_state.to(head_device))
+    return logits.to("cpu")
 
 
 # ---------------------------------------------------------------------------
