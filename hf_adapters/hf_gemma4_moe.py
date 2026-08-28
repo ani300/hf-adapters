@@ -24,6 +24,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as spyre_config
+from torch_spyre._inductor.wsr.propagate_named_dims import (
+    declare_tensor_dim,
+    name_tensor_dims,
+)
 from torch_spyre.model_utils import (
     dma_moe_expert_weight_to_spyre,
     dma_moe_per_expert_scale_to_spyre,
@@ -48,6 +52,23 @@ _STICK_SIZE = get_elem_in_stick(torch.float16)
 
 def _materialize(x):
     return torch.ops.spyre.opaque_copy_(x, torch.empty_like(x))
+
+
+def _name_prefill_inputs(x, gate, up, down):
+    tokens = x.shape[0] * x.shape[1]
+    experts, hidden, intermediate = gate.shape
+    for name, extent in (
+        ("E", experts),
+        ("T", tokens),
+        ("H", hidden),
+        ("M", intermediate),
+        ("ONE", 1),
+    ):
+        declare_tensor_dim(name, extent)
+    name_tensor_dims(x, ["T", "H"])
+    name_tensor_dims(gate, ["E", "H", "M"])
+    name_tensor_dims(up, ["E", "H", "M"])
+    name_tensor_dims(down, ["E", "M", "H"])
 
 
 def _router_probs(x, weight, scale, root_size, eps):
@@ -152,30 +173,10 @@ def _moe_expert_persistent(x_expert, routing_weight, gate, up, down):
     from torch_spyre._inductor.propagate_hints import spyre_hint
 
     experts, hidden, intermediate = gate.shape
-    tokens = x_expert.shape[0]
 
-    # clone() turns the stick slice into an owned dense [E,T,1] buffer.
     x = x_expert.unsqueeze(0)
-    route = routing_weight.permute(1, 0, 2).contiguous().clone()
-    if x_expert.device.type == "spyre":
-        from torch_spyre._inductor.wsr.propagate_named_dims import (
-            declare_tensor_dim,
-            name_tensor_dims,
-        )
-
-        for name, extent in (
-            ("E", experts),
-            ("T", tokens),
-            ("H", hidden),
-            ("M", intermediate),
-            ("ONE", 1),
-        ):
-            declare_tensor_dim(name, extent)
-        name_tensor_dims(x_expert, ["T", "H"])
-        name_tensor_dims(gate, ["E", "H", "M"])
-        name_tensor_dims(up, ["E", "H", "M"])
-        name_tensor_dims(down, ["E", "M", "H"])
-        name_tensor_dims(route, ["E", "T", "ONE"])
+    with spyre_hint(named_dims=["E", "T", "ONE"]):
+        route = routing_weight.permute(1, 0, 2).contiguous().clone()
 
     with spyre_hint(num_tiles_per_dim={"E": experts}, work_div={"T": 32}):
         gate_out = torch.matmul(x, gate)
@@ -223,8 +224,12 @@ class Gemma4MoEBlock(nn.Module):
         )
         self._moe_k = moe_k
         self._moe_rms_eps = self.router.eps
-        self._compiled_decode = torch.compile(self._decode_forward, dynamic=False)
-        self._compiled_prefill = torch.compile(self._prefill_forward, dynamic=False)
+        self._compiled_decode = torch.compile(
+            self._decode_forward, dynamic=False, fullgraph=True
+        )
+        self._compiled_prefill = torch.compile(
+            self._prefill_forward, dynamic=False, fullgraph=True
+        )
         self.train(layer.training)
 
     def _dense_forward(self, residual):
@@ -277,7 +282,9 @@ class Gemma4MoEBlock(nn.Module):
         )
         return (residual + ffn_out) * layer_scalar
 
-    def _prefill_core(self, router_input):
+    def _prefill_forward(self, residual, layer_scalar):
+        router_input = residual.reshape(-1, residual.shape[-1])
+        dense_out = self._dense_forward(residual)
         expert_input = _gemma4_rms_norm(
             router_input,
             self.pre_feedforward_layernorm_2.weight,
@@ -295,24 +302,17 @@ class Gemma4MoEBlock(nn.Module):
             router.route_identity,
         )[..., :1]
         experts = self.experts
-        return _moe_expert_persistent(
+        moe_out = _moe_expert_persistent(
             expert_input,
             routing_weight,
             experts.gate_proj,
             experts.up_proj,
             experts.down_proj,
         )
-
-    def _prefill_forward(self, residual, layer_scalar):
-        router_input = residual.reshape(-1, residual.shape[-1])
-        dense_out = self._dense_forward(residual)
-        moe_out = self._prefill_core(router_input)
-        moe_out = _materialize(
-            _gemma4_rms_norm(
-                moe_out.to(residual.dtype).reshape_as(residual),
-                self.post_feedforward_layernorm_2.weight,
-                self.post_feedforward_layernorm_2.eps,
-            )
+        moe_out = _gemma4_rms_norm(
+            moe_out.to(residual.dtype).reshape_as(residual),
+            self.post_feedforward_layernorm_2.weight,
+            self.post_feedforward_layernorm_2.eps,
         )
         ffn_input = _materialize(dense_out + moe_out)
         ffn_out = _materialize(
@@ -353,6 +353,13 @@ class Gemma4MoEBlock(nn.Module):
         )
 
         if hidden_states.shape[1] > 1:
+            experts = self.experts
+            _name_prefill_inputs(
+                hidden_states,
+                experts.gate_proj,
+                experts.up_proj,
+                experts.down_proj,
+            )
             with spyre_config.patch(
                 {
                     "sencores": 32,
