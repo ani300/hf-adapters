@@ -50,10 +50,6 @@ _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
 _STICK_SIZE = get_elem_in_stick(torch.float16)
 
 
-def _materialize(x):
-    return torch.ops.spyre.opaque_copy_(x, torch.empty_like(x))
-
-
 def _name_prefill_inputs(x, gate, up, down):
     tokens = x.shape[0] * x.shape[1]
     experts, hidden, intermediate = gate.shape
@@ -314,13 +310,11 @@ class Gemma4MoEBlock(nn.Module):
             self.post_feedforward_layernorm_2.weight,
             self.post_feedforward_layernorm_2.eps,
         )
-        ffn_input = _materialize(dense_out + moe_out)
-        ffn_out = _materialize(
-            _gemma4_rms_norm(
-                ffn_input,
-                self.post_feedforward_layernorm.weight,
-                self.post_feedforward_layernorm.eps,
-            )
+        ffn_input = dense_out + moe_out
+        ffn_out = _gemma4_rms_norm(
+            ffn_input,
+            self.post_feedforward_layernorm.weight,
+            self.post_feedforward_layernorm.eps,
         )
         return (residual + ffn_out) * layer_scalar
 
