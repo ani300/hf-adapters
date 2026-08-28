@@ -27,6 +27,7 @@ from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.wsr.propagate_named_dims import (
     declare_tensor_dim,
     name_tensor_dims,
+    reset as _reset_named_dims,
 )
 from torch_spyre.model_utils import (
     dma_moe_expert_weight_to_spyre,
@@ -36,7 +37,6 @@ from torch_spyre.model_utils import (
 from hf_adapters.hf_common import text_config
 from hf_adapters.hf_gemma4 import (
     Gemma4Attention,
-    _compiled_gemma4_rms_norm,
     _gemma4_backbone,
     _gemma4_rms_norm,
     _run_backbone_forward,
@@ -202,7 +202,6 @@ class Gemma4MoEBlock(nn.Module):
             head_dim,
             is_kv_eq_v,
         )
-        self.self_attn._use_compiled_rms_norm = True
         self.mlp = layer.mlp
         self.input_layernorm = layer.input_layernorm
         self.post_attention_layernorm = layer.post_attention_layernorm
@@ -221,12 +220,45 @@ class Gemma4MoEBlock(nn.Module):
         self._moe_k = moe_k
         self._moe_rms_eps = self.router.eps
         self._compiled_decode = torch.compile(
-            self._decode_forward, dynamic=False, fullgraph=True
+            self._full_decode_forward, dynamic=False, fullgraph=True
         )
-        self._compiled_prefill = torch.compile(
-            self._prefill_forward, dynamic=False, fullgraph=True
+        self._compiled_prefill_attn = torch.compile(
+            self._attn_forward, dynamic=False, fullgraph=True
+        )
+        self._compiled_prefill_ffn = torch.compile(
+            self._prefill_ffn, dynamic=False, fullgraph=True
         )
         self.train(layer.training)
+
+    def _attn_forward(
+        self,
+        hidden_states,
+        selected_freqs,
+        attn_mask,
+        key_cache,
+        value_cache,
+        cache_index,
+    ):
+        residual = hidden_states
+        hidden_states = _gemma4_rms_norm(
+            hidden_states,
+            self.input_layernorm.weight,
+            self.input_layernorm.eps,
+        )
+        attn_out, key_cache, value_cache = self.self_attn(
+            hidden_states,
+            selected_freqs,
+            attn_mask,
+            key_cache,
+            value_cache,
+            cache_index,
+        )
+        hidden_states = residual + _gemma4_rms_norm(
+            attn_out,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
+        return hidden_states, key_cache, value_cache
 
     def _dense_forward(self, residual):
         dense_input = _gemma4_rms_norm(
@@ -240,7 +272,23 @@ class Gemma4MoEBlock(nn.Module):
             self.post_feedforward_layernorm_1.eps,
         )
 
-    def _decode_forward(self, residual, layer_scalar):
+    def _full_decode_forward(
+        self,
+        hidden_states,
+        selected_freqs,
+        attn_mask,
+        key_cache,
+        value_cache,
+        cache_index,
+        layer_scalar,
+    ):
+        hidden_states, key_cache, value_cache = self._attn_forward(
+            hidden_states, selected_freqs, attn_mask,
+            key_cache, value_cache, cache_index,
+        )
+        return self._decode_ffn(hidden_states, layer_scalar), key_cache, value_cache
+
+    def _decode_ffn(self, residual, layer_scalar):
         hidden_size = residual.shape[-1]
         dense_out = self._dense_forward(residual)
         router_input = residual.reshape(-1, hidden_size)
@@ -278,7 +326,7 @@ class Gemma4MoEBlock(nn.Module):
         )
         return (residual + ffn_out) * layer_scalar
 
-    def _prefill_forward(self, residual, layer_scalar):
+    def _prefill_ffn(self, residual, layer_scalar):
         router_input = residual.reshape(-1, residual.shape[-1])
         dense_out = self._dense_forward(residual)
         expert_input = _gemma4_rms_norm(
@@ -328,25 +376,15 @@ class Gemma4MoEBlock(nn.Module):
         cache_index,
         layer_scalar,
     ):
-        residual = hidden_states
-        hidden_states = _compiled_gemma4_rms_norm(
-            hidden_states, self.input_layernorm.weight, self.input_layernorm.eps
-        )
-        attn_out, key_cache, value_cache = self.self_attn(
-            hidden_states,
-            selected_freqs,
-            attn_mask,
-            key_cache,
-            value_cache,
-            cache_index,
-        )
-        hidden_states = residual + _compiled_gemma4_rms_norm(
-            attn_out,
-            self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.eps,
-        )
-
         if hidden_states.shape[1] > 1:
+            hidden_states, key_cache, value_cache = self._compiled_prefill_attn(
+                hidden_states,
+                selected_freqs,
+                attn_mask,
+                key_cache,
+                value_cache,
+                cache_index,
+            )
             experts = self.experts
             _name_prefill_inputs(
                 hidden_states,
@@ -361,13 +399,20 @@ class Gemma4MoEBlock(nn.Module):
                     "allow_all_ops_in_lx_planning": True,
                 }
             ):
-                hidden_states = self._compiled_prefill(hidden_states, layer_scalar)
+                hidden_states = self._compiled_prefill_ffn(
+                    hidden_states, layer_scalar
+                )
+            _reset_named_dims()
         else:
-            hidden_states = self._compiled_decode(
+            hidden_states, key_cache, value_cache = self._compiled_decode(
                 hidden_states,
+                selected_freqs,
+                attn_mask,
+                key_cache,
+                value_cache,
+                cache_index,
                 layer_scalar,
             )
-            return hidden_states, key_cache, value_cache
 
         return hidden_states, key_cache, value_cache
 
