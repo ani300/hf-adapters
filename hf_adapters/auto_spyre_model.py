@@ -20,15 +20,15 @@ adapter based on the model's config type.
 
 Usage::
 
-    from hf_adapters import AutoSpyreModelForCausalLM, encode_prompts
+    from hf_adapters import AutoSpyreModelForCausalLM
     from transformers import AutoTokenizer
 
     model = AutoSpyreModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-3B")
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B")
-    encoded = encode_prompts(tokenizer, ["Hello!"])
-    sequences = model.generate(**encoded, max_new_tokens=32)
+    inputs = tokenizer(["Hello!"], return_tensors="pt", padding=True)
+    sequences = model.generate(**inputs, max_new_tokens=32)
     outputs = tokenizer.batch_decode(
-        sequences[:, encoded["input_ids"].shape[1] :], skip_special_tokens=True
+        sequences[:, inputs["input_ids"].shape[1] :], skip_special_tokens=True
     )
 
 The model is automatically prepared for Spyre (RoPE precomputation, RMSNorm
