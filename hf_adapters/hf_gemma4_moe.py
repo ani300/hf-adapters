@@ -27,6 +27,8 @@ from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.wsr.propagate_named_dims import (
     declare_tensor_dim,
     name_tensor_dims,
+)
+from torch_spyre._inductor.wsr.propagate_named_dims import (
     reset as _reset_named_dims,
 )
 from torch_spyre.model_utils import (
@@ -283,8 +285,12 @@ class Gemma4MoEBlock(nn.Module):
         layer_scalar,
     ):
         hidden_states, key_cache, value_cache = self._attn_forward(
-            hidden_states, selected_freqs, attn_mask,
-            key_cache, value_cache, cache_index,
+            hidden_states,
+            selected_freqs,
+            attn_mask,
+            key_cache,
+            value_cache,
+            cache_index,
         )
         return self._decode_ffn(hidden_states, layer_scalar), key_cache, value_cache
 
@@ -399,9 +405,7 @@ class Gemma4MoEBlock(nn.Module):
                     "allow_all_ops_in_lx_planning": True,
                 }
             ):
-                hidden_states = self._compiled_prefill_ffn(
-                    hidden_states, layer_scalar
-                )
+                hidden_states = self._compiled_prefill_ffn(hidden_states, layer_scalar)
             _reset_named_dims()
         else:
             hidden_states, key_cache, value_cache = self._compiled_decode(
