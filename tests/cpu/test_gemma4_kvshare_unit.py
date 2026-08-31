@@ -72,7 +72,8 @@ def test_e2b_forward_runs_and_is_finite():
     from hf_adapters.hf_common import allocate_kv_caches, make_cache_index
 
     model = AutoModelForCausalLM.from_pretrained(E2B, dtype=torch.float32)
-    hf_gemma4.prepare_for_spyre(model)  # DEVICE is patched to "cpu" by tests/conftest.py
+    # DEVICE is patched to "cpu" by tests/conftest.py.
+    hf_gemma4.prepare_for_spyre(model)
     assert hasattr(model, "_spyre_producer_of")
     assert hasattr(model, "_spyre_has_ple") and model._spyre_has_ple
 
@@ -88,7 +89,13 @@ def test_e2b_forward_runs_and_is_finite():
     cache_index = make_cache_index(0, S, "cpu")
     with torch.no_grad():
         logits = hf_gemma4._run_forward(
-            model, input_ids, pos, mask, kc, vc, cache_index,
+            model,
+            input_ids,
+            pos,
+            mask,
+            kc,
+            vc,
+            cache_index,
         )
     assert logits.shape[1] == S
     assert torch.isfinite(logits[0, -1]).all()
@@ -132,9 +139,17 @@ def test_e2b_block_padded_prefill_logits_finite():
     cache_index = hf_common.make_cache_index(0, padded_len, "cpu")
     with torch.no_grad():
         logits = hf_gemma4._run_forward(
-            model, padded_ids, position_ids, prefill_mask, kc, vc, cache_index,
+            model,
+            padded_ids,
+            position_ids,
+            prefill_mask,
+            kc,
+            vc,
+            cache_index,
         )
     # The only rows that matter are the real tokens (offset 59..63); their
     # logits must be finite for argmax/generation to work.
-    real_logits = logits[0, prompt_offsets[0].item():]
-    assert torch.isfinite(real_logits).all(), "block-padded prefill produced non-finite real-token logits"
+    real_logits = logits[0, prompt_offsets[0].item() :]
+    assert torch.isfinite(
+        real_logits
+    ).all(), "block-padded prefill produced non-finite real-token logits"

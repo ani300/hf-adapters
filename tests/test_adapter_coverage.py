@@ -23,14 +23,24 @@ from pathlib import Path
 
 from tests.model_registry import (
     CAUSAL_LM_MODELS,
+    CAUSAL_PATHS,
     EMBEDDING_MODELS,
     MASKED_LM_MODELS,
+    NON_BLOCKING_CAUSAL_MODELS,
     QUESTION_ANSWERING_MODELS,
     RERANKER_MODELS,
     SEQ_CLASSIFICATION_MODELS,
     TOKEN_CLASSIFICATION_MODELS,
     VISION_MODELS,
 )
+
+
+def test_gemma4_e_variants_are_enabled():
+    """Both E-variant configurations must gate the default causal test matrix."""
+    e_variants = {"google/gemma-4-E2B-it", "google/gemma-4-E4B"}
+
+    assert e_variants <= set(CAUSAL_PATHS)
+    assert e_variants.isdisjoint(NON_BLOCKING_CAUSAL_MODELS)
 
 
 def get_adapter_files():
