@@ -172,13 +172,13 @@ def _ple_tail(block, h, per_layer_input):
 
 
 def _offset_zero_per_layer_input(per_layer_inputs, layer_index):
-    """Return one PLE layer slice backed by fresh, offset-zero storage.
+    """Copy one PLE layer slice into fresh, offset-zero storage.
 
-    ``contiguous()`` is insufficient here: a decode slice has shape
-    ``[B, 1, ple_dim]``, so PyTorch considers it contiguous even though it
-    retains the parent tensor's nonzero storage offset.  ``clone()`` always
-    materializes the slice and therefore also covers the singleton decode
-    shape.
+    This does not copy a KV cache. ``contiguous()`` is insufficient here: a
+    decode slice has shape ``[B, 1, ple_dim]``, so PyTorch considers it
+    contiguous even though it retains the parent tensor's nonzero storage
+    offset. ``clone()`` always materializes the small PLE slice and therefore
+    also covers the singleton decode shape.
     """
     return per_layer_inputs[:, :, layer_index, :].clone()
 
@@ -625,13 +625,12 @@ def _run_blocks_over_embeds(
     producer_of = model._spyre_producer_of
     for i, compiled_block in enumerate(model._spyre_compiled_blocks):
         lt = cfg.layer_types[i]
-        # Each layer slice must have fresh offset-0 storage. A decode slice has
-        # singleton leading dimensions and is therefore already "contiguous"
-        # according to PyTorch even while retaining the parent view's nonzero
-        # storage offset, so contiguous() is not sufficient; clone() is. Inductor
-        # drops a graph input's storage_offset (the offset-drop footgun documented
-        # in torch_spyre customops.py), which otherwise makes later layers read the
-        # first layer's PLE values.
+        # Each PLE slice needs fresh offset-0 storage at the graph boundary. A
+        # singleton decode slice reports contiguous despite retaining the
+        # parent's nonzero storage offset, so contiguous() is not sufficient;
+        # clone() is. Inductor otherwise drops the graph input's storage_offset
+        # and later layers read layer 0's PLE values. This copies only the small
+        # PLE slice, not any KV cache.
         pli = (
             _offset_zero_per_layer_input(per_layer_inputs, i)
             if per_layer_inputs is not None
@@ -687,9 +686,10 @@ def _run_backbone_forward(
     """
     backbone = _gemma4_backbone(model)
     h = backbone.embed_tokens(input_ids)
-    # Neutralize left-pad rows before they can overflow fp16 and poison the KV
-    # cache with NaN (see _zero_fully_masked_rows). No-op for the unpadded path.
-    h = _zero_fully_masked_rows(h, attn_mask)
+    # Only prefill can contain fully-masked left-pad query rows. Avoid the CPU
+    # mask transfer and reduction on every single-token decode step.
+    if h.shape[1] > 1:
+        h = _zero_fully_masked_rows(h, attn_mask)
     per_layer_inputs = _compute_per_layer_inputs(model, h, input_ids)
     return _run_blocks_over_embeds(
         model,

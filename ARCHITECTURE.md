@@ -569,9 +569,10 @@ give two KV-cache shapes per model (`model._spyre_kv_shapes`). It further adds
 per-head V-norm (Q/K/V RMSNorm), a per-layer scalar, K==V projection sharing
 on global layers, unscaled attention (`scale=1.0`), and final-logit
 softcapping. E2B / E4B additionally use per-layer embeddings and trailing
-KV-sharing layers; PLE slices are materialized into fresh offset-zero storage
-before each compiled block, including singleton decode steps. MoE (26B-A4B)
-remains unsupported and is rejected by `prepare_for_spyre`.
+KV-sharing layers; each PLE slice is copied into fresh offset-zero storage
+before crossing a compiled-block boundary, including singleton decode steps.
+This is a small PLE copy, not a KV-cache copy. MoE (26B-A4B) remains unsupported
+and is rejected by `prepare_for_spyre`.
 
 **Learned absolute positions + Conv1D** (GPT-2): `hf_gpt2.py` is the first
 non-RoPE decoder — positions come from a learned `wpe` table added to `wte`, so
