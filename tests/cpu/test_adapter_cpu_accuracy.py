@@ -40,7 +40,7 @@ from transformers import AutoTokenizer
 
 from hf_adapters.hf_common import encode_prompts
 from tests.conftest import (
-    get_dtype_for_cpu,
+    encode_generation_inputs,
     load_ref_model,
     resolve_adapter_module_for_test,
 )
@@ -164,16 +164,20 @@ def adapter_greedy_steps(run_forward_fn, model, input_ids, num_decode=NUM_DECODE
 @pytest.mark.parametrize("model_path", CAUSAL_PATHS, ids=CAUSAL_PATHS)
 def test_auto_loader(model_path):
     auto_spyre_model = sys.modules["hf_adapters.auto_spyre_model"]
-    torch_dtype = get_dtype_for_cpu(model_path=model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     # Phase 1: auto-loader generate
-    model = auto_spyre_model.AutoSpyreModelForCausalLM.from_pretrained(
-        model_path, dtype=torch_dtype
-    )
+    model = auto_spyre_model.AutoSpyreModelForCausalLM.from_pretrained(model_path)
     _unwrap_compiled_blocks(model)
-    auto_outputs = model.generate(
-        tokenizer, [PROMPT], max_new_tokens=NUM_DECODE, do_sample=False
+    encoded = encode_generation_inputs(tokenizer, [PROMPT])
+    auto_sequences = model.generate(
+        **encoded,
+        max_new_tokens=NUM_DECODE,
+        do_sample=False,
+    )
+    auto_outputs = tokenizer.batch_decode(
+        auto_sequences[:, encoded["input_ids"].shape[1] :],
+        skip_special_tokens=True,
     )
     del model
     gc.collect()

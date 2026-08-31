@@ -86,6 +86,7 @@ from hf_adapters.hf_common import (
     build_decode_mask,
     build_prefill_mask,
     decode_block_walk,
+    generation_begin_index,
     generation_cache_len,
     get_backbone,
     get_model_dtype,
@@ -155,17 +156,6 @@ def prepare_for_spyre(model):
         "hf_gemma4_mm requires a vision embedder (model.model.embed_vision); "
         "this checkpoint has no vision_config."
     )
-
-    try:
-        from torch_spyre._inductor import (  # type: ignore[import-not-found]
-            config as spyre_config,
-        )
-
-        # Bundle-scoped HBM pool planning in torch-spyre d9c0301 corrupts
-        # Gemma outputs. Keep this disabled through lazy compilation.
-        setattr(spyre_config, "hbm_pool_planning", False)
-    except ImportError:
-        pass
 
     # Shared text decoder (mirrors hf_gemma4.prepare_for_spyre).
     hf_gemma4.prepare_text_decoder_for_spyre(model)
@@ -504,6 +494,7 @@ def generate(
     temperature=None,
     top_k=None,
     top_p=None,
+    generation_config=None,
 ):
     """Autoregressive image→text generation on Spyre (greedy / top-k/p sampling).
 
@@ -522,27 +513,30 @@ def generate(
     (``processor.tokenizer.padding_side='left'``). Returns EOS-trimmed strings.
     """
     tokenizer = processor.tokenizer
-    params = _resolve_generation_params(
+    cfg, eos_ids, _ = _resolve_generation_params(
         model,
-        tokenizer,
+        generation_config,
         {
             "do_sample": do_sample,
             "temperature": temperature,
             "top_k": top_k,
             "top_p": top_p,
         },
+        {},
     )
-    do_sample = params["do_sample"]
-    temperature = params["temperature"]
-    top_k = params["top_k"]
-    top_p = params["top_p"]
-    eos_ids = params["eos_ids"]
+    do_sample = cfg.do_sample
+    temperature = cfg.temperature
+    top_k = cfg.top_k
+    top_p = cfg.top_p
 
     backbone = get_backbone(model)
     model_d_type = get_model_dtype(model)
 
     batch_size, prompt_length = input_ids.shape
     actual_prompt_lengths = attention_mask.sum(dim=1)  # [B]
+    begin_suppress_index = generation_begin_index(
+        prompt_length, cfg.forced_bos_token_id
+    )
 
     max_cache_len = generation_cache_len(prompt_length, max_new_tokens)
     input_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
@@ -611,7 +605,16 @@ def generate(
             current_cache_len += 1
 
         next_tokens = select_next_token(
-            next_logits, do_sample, temperature, top_k, top_p
+            next_logits,
+            do_sample,
+            temperature,
+            top_k,
+            top_p,
+            cfg.suppress_tokens,
+            cfg.begin_suppress_tokens,
+            cfg.forced_bos_token_id,
+            current_length=prompt_length + i,
+            begin_suppress_index=begin_suppress_index,
         )
 
         # Append the token: generated slots are contiguous from padded_len.
