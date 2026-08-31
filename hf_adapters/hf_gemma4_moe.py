@@ -398,13 +398,7 @@ class Gemma4MoEBlock(nn.Module):
                 experts.up_proj,
                 experts.down_proj,
             )
-            with spyre_config.patch(
-                {
-                    "sencores": 32,
-                    "lx_planning": True,
-                    "allow_all_ops_in_lx_planning": True,
-                }
-            ):
+            with spyre_config.patch({"allow_all_ops_in_lx_planning": True}):
                 hidden_states = self._compiled_prefill_ffn(hidden_states, layer_scalar)
             _reset_named_dims()
         else:
