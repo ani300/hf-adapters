@@ -7,6 +7,22 @@ from hf_adapters import hf_gemma4
 E2B = "google/gemma-4-E2B-it"
 
 
+def test_decode_ple_slice_has_fresh_offset_zero_storage():
+    per_layer_inputs = torch.arange(2 * 4).reshape(1, 1, 2, 4)
+    view = per_layer_inputs[:, :, 1, :]
+
+    # Singleton leading dimensions make the offset view report contiguous, so
+    # contiguous() returns the same storage and cannot protect compiled decode.
+    assert view.is_contiguous()
+    assert view.storage_offset() != 0
+    assert view.contiguous().storage_offset() != 0
+
+    got = hf_gemma4._offset_zero_per_layer_input(per_layer_inputs, 1)
+    assert got.storage_offset() == 0
+    assert got.data_ptr() != view.data_ptr()
+    assert torch.equal(got, view)
+
+
 def test_compute_per_layer_inputs_matches_hf():
     model = AutoModelForCausalLM.from_pretrained(E2B, dtype=torch.float32)
     backbone = hf_gemma4._gemma4_backbone(model)

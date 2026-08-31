@@ -171,6 +171,18 @@ def _ple_tail(block, h, per_layer_input):
     return residual + x
 
 
+def _offset_zero_per_layer_input(per_layer_inputs, layer_index):
+    """Return one PLE layer slice backed by fresh, offset-zero storage.
+
+    ``contiguous()`` is insufficient here: a decode slice has shape
+    ``[B, 1, ple_dim]``, so PyTorch considers it contiguous even though it
+    retains the parent tensor's nonzero storage offset.  ``clone()`` always
+    materializes the slice and therefore also covers the singleton decode
+    shape.
+    """
+    return per_layer_inputs[:, :, layer_index, :].clone()
+
+
 def _shared_producer_map(cfg):
     """For each layer, the producer layer index whose KV a shared layer reuses.
 
@@ -347,9 +359,7 @@ class Gemma4Attention(nn.Module):
 class Gemma4Block(nn.Module):
     """Registered dense Gemma 4 decoder block used by the Spyre adapter."""
 
-    def __init__(
-        self, layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v, has_ple
-    ):
+    def __init__(self, layer, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v, has_ple):
         super().__init__()
         self.self_attn = Gemma4Attention(
             layer.self_attn,
@@ -615,19 +625,15 @@ def _run_blocks_over_embeds(
     producer_of = model._spyre_producer_of
     for i, compiled_block in enumerate(model._spyre_compiled_blocks):
         lt = cfg.layer_types[i]
-        # `.contiguous()` forces a fresh offset-0 tensor. per_layer_inputs[:, :, i, :]
-        # is a VIEW whose storage_offset grows with the layer index i. All producer
-        # blocks share one compiled code object (one Dynamo guarded-code cache slot),
-        # and Inductor DROPS a graph input's storage_offset (the offset-drop footgun
-        # documented in torch_spyre customops.py: the kernel binds the storage base
-        # pointer and reads element 0). A block compiled alone is fine — its runtime
-        # view's data_ptr already folds in the offset — but reusing one baked block
-        # binary across differently-offset ple slices under the same cache slot
-        # corrupts later same-structure compiles (device garbage; CPU is immune).
-        # An offset-0 input per block sidesteps the footgun. See
-        # probe_e2b_layers.py loop_contig / loop_uniq for the device proof.
+        # Each layer slice must have fresh offset-0 storage. A decode slice has
+        # singleton leading dimensions and is therefore already "contiguous"
+        # according to PyTorch even while retaining the parent view's nonzero
+        # storage offset, so contiguous() is not sufficient; clone() is. Inductor
+        # drops a graph input's storage_offset (the offset-drop footgun documented
+        # in torch_spyre customops.py), which otherwise makes later layers read the
+        # first layer's PLE values.
         pli = (
-            per_layer_inputs[:, :, i, :].contiguous()
+            _offset_zero_per_layer_input(per_layer_inputs, i)
             if per_layer_inputs is not None
             else None
         )

@@ -31,7 +31,8 @@ which models are supported on Spyre.
 | Granite Vision 4.1 4B (text backbone) | granite (text) | 64→128 | 64 | Yes (padded) | Yes | Yes | Yes |
 | Gemma 4 12B | gemma4\_unified | 256 / 512 | 128 / 256 | Yes | Yes | Yes | Yes |
 | Gemma 4 26B-A4B (MoE) | gemma4 (MoE, `enable_moe_block`) | 256 / 512 | 128 / 256 | Yes | Yes | Yes | Yes |
-| Gemma 4 E2B | gemma4\_unified (PLE + KV-share) | 256 / 512 | 128 / 256 | Yes | Yes | Yes | No¹ |
+| Gemma 4 E2B (bf16) | gemma4\_unified (PLE + KV-share) | 256 / 512 | 128 / 256 | Yes | Yes | Yes | Yes |
+| Gemma 4 E4B (bf16) | gemma4\_unified (PLE + KV-share) | 256 / 512 | 128 / 256 | Yes | Yes | Yes | Yes |
 | Gemma 3 1B | gemma3\_text | 256 | 128 | Yes | Yes | Yes | Yes |
 | Gemma 2 9B | gemma2 | 256 | 128 | Yes | Yes | Yes | Yes |
 | GPT-2 124M | gpt2 | 64 | n/a (no RoPE) | Yes | Yes | Yes | Yes |
@@ -45,17 +46,6 @@ which models are supported on Spyre.
 **CPU Accurate** = adapter produces identical greedy tokens to stock HF on CPU.
 **Spyre Compiles** = `torch.compile(block_forward)` succeeds on Spyre.
 **Spyre Runs** = block produces output (no crash/NaN).
-
-¹ Gemma 4 E2B compiles and runs on Spyre without crash/NaN and is
-**CPU-exact** (same adapter code), but device output is not yet
-numerically coherent. The divergence is under active investigation: it
-appears only when a decoder block is compiled as one whole graph and is
-data-dependent (architecturally identical sliding blocks diverge on some
-positions but not others), pointing at the compiled
-KV-write → SDPA → o\_proj layout chain rather than the per-layer
-embeddings (a direct device-vs-CPU PLE probe is at the bf16 floor). Not
-counted as a verified checkpoint until device output matches CPU
-(next-token parity). E4B is registered and CPU-only for now.
 
 Unless a row notes otherwise (e.g. `(bf16)`), **verified means verified in fp16** — this holds even for bf16-native checkpoints. A bf16-native model that is only verified in fp16 may behave differently in bf16 on Spyre (and vice versa); the dtype actually tested is what the table certifies.
 
@@ -203,7 +193,7 @@ pattern, norms, and weight layout.
 | hf\_granite\_swa.py | granite\_swa | 1 | Granite 4.1 8B (unverified), Granite 4.1 20B |
 | hf\_smollm3.py | smollm3 | 1 | — |
 | hf\_lfm2.py | lfm2 | 1 | LFM2 700M/1.2B and dense LFM2 fine-tunes with hybrid convolution/attention layers |
-| hf\_gemma4.py | gemma4\_unified / gemma4 (dense) | 1 | Gemma 4 31B (dense). Also E2B/E4B (PLE + KV-share): CPU-accurate, but E2B device output is not yet coherent (under investigation, see ¹ above); E4B registered, CPU-only. Not 26B-A4B (MoE). |
+| hf\_gemma4.py | gemma4\_unified / gemma4 (dense + PLE/KV-share) | 3 | Gemma 4 31B (dense). Not 26B-A4B (MoE). |
 | hf\_gemma4\_mm.py | gemma4\_unified (multimodal) | 1 | Gemma 4 31B (dense unified VLM). Not E2B/E4B (PLE) or 26B-A4B (MoE). |
 | hf\_gemma4\_moe.py | gemma4 (MoE, `enable_moe_block`) | 1 | Gemma 4 26B-A4B (128 experts, top-8 routing). Persistent prefill + gathered decode, 5/5 token match. |
 | hf\_gemma3.py | gemma3\_text / gemma3 (dense) | 2 | Gemma 3 4B/12B/27B (text decoder of the multimodal checkpoints); EmbeddingGemma (bidirectional embedder). Not Gemma 3n (PLE). |
