@@ -35,12 +35,16 @@ from tests.model_registry import (
 )
 
 
-def test_gemma4_e_variants_are_enabled():
-    """Both E-variant configurations must gate the default causal test matrix."""
-    e_variants = {"google/gemma-4-E2B-it", "google/gemma-4-E4B"}
+def test_always_test_causal_models_are_enabled_and_blocking():
+    """Every ``always_test`` causal model must gate the default test matrix."""
+    always_test_paths = {
+        info["path"]
+        for info in CAUSAL_LM_MODELS.values()
+        if info.get("always_test", False)
+    }
 
-    assert e_variants <= set(CAUSAL_PATHS)
-    assert e_variants.isdisjoint(NON_BLOCKING_CAUSAL_MODELS)
+    assert always_test_paths <= set(CAUSAL_PATHS)
+    assert always_test_paths.isdisjoint(NON_BLOCKING_CAUSAL_MODELS)
 
 
 def get_adapter_files():
