@@ -29,7 +29,13 @@ from __future__ import annotations
 import gc
 import time
 
-from _generate_edge_case_helpers import (
+from transformers import (
+    AutoTokenizer,
+    PreTrainedModel,
+)
+
+from hf_adapters import AutoSpyreModelForCausalLM
+from tests._generate_edge_case_helpers import (
     CASES,
     EOS_CASES,
     forced_eos_expected,
@@ -37,17 +43,14 @@ from _generate_edge_case_helpers import (
     hf_reference_outputs,
     make_prompts,
 )
-from torch.nn import Module
-from transformers import (
-    AutoTokenizer,
-    PreTrainedModel,
+from tests.conftest import (
+    encode_generation_inputs,
+    load_ref_model,
+    resolve_adapter_module_for_test,
 )
 
-from hf_adapters import AutoSpyreModelForCausalLM
-from tests.conftest import load_ref_model, resolve_adapter_module_for_test
 
-
-def _load_spyre_model(model_path: str) -> Module:
+def _load_spyre_model(model_path: str) -> PreTrainedModel:
     print(f"  Loading {model_path} on Spyre ...")
     t0 = time.time()
     model = AutoSpyreModelForCausalLM.from_pretrained(model_path)
@@ -84,9 +87,15 @@ def run_greedy_case(model_path: str, case_id: str) -> tuple[bool, str]:
         targets, max_new = CASES[case_id]
         prompts = make_prompts(tokenizer, targets)
         hf_outputs = hf_reference_outputs(ref_model, tokenizer, prompts, max_new)
+        encoded = encode_generation_inputs(tokenizer, prompts)
         t0 = time.time()
-        spyre_outputs = model.generate(
-            tokenizer, prompts, max_new_tokens=max_new, do_sample=False
+        sequences = model.generate(
+            **encoded,
+            max_new_tokens=max_new,
+            do_sample=False,
+        )
+        spyre_outputs = tokenizer.batch_decode(
+            sequences[:, encoded["input_ids"].shape[1] :], skip_special_tokens=True
         )
         elapsed = time.time() - t0
         ok = all(hf.strip() == sp.strip() for hf, sp in zip(hf_outputs, spyre_outputs))
@@ -107,7 +116,7 @@ def run_eos_case(model_path: str, case_id: str) -> tuple[bool, str]:
         per_prompt_ids = [
             greedy_token_ids(ref_model, tokenizer, p, max_new) for p in prompts
         ]
-        from _generate_edge_case_helpers import pick_forced_eos_id
+        from tests._generate_edge_case_helpers import pick_forced_eos_id
 
         eos_id = pick_forced_eos_id(per_prompt_ids, eos_offsets)
         if eos_id is None:
@@ -115,13 +124,16 @@ def run_eos_case(model_path: str, case_id: str) -> tuple[bool, str]:
 
             pytest.skip("no clean shared eos token at requested offsets")
         expected = forced_eos_expected(per_prompt_ids, eos_offsets, tokenizer)
+        encoded = encode_generation_inputs(tokenizer, prompts)
         t0 = time.time()
-        out = model.generate(
-            tokenizer,
-            prompts,
+        sequences = model.generate(
+            **encoded,
             max_new_tokens=max_new,
             do_sample=False,
             eos_token_id=eos_id,
+        )
+        out = tokenizer.batch_decode(
+            sequences[:, encoded["input_ids"].shape[1] :], skip_special_tokens=True
         )
         elapsed = time.time() - t0
         ok = all(e.strip() == g.strip() for e, g in zip(expected, out))

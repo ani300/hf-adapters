@@ -12,15 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre edge case: ``short_two_blocks_plus`` (two expansions + partial fill)."""
+"""
+Conftest for the Spyre test suite.
 
-import pytest
-from _shared import run_greedy_case
-from model_registry import CAUSAL_PATHS
+Adds ``tests/spyre/`` to ``sys.path`` so test modules in this directory can do
+bare ``from _seq_classification_helpers import ...`` (and any future
+``_*_helpers`` files) without the directory needing to be a Python package.
+Mirrors the same pattern used by ``tests/spyre/edge_cases/conftest.py``.
+"""
 
+import os
+import sys
 
-@pytest.mark.parametrize("model_path", CAUSAL_PATHS, ids=CAUSAL_PATHS)
-@pytest.mark.slow
-def test_short_two_blocks_plus_spyre(model_path: str) -> None:
-    ok, detail = run_greedy_case(model_path, "short_two_blocks_plus")
-    assert ok, detail
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
