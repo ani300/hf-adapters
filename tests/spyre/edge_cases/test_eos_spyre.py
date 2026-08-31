@@ -19,6 +19,7 @@ import time
 import pytest
 import torch
 
+from hf_adapters.hf_common import encode_prompts
 from tests._generate_edge_case_helpers import (
     hf_reference_outputs,
     make_prompt_with_eos_inside,
@@ -101,7 +102,7 @@ def test_no_eos_runs_full_budget_spyre(model_path: str) -> None:
         no_eos_max_new = 64 + 7
         no_eos_refs = []
         for prompt in no_eos_prompts:
-            encoded = tokenizer(prompt, return_tensors="pt")
+            encoded = encode_prompts(tokenizer, prompt)
             with torch.no_grad():
                 out = ref_model.generate(
                     **encoded,

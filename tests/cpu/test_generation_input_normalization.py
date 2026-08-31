@@ -17,6 +17,7 @@ import torch
 
 from hf_adapters.hf_common import (
     build_prefill_mask,
+    encode_prompts,
     generation_cache_len,
     normalize_generation_inputs,
 )
@@ -31,6 +32,51 @@ def _normalize(input_ids, attention_mask=None):
             else torch.tensor(attention_mask, dtype=torch.long)
         ),
     )
+
+
+class _RecordingTokenizer:
+    eos_token = "<eos>"
+    pad_token = None
+
+    def __init__(self, chat_template=None):
+        self.chat_template = chat_template
+        self.call = None
+
+    def apply_chat_template(self, conversations, **kwargs):
+        self.call = ("chat", conversations, kwargs)
+        return {"input_ids": "chat-ids", "attention_mask": "chat-mask"}
+
+    def __call__(self, prompts, **kwargs):
+        self.call = ("plain", prompts, kwargs)
+        return {"input_ids": "plain-ids", "attention_mask": "plain-mask"}
+
+
+def test_encode_prompts_uses_chat_template_by_default():
+    tokenizer = _RecordingTokenizer(chat_template="template")
+
+    encoded = encode_prompts(tokenizer, "hello")
+
+    assert encoded["input_ids"] == "chat-ids"
+    kind, conversations, kwargs = tokenizer.call
+    assert kind == "chat"
+    assert conversations == [[{"role": "user", "content": "hello"}]]
+    assert kwargs["add_generation_prompt"] is True
+    assert kwargs["padding_side"] == "left"
+    assert tokenizer.pad_token == tokenizer.eos_token
+
+
+def test_encode_prompts_can_force_plain_right_padding():
+    tokenizer = _RecordingTokenizer(chat_template="template")
+
+    encoded = encode_prompts(
+        tokenizer, ["short", "longer"], chat=False, padding_side="right"
+    )
+
+    assert encoded["input_ids"] == "plain-ids"
+    kind, prompts, kwargs = tokenizer.call
+    assert kind == "plain"
+    assert prompts == ["short", "longer"]
+    assert kwargs["padding_side"] == "right"
 
 
 @pytest.mark.parametrize(

@@ -7,10 +7,13 @@ stopping, but diverges from stock HF in several ways worth documenting.
 ## Stock-shaped inputs and basic output
 
 - **Inputs are pre-tokenized.** Callers pass `input_ids` and an optional
-  `attention_mask`, as with stock HF. Ordinary contiguous left or right caller
-  padding is removed on CPU, the logical prompts are compacted, and each row is
-  right-aligned in the internal 64-token block layout before prefill. Sparse
-  masks with holes are rejected rather than silently reinterpreted.
+  `attention_mask`, as with stock HF. `hf_adapters.encode_prompts()` is provided
+  for canonical model-aware tokenization: it applies the checkpoint's chat
+  template for instruct models and ordinary tokenizer post-processing for base
+  models. Ordinary contiguous left or right caller padding is removed on CPU,
+  the logical prompts are compacted, and each row is right-aligned in the
+  internal 64-token block layout before prefill. Sparse masks with holes are
+  rejected rather than silently reinterpreted.
 - **The default return is a token tensor.** It contains the caller's exact
   `input_ids` prefix followed by generated tokens, including EOS. Decode the
   continuation outside `generate()` with the tokenizer, as with stock HF.

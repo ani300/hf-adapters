@@ -68,9 +68,25 @@ outputs = tokenizer.batch_decode(
 print(outputs[0])
 ```
 
-The `AutoSpyreModelForCausalLM` class automatically selects the correct adapter module based on the model's config type.
+The only change from a stock Hugging Face script is the model class —
+`AutoSpyreModelForCausalLM` instead of `AutoModelForCausalLM`. Tokenization,
+generation arguments, and decoding all work the same way.
 
-`model.generate()` follows the stock Hugging Face input and basic tensor-output conventions, but supports a smaller set of generation features (see [docs/generate_vs_stock_hf.md](docs/generate_vs_stock_hf.md)).
+`model.generate()` follows the stock Hugging Face input and basic tensor-output
+conventions, but supports a smaller set of generation features (see
+[docs/generate_vs_stock_hf.md](docs/generate_vs_stock_hf.md)).
+
+For instruct checkpoints, the convenience helper `encode_prompts()` applies the
+model's chat template automatically (or plain tokenizer post-processing for base
+models). It is recommended when you want canonical tokenization without manual
+template handling:
+
+```python
+from hf_adapters import AutoSpyreModelForCausalLM, encode_prompts
+
+inputs = encode_prompts(tokenizer, ["What is 2+2?"])
+sequences = model.generate(**inputs, max_new_tokens=5)
+```
 
 ## Embedding Models
 

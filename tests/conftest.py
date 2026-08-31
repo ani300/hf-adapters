@@ -146,16 +146,10 @@ from hf_adapters.auto_spyre_model import (  # noqa: E402
 
 
 def encode_generation_inputs(tokenizer: Any, prompts: list[str]):
-    """Tokenize a generation batch with ordinary right padding."""
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-    return tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        return_attention_mask=True,
-    )
+    """Tokenize canonically, using right padding to exercise input normalization."""
+    from hf_adapters.hf_common import encode_prompts
+
+    return encode_prompts(tokenizer, prompts, padding_side="right")
 
 
 def pytest_configure(config: Config) -> None:

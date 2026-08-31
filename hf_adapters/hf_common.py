@@ -148,6 +148,50 @@ def text_config(config):
     return getattr(config, "text_config", None) or config
 
 
+def encode_prompts(
+    tokenizer,
+    prompts,
+    *,
+    padding_side: str = "left",
+    add_generation_prompt: bool = True,
+    chat: bool | None = None,
+):
+    """Tokenize prompt(s) following the model's canonical input scheme.
+
+    Chat/instruct models use their chat template with one user turn and a
+    trailing generation prompt. Base models use the tokenizer directly, which
+    preserves the checkpoint's own special-token post-processor. ``chat`` can
+    force either behavior; by default, the presence of a chat template decides.
+
+    Returns a padded ``BatchEncoding`` containing ``input_ids`` and
+    ``attention_mask``. A single string is normalized to a one-row batch.
+    """
+    prompt_list = [prompts] if isinstance(prompts, str) else list(prompts)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    use_chat = (tokenizer.chat_template is not None) if chat is None else chat
+    if use_chat:
+        conversations = [[{"role": "user", "content": p}] for p in prompt_list]
+        return tokenizer.apply_chat_template(
+            conversations,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            padding=True,
+            padding_side=padding_side,
+        )
+    return tokenizer(
+        prompt_list,
+        return_tensors="pt",
+        padding=True,
+        padding_side=padding_side,
+        return_attention_mask=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # RoPE: precompute rotation matrices on CPU
 # ---------------------------------------------------------------------------
