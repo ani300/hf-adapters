@@ -268,7 +268,6 @@ CAUSAL_LM_MODELS = {
         "adapter": "hf_gemma4_moe.py",
         "size": "26b",
         "dtype": "bfloat16",
-        "is_gated": True,
     },
     # DSpark speculative-decoding drafters (block proposers). kind="dspark_draft"
     # keeps them out of the generate-based causal-LM harnesses (see CAUSAL_PATHS);
