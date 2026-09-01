@@ -73,7 +73,6 @@ Usage::
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_spyre._inductor import config as spyre_config
 
 from hf_adapters.hf_common import (
     InvFreqShim,
@@ -82,6 +81,7 @@ from hf_adapters.hf_common import (
     apply_rope_matmul,
     get_backbone,
     kv_cache_update,
+    optional_spyre_config_patch,
     pad_lm_head,
     text_config,
 )
@@ -323,7 +323,7 @@ def _build_layer_masks(
     return {"full_attention": attn_mask, "sliding_attention": sliding_mask}
 
 
-@spyre_config.patch({"frontend_pool_allocation": True})
+@optional_spyre_config_patch({"frontend_pool_allocation": True})
 def _run_blocks_over_embeds(
     model,
     h,
