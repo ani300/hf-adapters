@@ -212,12 +212,13 @@ def _shared_producer_map(cfg):
     return first, producer_of
 
 
-def _zero_fully_masked_rows(h, attn_mask):
-    """Zero the hidden-state rows whose attention mask is entirely ``-inf``.
+def _query_row_mask(h, attn_mask):
+    """Return a multiplier that is zero for fully masked query rows.
 
     Under ``hf_common.generate``'s block-padded prefill, a short prompt is
     left-padded to a ``BLOCK_SIZE`` multiple. The leading pad query rows attend
-    to *no* key (their whole mask row is ``-inf``), so their output is discarded
+    to *no* key (their whole mask row contains only the finite mask fill value),
+    so their output is discarded
     downstream — but they still flow through the decoder and write K/V into the
     padded cache slots. On Gemma 4 that is fatal: the ``<pad>`` (id 0) embedding
     RMSNorms to a large-magnitude activation whose MLP ``gate*up`` product
@@ -230,13 +231,12 @@ def _zero_fully_masked_rows(h, attn_mask):
     ``<pad>``. (A mask fix cannot help: the poison is a NaN *key*, not a masking
     error.)
 
-    Zeroing these rows breaks the chain at the source: Gemma 4 has no
-    projection biases and SDPA returns exactly ``0`` for a fully-masked row, so
-    ``RMSNorm(0) = 0`` and an all-zero row stays all-zero through every layer —
-    the pad cache slots hold clean zeros and real rows (masked ``-inf`` against
-    them) get weight 0. Real query rows always attend to at least their own
-    position, so they are never zeroed and their numerics are unchanged; in the
-    unpadded path (no fully-masked row) this is a no-op.
+    The mask builder uses a finite negative sentinel rather than ``-inf``.
+    Consequently SDPA can produce a nonzero result for an invalid query even
+    when its input embedding is zero. The caller therefore applies this mask
+    before the first block and after every block, keeping invalid rows (and the
+    K/V they write in the following layer) neutral throughout the decoder.
+    Valid query rows always contain at least one zero-valued, attendable entry.
 
     The fully-masked test is derived on **CPU** (a boolean reduction) and only
     the resulting float multiplier is moved to ``h``'s device, mirroring
@@ -244,11 +244,11 @@ def _zero_fully_masked_rows(h, attn_mask):
     on-device boolean reductions. This runs in the eager block driver, outside
     any compiled region, so it is static and Spyre-safe.
     """
-    # attn_mask: [B, 1, S, cache_len]. A row is "live" if it has any finite
-    # (attendable) key; pad rows are entirely -inf -> multiplier 0.
+    # attn_mask: [B, 1, S, cache_len]. Allowed entries are exactly zero;
+    # disallowed entries use the finite value returned by _mask_fill_value.
     am = attn_mask.to("cpu")
-    live_rows = torch.isfinite(am).any(dim=-1).any(dim=1).to(h.dtype)  # [B, S]
-    return h * live_rows.to(h.device)[:, :, None]
+    live_rows = (am == 0).any(dim=-1).any(dim=1).to(h.dtype)  # [B, S]
+    return live_rows.to(h.device)[:, :, None]
 
 
 def _patch_gemma4_rmsnorm(rmsnorm_cls):
@@ -572,6 +572,7 @@ def _run_blocks_over_embeds(
     cache_index,
     masks=None,
     per_layer_inputs=None,
+    query_row_mask=None,
 ):
     """Run the compiled Gemma 4 decoder blocks over precomputed embeddings.
 
@@ -592,6 +593,10 @@ def _run_blocks_over_embeds(
     ``per_layer_input=None`` is passed to each block, never read since
     ``has_ple=False`` gates the PLE tail off. A ``None`` (not a zero-length
     tensor) keeps the "no zero-length tensors on Spyre" rule on the shared path.
+
+    ``query_row_mask`` is the optional ``[B, S, 1]`` validity multiplier for
+    block-padded text prefill. It is reapplied after every block because a
+    finite all-masked attention row is not guaranteed to produce zero.
 
     Each layer dispatches on ``model._spyre_producer_of[i]``: ``None`` runs the
     full block (writes its own KV cache, returns a 3-tuple); an int runs the
@@ -662,6 +667,8 @@ def _run_blocks_over_embeds(
                 backbone_layers[i].layer_scalar,
                 pli,
             )
+        if query_row_mask is not None:
+            h = h * query_row_mask
 
     norm = backbone.norm
     weight = norm.weight if norm.with_scale else None
@@ -688,8 +695,10 @@ def _run_backbone_forward(
     h = backbone.embed_tokens(input_ids)
     # Only prefill can contain fully-masked left-pad query rows. Avoid the CPU
     # mask transfer and reduction on every single-token decode step.
+    query_row_mask = None
     if h.shape[1] > 1:
-        h = _zero_fully_masked_rows(h, attn_mask)
+        query_row_mask = _query_row_mask(h, attn_mask)
+        h = h * query_row_mask
     per_layer_inputs = _compute_per_layer_inputs(model, h, input_ids)
     return _run_blocks_over_embeds(
         model,
@@ -700,6 +709,7 @@ def _run_backbone_forward(
         value_caches,
         cache_index,
         per_layer_inputs=per_layer_inputs,
+        query_row_mask=query_row_mask,
     )
 
 

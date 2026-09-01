@@ -279,6 +279,7 @@ CAUSAL_LM_MODELS = {
         "path": "google/gemma-4-12B-it",
         "adapter": "hf_gemma4.py",
         "size": "12b",
+        "always_test": True,
     },
     "gemma4_31b": {
         "name": "Gemma 4 31B",
