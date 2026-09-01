@@ -396,6 +396,7 @@ class Gemma4Block(nn.Module):
         cache_index,
         layer_scalar,
         per_layer_input=None,
+        query_row_mask=None,
     ):
         residual = hidden_states
         h = self.input_layernorm(hidden_states)
@@ -417,7 +418,10 @@ class Gemma4Block(nn.Module):
         h = residual + h
         if self.has_ple:
             h = _ple_tail(self, h, per_layer_input)
-        return h * layer_scalar, key_cache, value_cache
+        h = h * layer_scalar
+        if query_row_mask is not None:
+            h = h * query_row_mask
+        return h, key_cache, value_cache
 
 
 class Gemma4SharedBlock(nn.Module):
@@ -466,6 +470,7 @@ class Gemma4SharedBlock(nn.Module):
         value_cache,
         layer_scalar,
         per_layer_input=None,
+        query_row_mask=None,
     ):
         residual = hidden_states
         h = self.input_layernorm(hidden_states)
@@ -493,7 +498,10 @@ class Gemma4SharedBlock(nn.Module):
         h = residual + h
         if self.has_ple:
             h = _ple_tail(self, h, per_layer_input)
-        return h * layer_scalar
+        h = h * layer_scalar
+        if query_row_mask is not None:
+            h = h * query_row_mask
+        return h
 
 
 def prepare_gemma4_blocks(
@@ -595,8 +603,10 @@ def _run_blocks_over_embeds(
     tensor) keeps the "no zero-length tensors on Spyre" rule on the shared path.
 
     ``query_row_mask`` is the optional ``[B, S, 1]`` validity multiplier for
-    block-padded text prefill. It is reapplied after every block because a
-    finite all-masked attention row is not guaranteed to produce zero.
+    block-padded text prefill. Each compiled block applies it to its output
+    because a finite all-masked attention row is not guaranteed to produce
+    zero. Keeping this operation inside the compiled graph also preserves the
+    expected layout at the boundary between blocks.
 
     Each layer dispatches on ``model._spyre_producer_of[i]``: ``None`` runs the
     full block (writes its own KV cache, returns a 3-tuple); an int runs the
@@ -655,6 +665,7 @@ def _run_blocks_over_embeds(
                 cache_index,
                 backbone_layers[i].layer_scalar,
                 pli,
+                query_row_mask,
             )
         else:
             # KV-sharing layer: read the producer's cache, write nothing.
@@ -666,9 +677,8 @@ def _run_blocks_over_embeds(
                 value_caches[p],
                 backbone_layers[i].layer_scalar,
                 pli,
+                query_row_mask,
             )
-        if query_row_mask is not None:
-            h = h * query_row_mask
 
     norm = backbone.norm
     weight = norm.weight if norm.with_scale else None
