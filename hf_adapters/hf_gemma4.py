@@ -257,7 +257,13 @@ def _patch_gemma4_rmsnorm(rmsnorm_cls):
     def _forward_fp16(self, hidden_states):
         if hidden_states.device.type == "spyre":
             weight = self.weight if self.with_scale else None
-            return _gemma4_rms_norm(hidden_states, weight, self.eps)
+            # When a parent region is already being traced, expose the RMSNorm
+            # operations directly to that graph. A standalone eager module call
+            # needs the whole upcast/reduction/downcast chain compiled together
+            # so the DL16<->fp32 staggered element arrangement is preserved.
+            if torch.compiler.is_compiling():
+                return _gemma4_rms_norm(hidden_states, weight, self.eps)
+            return _compiled_gemma4_rms_norm(hidden_states, weight, self.eps)
         # CPU path: fp32 for numerical parity with stock HF.
         xf = hidden_states.float()
         variance = (xf * xf).mean(-1, keepdim=True)
