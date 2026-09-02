@@ -297,6 +297,7 @@ CAUSAL_LM_MODELS = {
         "size": "26b",
         "dtype": "bfloat16",
     },
+    # hf_gemma4.py E variants
     "gemma4_e2b": {
         "name": "Gemma 4 E2B",
         "path": "google/gemma-4-E2B-it",

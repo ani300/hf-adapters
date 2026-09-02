@@ -71,8 +71,8 @@ E-variant support (E2B / E4B): the two E-variant features are handled here:
   Q-only block (no k/v proj, no cache write) against that producer's cache — see
   ``_shared_producer_map`` and ``Gemma4SharedBlock``.
 
-Still out of scope: MoE blocks (26B-A4B). ``prepare_for_spyre`` asserts MoE is
-absent so an unsupported checkpoint fails loudly instead of running incorrectly.
+The MoE 26B-A4B variant is handled by the sibling ``hf_gemma4_moe`` adapter,
+which reuses this module's attention-side setup and forward driver.
 
 Usage::
 
@@ -189,7 +189,7 @@ def _shared_producer_map(cfg):
     Shared layers are the last ``num_kv_shared_layers`` layers; each reuses the
     KV of the nearest preceding NON-shared layer of the same ``layer_type``
     (stock Gemma4 ``store_full_length_kv`` semantics). Non-shared layers map to
-    ``None``. Returns ``(first_shared_index, producer_of)``.
+    ``None``. Returns ``producer_of``.
     """
     n = cfg.num_hidden_layers
     n_shared = getattr(cfg, "num_kv_shared_layers", 0)
@@ -197,7 +197,7 @@ def _shared_producer_map(cfg):
     layer_types = cfg.layer_types
     producer_of = [None] * n
     if n_shared <= 0:
-        return first, producer_of
+        return producer_of
     # Last non-shared layer index per type (only layers before `first` produce).
     last_by_type = {}
     for i in range(first):
@@ -209,7 +209,7 @@ def _shared_producer_map(cfg):
             "same-type producer before the KV-share boundary."
         )
         producer_of[i] = p
-    return first, producer_of
+    return producer_of
 
 
 def _query_row_mask(h, attn_mask):
@@ -608,10 +608,11 @@ def _run_blocks_over_embeds(
     zero. Keeping this operation inside the compiled graph also preserves the
     expected layout at the boundary between blocks.
 
-    Each layer dispatches on ``model._spyre_producer_of[i]``: ``None`` runs the
-    full block (writes its own KV cache, returns a 3-tuple); an int runs the
+    Dense/E layers dispatch on ``model._spyre_producer_of[i]``: ``None`` runs
+    the full block (writes its own KV cache, returns a 3-tuple); an int runs the
     shared block against that producer layer's cache (returns 1 tensor; the
-    shared layer's own cache entry is never written).
+    shared layer's own cache entry is never written). Dedicated MoE blocks keep
+    their original seven-argument call contract.
     """
     backbone = _gemma4_backbone(model)
     cfg = text_config(model.config)
@@ -638,6 +639,7 @@ def _run_blocks_over_embeds(
 
     backbone_layers = backbone.layers
     producer_of = model._spyre_producer_of
+    is_moe = bool(getattr(cfg, "enable_moe_block", False))
     for i, compiled_block in enumerate(model._spyre_compiled_blocks):
         lt = cfg.layer_types[i]
         # Each PLE slice needs fresh offset-0 storage at the graph boundary. A
@@ -655,7 +657,20 @@ def _run_blocks_over_embeds(
         # Pass the per-layer scalar as a tensor read fresh from the registered,
         # device-moved block — NOT as a Python float — so Dynamo guards on tensor
         # metadata instead of recompiling for each distinct learned value.
-        if p is None:
+        if is_moe:
+            # The dedicated MoE blocks predate the dense/E optional inputs and
+            # compile their attention and FFN regions internally. Preserve that
+            # call contract while sharing the surrounding Gemma 4 driver.
+            h, key_caches[i], value_caches[i] = compiled_block(
+                h,
+                freqs[lt],
+                masks[lt],
+                key_caches[i],
+                value_caches[i],
+                cache_index,
+                backbone_layers[i].layer_scalar,
+            )
+        elif p is None:
             h, key_caches[i], value_caches[i] = compiled_block(
                 h,
                 freqs[lt],
@@ -698,15 +713,17 @@ def _run_backbone_forward(
     """Gemma 4 backbone: scaled embedding, per-type RoPE + masks, blocks, norm.
 
     Text-only path: embed the ids (scaled word embedding), neutralize left-pad
-    rows, compute the PLE tensor (``None`` for non-PLE models), then delegate to
-    ``_run_blocks_over_embeds`` (no blockwise vision band).
+    rows for dense/E models, compute the PLE tensor (``None`` for non-PLE
+    models), then delegate to ``_run_blocks_over_embeds`` (no blockwise vision
+    band).
     """
     backbone = _gemma4_backbone(model)
     h = backbone.embed_tokens(input_ids)
     # Only prefill can contain fully-masked left-pad query rows. Avoid the CPU
     # mask transfer and reduction on every single-token decode step.
     query_row_mask = None
-    if h.shape[1] > 1:
+    cfg = text_config(model.config)
+    if h.shape[1] > 1 and not getattr(cfg, "enable_moe_block", False):
         query_row_mask = _query_row_mask(h, attn_mask)
         h = h * query_row_mask
     per_layer_inputs = _compute_per_layer_inputs(model, h, input_ids)
@@ -780,10 +797,16 @@ def _setup_gemma4_text_decoder(model, *, allow_moe=False):
 
     # E-variant features (handled): PLE flag + KV-share producer map.
     model._spyre_has_ple = bool(getattr(cfg, "hidden_size_per_layer_input", 0))
-    _, producer_of = _shared_producer_map(cfg)
-    model._spyre_producer_of = producer_of
+    model._spyre_producer_of = _shared_producer_map(cfg)
 
-    if not allow_moe:
+    if allow_moe:
+        assert (
+            not model._spyre_has_ple
+        ), "Gemma 4 MoE adapter does not support per-layer embeddings (PLE)."
+        assert not getattr(
+            cfg, "num_kv_shared_layers", 0
+        ), "Gemma 4 MoE adapter does not support KV-sharing across layers."
+    else:
         assert not getattr(cfg, "enable_moe_block", False), (
             "Gemma 4 dense adapter does not support MoE blocks "
             "(enable_moe_block=True); use hf_gemma4_moe."
@@ -834,8 +857,8 @@ def prepare_text_decoder_for_spyre(model):
     """Prepare ONLY the Gemma 4 **dense** text decoder for Spyre (in-place).
 
     Runs the shared attention-side setup (``_setup_gemma4_text_decoder``:
-    MoE/E2B/KV-share asserts, RMSNorm patch, per-type RoPE, KV shapes, LM-head
-    padding) then compiles a dense ``Gemma4Block`` per decoder layer. The MoE
+    feature dispatch, RMSNorm patch, per-type RoPE, KV shapes, LM-head padding)
+    then compiles a dense ``Gemma4Block`` per decoder layer. The MoE
     adapter (``hf_gemma4_moe``) calls the same seam with ``allow_moe=True`` and
     compiles its own MoE blocks instead.
     """

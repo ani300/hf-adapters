@@ -571,8 +571,8 @@ on global layers, unscaled attention (`scale=1.0`), and final-logit
 softcapping. E2B / E4B additionally use per-layer embeddings and trailing
 KV-sharing layers; each PLE slice is copied into fresh offset-zero storage
 before crossing a compiled-block boundary, including singleton decode steps.
-This is a small PLE copy, not a KV-cache copy. MoE (26B-A4B) remains unsupported
-and is rejected by `prepare_for_spyre`.
+This is a small PLE copy, not a KV-cache copy. The MoE 26B-A4B variant uses the
+dedicated `hf_gemma4_moe.py` adapter, which shares this attention-side setup.
 
 **Learned absolute positions + Conv1D** (GPT-2): `hf_gpt2.py` is the first
 non-RoPE decoder — positions come from a learned `wpe` table added to `wte`, so
