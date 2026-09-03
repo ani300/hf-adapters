@@ -70,6 +70,7 @@ from hf_adapters.auto_spyre_model import (
     resolve_adapter_module,
 )
 from hf_adapters.hf_common import (
+    _SDPA_MAX_SEQUENCE_TILE_SIZE,
     DEVICE,
     allocate_kv_caches,
     build_decode_mask,
@@ -161,7 +162,7 @@ def _adapter_teacher_forced_steps(
 
     max_cache_len = generation_cache_len(prompt_length, n_steps)
     padded_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
-        input_ids, actual_prompt_lengths
+        input_ids, actual_prompt_lengths, _SDPA_MAX_SEQUENCE_TILE_SIZE
     )
     key_caches, value_caches = allocate_kv_caches(
         model, batch_size, max_cache_len, model_d_type

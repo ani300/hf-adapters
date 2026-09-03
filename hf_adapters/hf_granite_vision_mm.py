@@ -58,6 +58,7 @@ import torch
 
 from hf_adapters import hf_siglip_vision
 from hf_adapters.hf_common import (
+    _SDPA_MAX_SEQUENCE_TILE_SIZE,
     DEVICE,
     _resolve_generation_params,
     allocate_kv_caches,
@@ -332,7 +333,7 @@ def prefill_logits(model, input_ids, attention_mask, pixel_values, image_sizes):
     """
     actual_lengths = attention_mask.sum(dim=1)
     padded_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
-        input_ids, actual_lengths
+        input_ids, actual_lengths, _SDPA_MAX_SEQUENCE_TILE_SIZE
     )
     key_caches, value_caches = allocate_kv_caches(
         model, padded_ids.shape[0], padded_len, get_model_dtype(model)
@@ -447,7 +448,7 @@ def generate(
 
     max_cache_len = generation_cache_len(prompt_length, max_new_tokens)
     input_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
-        input_ids, actual_prompt_lengths
+        input_ids, actual_prompt_lengths, _SDPA_MAX_SEQUENCE_TILE_SIZE
     )
 
     key_caches, value_caches = allocate_kv_caches(
