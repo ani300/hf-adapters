@@ -47,8 +47,6 @@ which models are supported on Spyre.
 **Spyre Compiles** = `torch.compile(block_forward)` succeeds on Spyre.
 **Spyre Runs** = block produces output (no crash/NaN).
 
-Unless a row notes otherwise (e.g. `(bf16)`), **verified means verified in fp16** — this holds even for bf16-native checkpoints. A bf16-native model that is only verified in fp16 may behave differently in bf16 on Spyre (and vice versa); the dtype actually tested is what the table certifies.
-
 **Gemma 4 26B-A4B (MoE):** 128 experts, top-8 routing. Prefill uses a persistent
 expert loop (all experts evaluated, routed via `keep_by_index` + coarse-tile
 carried sum). Decode uses per-token expert gather with BMM. Both paths compile
