@@ -339,8 +339,10 @@ class Gemma4Attention(nn.Module):
 
         q = self._rms_norm(q, self.q_norm).transpose(1, 2)
         k = self._rms_norm(k_lin, self.k_norm).transpose(1, 2)
-        q = apply_rope_matmul(q, selected_freqs)
-        k = apply_rope_matmul(k, selected_freqs)
+        # Materialize the transpose returned by RoPE before the cache scatter.
+        # A view here can make index_copy_ consume the wrong physical layout.
+        q = apply_rope_matmul(q, selected_freqs).contiguous()
+        k = apply_rope_matmul(k, selected_freqs).contiguous()
 
         key_cache, value_cache = kv_cache_update(
             k,
