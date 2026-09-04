@@ -92,8 +92,9 @@ def adapter_greedy_steps(
 ) -> list[dict[str, Any]]:
     """Run adapter forward on Spyre for prefill + N decode steps."""
     from hf_adapters.hf_common import (
-        _SDPA_MAX_SEQUENCE_TILE_SIZE,
+        BLOCK_SIZE,
         _materialize_decode_mask_heads,
+        _prefill_cache_inputs,
         _sdpa_compatible_kv_length,
         allocate_kv_caches,
         build_decode_mask,
@@ -109,8 +110,9 @@ def adapter_greedy_steps(
     vocab_size = getattr(cfg, "vocab_size", None) or cfg.text_config.vocab_size
 
     actual_lengths = torch.full((batch_size,), seq_len, dtype=torch.long)
+    prefill_chunk_size = getattr(model, "_spyre_prefill_chunk_size", None)
     padded_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
-        input_ids, actual_lengths, _SDPA_MAX_SEQUENCE_TILE_SIZE
+        input_ids, actual_lengths, prefill_chunk_size or BLOCK_SIZE
     )
     prompt_offset = (
         prompt_offsets if isinstance(prompt_offsets, int) else prompt_offsets[0].item()
@@ -123,17 +125,19 @@ def adapter_greedy_steps(
     key_caches, value_caches = allocate_kv_caches(
         model, batch_size, max_cache_len, dtype
     )
-    prefill_key_caches = [
-        c[:, :, :prefill_kv_len, :] if c.ndim == 4 else c for c in key_caches
-    ]
-    prefill_value_caches = [
-        c[:, :, :prefill_kv_len, :] if c.ndim == 4 else c for c in value_caches
-    ]
+    chunked_prefill = prefill_chunk_size is not None
+    prefill_cache_len = prefill_kv_len if chunked_prefill else max_cache_len
+    prefill_key_caches = _prefill_cache_inputs(
+        key_caches, prefill_cache_len, chunked_prefill
+    )
+    prefill_value_caches = _prefill_cache_inputs(
+        value_caches, prefill_cache_len, chunked_prefill
+    )
 
     results = []
 
     prefill_mask = build_prefill_mask(
-        batch_size, padded_len, prefill_kv_len, prompt_offset, dtype=dtype
+        batch_size, padded_len, prefill_cache_len, prompt_offset, dtype=dtype
     )
 
     with torch.no_grad():

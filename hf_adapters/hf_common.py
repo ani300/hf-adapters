@@ -23,6 +23,7 @@ compiled block functions.
 
 import math
 import os
+import sys
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Optional
@@ -1272,15 +1273,27 @@ def _sdpa_compatible_kv_length(min_length: int) -> int:
 def generation_cache_len(prompt_length: int, max_new_tokens: int) -> int:
     """Compute a compiler-compatible KV cache size for prompt plus generation.
 
-    The base requirement pads prompt and generation capacity independently to
-    one stick.  The standard SDPA lowering stages fixed-size KV blocks, whose
-    extent must divide the backing cache tensor.  Add the minimum whole-stick
-    padding that satisfies that constraint; short generations normally need
-    no extra space, while an exact 8K/32K prompt gains one 512-token block.
+    Callers must pass the padded prefill extent, not the raw prompt length, so
+    the first decode position is inside the cache. The base requirement pads
+    prompt and generation capacity independently to one stick. The standard
+    SDPA lowering stages fixed-size KV blocks, whose extent must divide the
+    backing cache tensor. Add the minimum whole-stick padding that satisfies
+    that constraint; short generations normally need no extra space, while an
+    exact 8K/32K prompt gains one 512-token block.
     """
     padded_prompt = math.ceil(prompt_length / BLOCK_SIZE) * BLOCK_SIZE
     padded_generation = math.ceil(max_new_tokens / BLOCK_SIZE) * BLOCK_SIZE
     return _sdpa_compatible_kv_length(padded_prompt + padded_generation)
+
+
+def _prefill_cache_inputs(caches, prefill_kv_len, chunked_prefill):
+    """Select cache tensors passed to prefill without wrapping one-shot caches."""
+    if not chunked_prefill:
+        return caches
+    return [
+        cache[:, :, :prefill_kv_len, :] if cache.ndim == 4 else cache
+        for cache in caches
+    ]
 
 
 def _cache_position_first_stl(batch_size, num_kv_heads, max_cache_len, head_dim, dtype):
@@ -1803,7 +1816,7 @@ def normalize_generation_inputs(input_ids, attention_mask=None):
         compact_ids[b, compact_len - valid_ids.numel() :] = valid_ids
 
     padded_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
-        compact_ids, actual_lengths, _SDPA_MAX_SEQUENCE_TILE_SIZE
+        compact_ids, actual_lengths
     )
     return (
         padded_ids,
@@ -1962,7 +1975,8 @@ def generate(
             stock ``generate()``).
         timing: Print per-token latency.
         prefill_chunk_size (via generation_config or kwargs): Query length for
-            each prefill chunk.  Defaults to ``_SDPA_MAX_SEQUENCE_TILE_SIZE``.
+            each prefill chunk. Falls back to the adapter's configured chunk
+            size, or one-shot prefill when the adapter has no override.
     """
     overrides = {
         "max_new_tokens": max_new_tokens,
@@ -2028,8 +2042,8 @@ def generate(
 
     prefill_chunk_size = getattr(cfg, "prefill_chunk_size", None)
     if prefill_chunk_size is None:
-        prefill_chunk_size = _SDPA_MAX_SEQUENCE_TILE_SIZE
-    if (
+        prefill_chunk_size = getattr(model, "_spyre_prefill_chunk_size", None)
+    if prefill_chunk_size is not None and (
         isinstance(prefill_chunk_size, bool)
         or not isinstance(prefill_chunk_size, int)
         or prefill_chunk_size <= 0
@@ -2042,13 +2056,18 @@ def generate(
 
     # Re-pad to a complete chunk if needed (normalize_generation_inputs
     # already padded to BLOCK_SIZE; chunk size may be larger).
-    if padded_len % prefill_chunk_size != 0:
+    if prefill_chunk_size is not None and padded_len % prefill_chunk_size != 0:
         input_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
             input_ids, actual_prompt_lengths, prefill_chunk_size
         )
 
+    chunked_prefill = prefill_chunk_size is not None
+    prefill_chunk_size = prefill_chunk_size or padded_len
+
     max_cache_len = generation_cache_len(padded_len, effective_max_new_tokens)
-    prefill_kv_len = _sdpa_compatible_kv_length(padded_len)
+    prefill_kv_len = (
+        _sdpa_compatible_kv_length(padded_len) if chunked_prefill else max_cache_len
+    )
 
     # Initialize empty KV caches. Per-layer shapes come from the model
     # (``_spyre_kv_shapes``) for heterogeneous architectures like Gemma 4,
@@ -2079,14 +2098,16 @@ def generate(
             # lengths gain only enough inactive KV columns for the selected
             # compiler block to divide Lk.  These prefix views share storage,
             # so in-place KV updates still seed the full decode caches.
-            prefill_key_caches = [
-                cache[:, :, :prefill_kv_len, :] if cache.ndim == 4 else cache
-                for cache in key_caches
-            ]
-            prefill_value_caches = [
-                cache[:, :, :prefill_kv_len, :] if cache.ndim == 4 else cache
-                for cache in value_caches
-            ]
+            # Preserve the original tensors for one-shot prefill. Even a
+            # full-extent slice is a view, and an in-place compiled update
+            # through that view does not reliably seed the tensors consumed by
+            # decode on Spyre.
+            prefill_key_caches = _prefill_cache_inputs(
+                key_caches, prefill_kv_len, chunked_prefill
+            )
+            prefill_value_caches = _prefill_cache_inputs(
+                value_caches, prefill_kv_len, chunked_prefill
+            )
             # Keep Lk fixed at the complete prefill extent while advancing Lq.
             # Future cache slots are still zero and are masked, and a fixed Lk
             # avoids compiling one attention graph for every prefix length.
@@ -2287,22 +2308,24 @@ def _named_standard_gqa_attention_inputs(query, key, value):
         yield
         return
 
-    from torch_spyre._inductor.wsr.propagate_named_dims import (  # type: ignore[import-not-found]
-        declare_tensor_dim,
-        name_tensor_dims,
-        reset,
-    )
+    # Access the module registered by PyTorch's Spyre backend auto-loader.
+    # Importing torch_spyre here can recurse through backend initialization.
+    named_dims = sys.modules["torch_spyre._inductor.wsr.propagate_named_dims"]
 
     try:
         _apply_standard_gqa_attention_dim_names(
-            query, key, value, declare_tensor_dim, name_tensor_dims
+            query,
+            key,
+            value,
+            named_dims.declare_tensor_dim,
+            named_dims.name_tensor_dims,
         )
         yield
     finally:
         # Compilation consumes and clears these globals itself. A cache-hit
         # execution does not, so clear them here to avoid leaking annotations
         # into a later, unrelated compilation.
-        reset()
+        named_dims.reset()
 
 
 class StandardGQAAttention(nn.Module):
