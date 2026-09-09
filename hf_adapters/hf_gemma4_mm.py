@@ -157,6 +157,11 @@ def prepare_for_spyre(model):
         "this checkpoint has no vision_config."
     )
 
+    # The unified VLM's bidirectional vision overlay widens attention, which the
+    # sliding-window op cannot express. Opt out here, before the blocks are built:
+    # prepare_text_decoder_for_spyre only fills in _spyre_swa_mode when absent.
+    model._spyre_swa_mode = None
+
     # Shared text decoder (mirrors hf_gemma4.prepare_for_spyre).
     hf_gemma4.prepare_text_decoder_for_spyre(model)
     assert not model._spyre_has_ple, (

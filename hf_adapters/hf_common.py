@@ -1425,6 +1425,9 @@ def allocate_kv_caches(model, batch_size, max_cache_len, dtype, device=None):
     correctly-sized caches per layer. Returns ``(key_caches, value_caches)``
     lists. ``device`` defaults to the module ``DEVICE`` resolved at call time (so
     the conftest CPU patch applies).
+
+    Models that need specialized per-layer capacities may install a
+    ``model._spyre_cache_allocator`` hook.
     """
     if device is None:
         device = DEVICE
@@ -2127,6 +2130,13 @@ def generate(
     prefill_kv_len = (
         _sdpa_compatible_kv_length(padded_len) if chunked_prefill else max_cache_len
     )
+    # Per-layer cache management needs the left padding: a sliding-window layer
+    # cannot mask pad columns with an attention mask (see swa_attention).
+    model._spyre_prompt_offsets = prompt_offsets
+    # Specialized cache allocators and prefill/decode state transitions need the
+    # padded prompt extent before caches are allocated. Keep this as host metadata;
+    # it is not an input to compiled graphs.
+    model._spyre_padded_prompt_len = padded_len
 
     # Initialize empty KV caches. Per-layer shapes come from the model
     # (``_spyre_kv_shapes``) for heterogeneous architectures like Gemma 4,
