@@ -259,7 +259,8 @@ class PrecomputedRotaryEmbedding(nn.Module):
         rope_half = inv_freq.shape[0]  # type: ignore[index]
         t = torch.arange(target_len, dtype=inv_freq.dtype)  # type: ignore[arg-type]
         freqs = torch.outer(
-            t, inv_freq  # type: ignore[arg-type]
+            t,
+            inv_freq,  # type: ignore[arg-type]
         ).float()  # [S, rope_half] # type: ignore[arg-type]
         scaling = getattr(self.original, "attention_scaling", 1.0)
         rot = torch.stack(
@@ -271,7 +272,10 @@ class PrecomputedRotaryEmbedding(nn.Module):
             ],
             dim=1,
         ).view(
-            target_len, 2, 2, rope_half  # type: ignore[arg-type]
+            target_len,
+            2,
+            2,
+            rope_half,  # type: ignore[arg-type]
         )  # type: ignore[arg-type]
 
         if self.padded_head_dim is not None:
@@ -616,9 +620,9 @@ def pad_attention_heads(
         num_kv_heads: Number of key/value heads.
     """
     assert orig_head_dim % 2 == 0, f"head_dim must be even, got {orig_head_dim}"
-    assert (
-        padded_head_dim % 2 == 0
-    ), f"padded head_dim must be even, got {padded_head_dim}"
+    assert padded_head_dim % 2 == 0, (
+        f"padded head_dim must be even, got {padded_head_dim}"
+    )
     assert padded_head_dim > orig_head_dim, (
         f"padded_head_dim ({padded_head_dim}) must exceed "
         f"orig_head_dim ({orig_head_dim})"
@@ -690,9 +694,9 @@ def pad_attention_heads_linear(
         f"padded_head_dim ({padded_head_dim}) must exceed "
         f"orig_head_dim ({orig_head_dim})"
     )
-    assert (
-        padded_head_dim >= BLOCK_SIZE
-    ), f"padded_head_dim ({padded_head_dim}) must be >= BLOCK_SIZE ({BLOCK_SIZE})"
+    assert padded_head_dim >= BLOCK_SIZE, (
+        f"padded_head_dim ({padded_head_dim}) must be >= BLOCK_SIZE ({BLOCK_SIZE})"
+    )
 
     for attn in attentions:
         attn.q_proj = _pad_proj_output_simple(
@@ -754,9 +758,9 @@ def pad_attention_heads_simple(
         f"padded_head_dim ({padded_head_dim}) must exceed "
         f"orig_head_dim ({orig_head_dim})"
     )
-    assert (
-        padded_head_dim >= BLOCK_SIZE
-    ), f"padded_head_dim ({padded_head_dim}) must be >= BLOCK_SIZE ({BLOCK_SIZE})"
+    assert padded_head_dim >= BLOCK_SIZE, (
+        f"padded_head_dim ({padded_head_dim}) must be >= BLOCK_SIZE ({BLOCK_SIZE})"
+    )
 
     for layer in layers:
         attn = layer.attention.self
@@ -824,9 +828,9 @@ def patch_layernorm(*layernorms):
     for ln in layernorms:
         if ln is None:
             continue
-        assert isinstance(
-            ln, torch.nn.LayerNorm
-        ), f"patch_layernorm expects nn.LayerNorm instances, got {type(ln)}"
+        assert isinstance(ln, torch.nn.LayerNorm), (
+            f"patch_layernorm expects nn.LayerNorm instances, got {type(ln)}"
+        )
         ln.forward = _types.MethodType(_forward, ln)
 
 
@@ -2130,8 +2134,8 @@ def generate(
     prefill_kv_len = (
         _sdpa_compatible_kv_length(padded_len) if chunked_prefill else max_cache_len
     )
-    # Per-layer cache management needs the left padding: a sliding-window layer
-    # cannot mask pad columns with an attention mask (see swa_attention).
+    # Compact-cache state needs the left-padding offsets so its runtime attention
+    # mask can exclude padding after prompt rows move to anchored coordinates.
     model._spyre_prompt_offsets = prompt_offsets
     # Specialized cache allocators and prefill/decode state transitions need the
     # padded prompt extent before caches are allocated. Keep this as host metadata;
@@ -2318,11 +2322,11 @@ def generate(
             break
 
     if timing and times_list:
-        print(f"\nFirst-token latency: {times_list[0]*1000:.3f} ms")
+        print(f"\nFirst-token latency: {times_list[0] * 1000:.3f} ms")
         if len(times_list) > 1:
             avg = sum(times_list[1:]) / len(times_list[1:])
-            print(f"Avg next-token latency: {avg*1000:.3f} ms")
-        print("Per-token: " + ", ".join(f"{t*1000:.1f}" for t in times_list) + " ms")
+            print(f"Avg next-token latency: {avg * 1000:.3f} ms")
+        print("Per-token: " + ", ".join(f"{t * 1000:.1f}" for t in times_list) + " ms")
 
     if generated_columns:
         generated_ids = torch.stack(generated_columns, dim=1)

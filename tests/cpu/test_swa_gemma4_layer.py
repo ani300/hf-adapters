@@ -84,9 +84,7 @@ def test_phase1_prefill_matches_the_band_masked_path():
     band_out, band_k, band_v = band(
         hidden, freqs, _band_mask(1, PREFILL, 0), *_caches(), index
     )
-    op_out, op_k, op_v = op(
-        hidden, freqs, None, *_caches(), index, cache_seqlen=PREFILL, valid_start=[0]
-    )
+    op_out, op_k, op_v = op(hidden, freqs, _band_mask(1, PREFILL, 0), *_caches(), index)
 
     torch.testing.assert_close(op_out, band_out, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(op_k, band_k)
@@ -119,12 +117,10 @@ def test_phase1_decode_matches_the_band_masked_path():
     op_out, _, _ = op(
         hidden,
         freqs,
-        None,
+        _band_mask(1, 1, PREFILL),
         key_cache.clone(),
         value_cache.clone(),
         index,
-        cache_seqlen=PREFILL + 1,
-        valid_start=[0],
     )
 
     torch.testing.assert_close(op_out, band_out, rtol=1e-5, atol=1e-6)
@@ -196,12 +192,10 @@ def test_kv_sharing_sliding_layer_matches_the_band_masked_path():
     op_out = op(
         hidden,
         freqs,
-        None,
+        _band_mask(1, PREFILL, 0),
         key_cache,
         value_cache,
         layer.layer_scalar,
-        cache_seqlen=PREFILL,
-        valid_start=[0],
     )
 
     torch.testing.assert_close(op_out, band_out, rtol=1e-5, atol=1e-6)

@@ -23,16 +23,25 @@ import torch
 import torch.nn.functional as F
 
 from hf_adapters.hf_common import add_causal_sliding_window_band, build_prefill_mask
-from hf_adapters.swa_attention import sliding_capacity, sliding_window_attention
+from hf_adapters.swa_attention import (
+    fit_attention_mask,
+    physical_cache_capacity,
+    sliding_capacity,
+    sliding_window_attention,
+)
 
 
-def _band_masked_attention(query, key_cache, value_cache, window_size, offset):
-    """What the Gemma adapters do today: causal + left-pad mask, then a band."""
+def _attention_mask(query, key_cache, window_size, offset):
+    """What the Gemma adapters pass: causal + left-pad mask, then a band."""
     batch, _, seqlen_q, _ = query.shape
     capacity = key_cache.size(2)
     mask = build_prefill_mask(batch, seqlen_q, capacity, offset, dtype=query.dtype)
     coords = torch.arange(seqlen_q)[None, :].expand(batch, seqlen_q)
-    mask = add_causal_sliding_window_band(mask, coords, window_size)
+    return add_causal_sliding_window_band(mask, coords, window_size)
+
+
+def _band_masked_attention(query, key_cache, value_cache, window_size, offset):
+    mask = _attention_mask(query, key_cache, window_size, offset)
     return F.scaled_dot_product_attention(
         query, key_cache, value_cache, attn_mask=mask, enable_gqa=True
     )
@@ -63,6 +72,23 @@ def test_sliding_capacity_rounds_up_to_a_stick():
     assert sliding_capacity(100) % 64 == 0
 
 
+def test_attention_mask_is_fitted_to_the_physical_cache():
+    mask = torch.zeros(2, 1, 4, 128, dtype=torch.float16)
+    expanded = fit_attention_mask(mask, 192)
+    cropped = fit_attention_mask(mask, 64)
+
+    assert expanded.shape == (2, 1, 4, 192)
+    assert torch.equal(expanded[..., :128], mask)
+    assert torch.all(expanded[..., 128:] < 0)
+    assert torch.equal(cropped, mask[..., :64])
+
+
+def test_physical_cache_capacity_uses_logical_width_on_cpu():
+    cache = torch.zeros(1, 2, 576, 64)
+    assert physical_cache_capacity(cache[:, :, :512, :]) == 512
+    assert physical_cache_capacity(cache) == 576
+
+
 def test_reference_matches_the_band_masked_path():
     """The equivalence the replacement rests on, at phase-1 geometry."""
     query, key_cache, value_cache = _inputs()
@@ -71,9 +97,9 @@ def test_reference_matches_the_band_masked_path():
         query,
         key_cache,
         value_cache,
+        _attention_mask(query, key_cache, 64, 0),
         window_size=64,
         scale=None,
-        cache_seqlen=128,
     )
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
@@ -98,10 +124,9 @@ def test_reference_honors_valid_start_like_left_padding():
         query,
         key_cache,
         value_cache,
+        _attention_mask(query, key_cache, 64, 17),
         window_size=64,
         scale=None,
-        cache_seqlen=128,
-        valid_start=[17],
     )
     torch.testing.assert_close(
         actual[:, :, 17:], expected[:, :, 17:], rtol=1e-5, atol=1e-6
@@ -118,21 +143,28 @@ def test_reference_honors_per_sequence_valid_start():
     """
     query, key_cache, value_cache = _inputs(batch=2)
     offsets = (0, 40)
-    per_entry = [
-        _band_masked_attention(
-            query[b : b + 1], key_cache[b : b + 1], value_cache[b : b + 1], 64, offset
-        )
+    masks = [
+        _attention_mask(query[b : b + 1], key_cache[b : b + 1], 64, offset)
         for b, offset in enumerate(offsets)
+    ]
+    per_entry = [
+        F.scaled_dot_product_attention(
+            query[b : b + 1],
+            key_cache[b : b + 1],
+            value_cache[b : b + 1],
+            attn_mask=masks[b],
+            enable_gqa=True,
+        )
+        for b in range(len(offsets))
     ]
     expected = torch.cat(per_entry, dim=0)
     actual = sliding_window_attention(
         query,
         key_cache,
         value_cache,
+        torch.cat(masks),
         window_size=64,
         scale=None,
-        cache_seqlen=128,
-        valid_start=list(offsets),
     )
     for b, offset in enumerate(offsets):
         torch.testing.assert_close(
@@ -144,10 +176,11 @@ def test_reference_honors_per_sequence_valid_start():
 def test_explicit_scale_is_honored():
     """Gemma 4 attends unscaled (scaling == 1.0), so scale must reach SDPA."""
     query, key_cache, value_cache = _inputs()
+    mask = _attention_mask(query, key_cache, 64, 0)
     unscaled = sliding_window_attention(
-        query, key_cache, value_cache, window_size=64, scale=1.0, cache_seqlen=128
+        query, key_cache, value_cache, mask, window_size=64, scale=1.0
     )
     default = sliding_window_attention(
-        query, key_cache, value_cache, window_size=64, scale=None, cache_seqlen=128
+        query, key_cache, value_cache, mask, window_size=64, scale=None
     )
     assert not torch.allclose(unscaled, default)

@@ -23,8 +23,8 @@ Two things make that a module rather than a call site:
 
 1. ``spyre::sliding_window_attention`` is registered for the spyre device only and
    has an empty eager body, so CPU needs the definition computed literally.
-2. Prefill uses trace-time geometry, while anchored decode passes a fixed-shape
-   runtime mask so all positions reuse one compiled graph.
+2. Both prefill and anchored decode pass their complete geometry in one runtime
+   mask, so position and padding values never specialize a compiled graph.
 """
 
 import dataclasses
@@ -50,6 +50,50 @@ def sliding_capacity(window_size, q_block=BLOCK_SIZE):
     stick-aligned. 1088 for Gemma 4 (W=1024), 576 for Gemma 3 (W=512).
     """
     return -(-(window_size + q_block - 1) // BLOCK_SIZE) * BLOCK_SIZE
+
+
+def fit_attention_mask(attention_mask, cache_capacity):
+    """Crop or mask-pad an attention mask to a layer's physical cache width.
+
+    The generic generation driver sizes masks for the global cache. Sliding
+    caches can be either narrower (long contexts) or wider (short prompts whose
+    global cache is below the minimum window allocation). Build this small piece
+    of per-layer input outside compiled blocks so the custom op always receives
+    its exact ``[B, 1, Lq, Lk]`` contract without adding work to every layer.
+    """
+    width = attention_mask.size(-1)
+    if width == cache_capacity:
+        return attention_mask
+    if width > cache_capacity:
+        return attention_mask[..., :cache_capacity]
+
+    original_device = attention_mask.device
+    padded = F.pad(
+        attention_mask.to("cpu"),
+        (0, cache_capacity - width),
+        value=_mask_fill_value(attention_mask.dtype),
+    )
+    return padded.to(original_device)
+
+
+def physical_cache_capacity(cache):
+    """Return the cache width preserved by a compiled in-place update.
+
+    Chunked prefill can pass a prefix view of a larger pinned Spyre cache. The
+    eager tensor reports the view width, but the compiled in-place ``index_copy_``
+    returns the owning allocation. Use that allocation width when fitting the
+    mask passed to attention later in the same graph.
+    """
+    if cache.device.type != "spyre":
+        return cache.size(2)
+
+    owner = cache
+    while isinstance(getattr(owner, "_base", None), torch.Tensor):
+        base = owner._base
+        if base.ndim != 4:
+            break
+        owner = base
+    return owner.size(2)
 
 
 def allocate_swa_caches(model, batch_size, max_cache_len, dtype, device):
@@ -108,13 +152,10 @@ def sliding_window_attention(
     query,
     key_cache,
     value_cache,
+    attention_mask,
     *,
     window_size,
     scale,
-    cache_seqlen=None,
-    buffer_origin=0,
-    valid_start=None,
-    decode_mask=None,
 ):
     """Attend ``query`` against the window of a KV cache.
 
@@ -129,106 +170,26 @@ def sliding_window_attention(
             ``c`` attends ``(c - window_size, c]``.
         scale: ``Q·Kᵀ`` multiplier. ``None`` means ``1/sqrt(D)``. Gemma 4 attends
             **unscaled** and must pass ``1.0``.
-        cache_seqlen: tokens the cache has seen, as distinct from its allocated
-            rows. Query row ``i`` sits at coordinate ``cache_seqlen - Lq + i``.
-        buffer_origin: logical position held by physical row 0. Callers keeping a
-            buffer-relative view (see ``SlidingWindowCache``) pass 0.
-        valid_start: one logical column per batch entry, below which nothing is
-            attended — left padding, which an offset-and-length window cannot
-            express. Padding query rows below the threshold retain a harmless
-            diagonal so softmax is defined; their outputs must be discarded or
-            zeroed by the model. ``None`` or all-zero costs nothing.
-        decode_mask: fixed-shape ``[B, 1, 1, capacity]`` additive mask for
-            single-token decode. It carries the write position, window, unwritten
-            tail, and padding as tensor data, so ``cache_seqlen``,
-            ``buffer_origin``, and ``valid_start`` must be omitted and every
-            decode position can reuse one graph.
+        attention_mask: additive ``[B, 1, Lq, capacity]`` mask carrying all
+            position-dependent state: causality, the window, unwritten cache rows,
+            and padding. Changing its values does not specialize the graph.
 
     Returns ``[B, Hq, Lq, D]``.
     """
     if query.device.type == "spyre":
-        op_buffer_origin = None if decode_mask is not None else buffer_origin
         return torch.ops.spyre.sliding_window_attention(
             query,
             key_cache,
             value_cache,
+            attention_mask,
             window_size,
-            True,
             scale,
-            cache_seqlen,
-            op_buffer_origin,
-            valid_start,
-            decode_mask,
         )
-    return _reference_attention(
-        query,
-        key_cache,
-        value_cache,
-        window_size,
-        scale,
-        cache_seqlen,
-        buffer_origin,
-        valid_start,
-        decode_mask,
-    )
-
-
-def _reference_attention(
-    query,
-    key_cache,
-    value_cache,
-    window_size,
-    scale,
-    cache_seqlen,
-    buffer_origin,
-    valid_start,
-    decode_mask,
-):
-    """The op's definition as a masked SDPA, for the CPU lane.
-
-    Query row ``i`` is at logical coordinate ``cache_seqlen - Lq + i``; physical
-    row ``j`` holds ``buffer_origin + j``. A row attends a column iff their gap is
-    in ``[0, window_size)`` and the column is not below ``valid_start``.
-
-    ``-inf`` rather than ``hf_common._mask_fill_value``: this branch runs on CPU
-    only, where the dlfloat16 saturation that motivates the finite fill does not
-    apply.
-    """
-    if decode_mask is not None:
-        return F.scaled_dot_product_attention(
-            query,
-            key_cache,
-            value_cache,
-            attn_mask=decode_mask,
-            dropout_p=0.0,
-            scale=scale,
-            enable_gqa=True,
-        )
-
-    seqlen_q = query.size(2)
-    capacity = key_cache.size(2)
-    if cache_seqlen is None:
-        cache_seqlen = capacity
-    rows = torch.arange(seqlen_q, device=query.device) + (cache_seqlen - seqlen_q)
-    columns = torch.arange(capacity, device=query.device) + buffer_origin
-    delta = rows.unsqueeze(-1) - columns.unsqueeze(0)
-    allowed = (delta >= 0) & (delta < window_size)
-    if valid_start is not None and max(valid_start) > 0:
-        starts = torch.tensor(valid_start, device=query.device).view(-1, 1, 1)
-        row_grid = rows.view(1, -1, 1)
-        column_grid = columns.view(1, 1, -1)
-        allowed = (allowed.unsqueeze(0) & (column_grid >= starts)) | (
-            (row_grid < starts) & (column_grid == row_grid)
-        )
-    else:
-        allowed = allowed.unsqueeze(0)
-    mask = torch.zeros(allowed.shape, dtype=query.dtype, device=query.device)
-    mask.masked_fill_(~allowed, float("-inf"))
     return F.scaled_dot_product_attention(
         query,
         key_cache,
         value_cache,
-        attn_mask=mask.unsqueeze(1),
+        attn_mask=attention_mask,
         dropout_p=0.0,
         scale=scale,
         enable_gqa=True,
@@ -423,7 +384,7 @@ def roll_compact_buffer(key_cache, value_cache):
 class AnchoredStep:
     """What one anchored decode step passes into a compiled sliding block.
 
-    ``decode_mask`` carries position and padding as tensor data. ``cache_index``
+    ``attention_mask`` carries position and padding as tensor data. ``cache_index``
     is likewise a tensor, so neither changing value can specialize the graph.
     ``do_shift`` tells the driver to roll the buffer eagerly before the compiled
     block; an in-graph in-place self-copy was the aliasing the compiler fused
@@ -432,10 +393,10 @@ class AnchoredStep:
 
     do_shift: bool
     cache_index: torch.Tensor
-    decode_mask: torch.Tensor
+    attention_mask: torch.Tensor
 
 
-def _anchored_decode_mask(state, dtype, device):
+def _anchored_attention_mask(state, dtype, device):
     """Build one runtime mask shared by every sliding layer in this step."""
     batch = len(state.valid_start)
     mask = torch.zeros((batch, 1, 1, state.capacity), dtype=dtype)
@@ -464,16 +425,16 @@ def anchored_step(state, device, dtype):
     return AnchoredStep(
         do_shift=do_shift,
         cache_index=torch.tensor([state.write_row], dtype=torch.long).to(device),
-        decode_mask=_anchored_decode_mask(state, dtype, device),
+        attention_mask=_anchored_attention_mask(state, dtype, device),
     )
 
 
 def valid_start_for(model, batch_size):
-    """First attendable cache column per sequence -- ``generate``'s left padding.
+    """Initial valid cache column per sequence -- ``generate``'s left padding.
 
     ``generate`` stashes ``_spyre_prompt_offsets``; a caller driving a forward
-    directly (the layer tests) has none. Lives here rather than in one adapter
-    now that both Gemma 3 and Gemma 4 build the op's ``valid_start`` from it.
+    directly (the layer tests) has none. Gemma 3 and Gemma 4 use this to initialize
+    the compact cache's runtime attention mask.
     """
     offsets = getattr(model, "_spyre_prompt_offsets", None)
     if offsets is None:

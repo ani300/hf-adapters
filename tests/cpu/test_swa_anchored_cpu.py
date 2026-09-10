@@ -94,7 +94,12 @@ def test_anchored_decode_matches_the_full_cache_band_path():
         hidden, freqs, _band_mask(PROMPT, 0), band_k, band_v, index
     )
     op_out, op_k, op_v = op(
-        hidden, freqs, None, op_k, op_v, index, cache_seqlen=PROMPT, valid_start=[0]
+        hidden,
+        freqs,
+        _band_mask(PROMPT, 0)[..., :PROMPT],
+        op_k,
+        op_v,
+        index,
     )
     torch.testing.assert_close(op_out, band_out, rtol=1e-5, atol=1e-6)
 
@@ -124,11 +129,10 @@ def test_anchored_decode_matches_the_full_cache_band_path():
         actual, op_k, op_v = op(
             token,
             token_freqs,
-            None,
+            step.attention_mask,
             op_k,
             op_v,
             step.cache_index,
-            decode_mask=step.decode_mask,
         )
         state.advance()
 
@@ -148,12 +152,12 @@ def test_anchored_decode_keeps_one_fixed_tensor_signature():
     visible_ranges = set()
     for _ in range(200):
         step = anchored_step(state, "cpu", torch.float16)
-        assert isinstance(
-            step.cache_index, torch.Tensor
-        ), "write position must be a tensor"
-        assert step.decode_mask.shape == (1, 1, 1, capacity)
-        assert step.decode_mask.dtype == torch.float16
-        visible = torch.where(step.decode_mask[0, 0, 0] == 0)[0]
+        assert isinstance(step.cache_index, torch.Tensor), (
+            "write position must be a tensor"
+        )
+        assert step.attention_mask.shape == (1, 1, 1, capacity)
+        assert step.attention_mask.dtype == torch.float16
+        visible = torch.where(step.attention_mask[0, 0, 0] == 0)[0]
         visible_ranges.add((visible[0].item(), visible[-1].item()))
         state.advance()
     assert len(visible_ranges) == BLOCK_SIZE
@@ -197,7 +201,12 @@ def test_anchored_shift_at_the_shipped_geometry():
     index = make_cache_index(0, prompt)
     _, band_k, band_v = band(hidden, freqs, band_mask(prompt, 0), band_k, band_v, index)
     _, op_k, op_v = op(
-        hidden, freqs, None, op_k, op_v, index, cache_seqlen=prompt, valid_start=[0]
+        hidden,
+        freqs,
+        band_mask(prompt, 0)[..., :prompt],
+        op_k,
+        op_v,
+        index,
     )
 
     state = SlidingWindowCache.after_prefill(window, prompt, [0])
@@ -226,11 +235,10 @@ def test_anchored_shift_at_the_shipped_geometry():
         actual, op_k, op_v = op(
             token,
             token_freqs,
-            None,
+            step.attention_mask,
             op_k,
             op_v,
             step.cache_index,
-            decode_mask=step.decode_mask,
         )
         state.advance()
         torch.testing.assert_close(
@@ -278,18 +286,12 @@ def test_chunked_prefill_compacts_only_on_first_decode_and_reuses_shared_kv(
             layer_scalar,
             per_layer_input,
             query_row_mask,
-            *,
-            cache_seqlen=None,
-            valid_start=None,
-            decode_mask=None,
         ):
             self.calls.append(
                 {
                     "capacity": key_cache.shape[2],
                     "cache_index": cache_index.clone(),
-                    "cache_seqlen": cache_seqlen,
-                    "valid_start": valid_start,
-                    "decode_mask": decode_mask,
+                    "attention_mask": mask.clone(),
                     "before": key_cache.clone(),
                 }
             )
@@ -315,14 +317,8 @@ def test_chunked_prefill_compacts_only_on_first_decode_and_reuses_shared_kv(
             layer_scalar,
             per_layer_input,
             query_row_mask,
-            *,
-            cache_seqlen=None,
-            valid_start=None,
-            decode_mask=None,
         ):
-            self.calls.append(
-                (key_cache, value_cache, cache_seqlen, valid_start, decode_mask)
-            )
+            self.calls.append((key_cache, value_cache, mask.clone()))
             return hidden
 
     producer = ProducerBlock()
@@ -374,22 +370,17 @@ def test_chunked_prefill_compacts_only_on_first_decode_and_reuses_shared_kv(
     decode_call = producer.calls[-1]
     assert decode_call["capacity"] == 128
     assert decode_call["cache_index"].tolist() == [64]
-    assert decode_call["cache_seqlen"] is None
-    assert decode_call["valid_start"] is None
-    assert decode_call["decode_mask"].shape == (1, 1, 1, 128)
-    assert torch.all(decode_call["decode_mask"][..., :1] < 0)
-    assert torch.all(decode_call["decode_mask"][..., 1:65] == 0)
-    assert torch.all(decode_call["decode_mask"][..., 65:] < 0)
+    assert decode_call["attention_mask"].shape == (1, 1, 1, 128)
+    assert torch.all(decode_call["attention_mask"][..., :1] < 0)
+    assert torch.all(decode_call["attention_mask"][..., 1:65] == 0)
+    assert torch.all(decode_call["attention_mask"][..., 65:] < 0)
     assert decode_call["before"][0, 0, :64, 0].tolist() == list(
         range(prompt_len - 64 + 1, prompt_len + 1)
     )
-    shared_key, shared_value, shared_seqlen, shared_start, shared_mask = consumer.calls[
-        -1
-    ]
+    shared_key, shared_value, shared_mask = consumer.calls[-1]
     assert shared_key is keys[0] and shared_value is values[0]
     assert keys[1] is keys[0] and values[1] is values[0]
-    assert shared_seqlen is None and shared_start is None
-    assert torch.equal(shared_mask, decode_call["decode_mask"])
+    assert torch.equal(shared_mask, decode_call["attention_mask"])
     assert model._spyre_swa_state.write_row == 65
 
 

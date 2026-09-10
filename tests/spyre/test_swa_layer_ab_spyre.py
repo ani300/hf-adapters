@@ -182,11 +182,9 @@ def test_prefill_op_no_worse_than_band_mask(seqlen_q):
         op,
         hidden.to("spyre"),
         freqs.to("spyre"),
-        None,
+        mask.to("spyre"),
         *_spyre_caches(capacity),
         index.to("spyre"),
-        cache_seqlen=seqlen_q,
-        valid_start=[0],
     )
     ref_out, _, _ = _run_cpu32(
         reference, hidden, freqs, mask, *_cpu_caches(capacity), index
@@ -226,11 +224,9 @@ def test_runtime_mask_decode_op_no_worse_than_band_mask():
         op,
         prompt.to("spyre"),
         prompt_freqs.to("spyre"),
-        None,
+        prompt_mask.to("spyre"),
         *_spyre_caches(capacity),
         prompt_index.to("spyre"),
-        cache_seqlen=written,
-        valid_start=[0],
     )
     _, ref_k, ref_v = _run_cpu32(
         reference,
@@ -265,11 +261,10 @@ def test_runtime_mask_decode_op_no_worse_than_band_mask():
         op,
         token.to("spyre"),
         token_freqs.to("spyre"),
-        None,
+        mask.to("spyre"),
         op_k,
         op_v,
         index.to("spyre"),
-        decode_mask=mask.to("spyre"),
     )
     ref_out, _, _ = _run_cpu32(reference, token, token_freqs, mask, ref_k, ref_v, index)
     # One query row has no stagger, so it spans WINDOW + 1 columns.
@@ -277,7 +272,7 @@ def test_runtime_mask_decode_op_no_worse_than_band_mask():
 
 
 def test_left_padding_op_no_worse_than_band_mask():
-    """17 pad columns inside the window: valid_start must match the mask.
+    """17 pad columns inside the window: the runtime mask must be preserved.
 
     This is the case the batch>1 Qwen3 decode bug lived in, so it is also the
     canary for window_band_mask's -inf fill (see hf_common._mask_fill_value).
@@ -311,11 +306,9 @@ def test_left_padding_op_no_worse_than_band_mask():
         op,
         hidden.to("spyre"),
         freqs.to("spyre"),
-        None,
+        mask.to("spyre"),
         *_spyre_caches(capacity),
         index.to("spyre"),
-        cache_seqlen=seqlen_q,
-        valid_start=[offset],
     )
     ref_out, _, _ = _run_cpu32(
         reference, hidden, freqs, mask, *_cpu_caches(capacity), index
@@ -377,12 +370,10 @@ def test_anchored_decode_matches_band_mask_across_a_shift():
         _, op_k, op_v = compiled_op(
             hidden,
             freqs,
-            None,
+            mask[..., :capacity],
             op_k,
             op_v,
             index,
-            cache_seqlen=prompt,
-            valid_start=[0],
         )
         _, ref_k, ref_v = _run_cpu32(
             reference,
@@ -426,11 +417,10 @@ def test_anchored_decode_matches_band_mask_across_a_shift():
             actual, op_k, op_v = compiled_op(
                 token,
                 token_freqs,
-                None,
+                step.attention_mask,
                 op_k,
                 op_v,
                 step.cache_index,
-                decode_mask=step.decode_mask,
             )
             # The float32 twin keeps its own full-length cache through the same
             # token stream, so every step is measured against truth rather than
