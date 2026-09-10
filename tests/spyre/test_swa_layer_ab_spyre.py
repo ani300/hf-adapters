@@ -1,9 +1,9 @@
 """Device A/B: Gemma 4's sliding layer, band-masked SDPA versus the SWA op.
 
-Gemma 4 12B currently fails device token-compare 0/5 and diverges at prefill for
-reasons unrelated to sliding-window attention, so end-to-end output cannot answer
-whether this replacement is correct. This test can: one layer, identical inputs,
-identical cache contents, both paths measured against a common float32 reference.
+End-to-end token equality is a useful integration signal, but it cannot bound the
+numeric error introduced by one attention replacement. This test can: one layer,
+identical inputs, identical cache contents, and both paths measured against a
+common float32 reference.
 
 **Why not compare the two device paths to each other at a tight tolerance.** Both
 paths reduce in fp16 in a different order — the op over a compact buffer, the band

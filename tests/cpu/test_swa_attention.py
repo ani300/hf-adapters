@@ -99,6 +99,7 @@ def test_reference_matches_the_band_masked_path():
         value_cache,
         _attention_mask(query, key_cache, 64, 0),
         window_size=64,
+        is_causal=True,
         scale=None,
     )
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
@@ -126,6 +127,7 @@ def test_reference_honors_valid_start_like_left_padding():
         value_cache,
         _attention_mask(query, key_cache, 64, 17),
         window_size=64,
+        is_causal=True,
         scale=None,
     )
     torch.testing.assert_close(
@@ -164,6 +166,7 @@ def test_reference_honors_per_sequence_valid_start():
         value_cache,
         torch.cat(masks),
         window_size=64,
+        is_causal=True,
         scale=None,
     )
     for b, offset in enumerate(offsets):
@@ -178,9 +181,21 @@ def test_explicit_scale_is_honored():
     query, key_cache, value_cache = _inputs()
     mask = _attention_mask(query, key_cache, 64, 0)
     unscaled = sliding_window_attention(
-        query, key_cache, value_cache, mask, window_size=64, scale=1.0
+        query,
+        key_cache,
+        value_cache,
+        mask,
+        window_size=64,
+        is_causal=True,
+        scale=1.0,
     )
     default = sliding_window_attention(
-        query, key_cache, value_cache, mask, window_size=64, scale=None
+        query,
+        key_cache,
+        value_cache,
+        mask,
+        window_size=64,
+        is_causal=True,
+        scale=None,
     )
     assert not torch.allclose(unscaled, default)

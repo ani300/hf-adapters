@@ -384,39 +384,134 @@ def test_chunked_prefill_compacts_only_on_first_decode_and_reuses_shared_kv(
     assert model._spyre_swa_state.write_row == 65
 
 
-class _MinimalGemma4:
-    """Smallest stand-in that reaches the caller-supplied-masks guard.
+def test_caller_supplied_masks_use_the_sliding_op_path(monkeypatch):
+    """The VLM's mixed mask reaches an anchored sliding block unchanged."""
 
-    ``_run_blocks_over_embeds`` checks ``model._spyre_swa_mode`` against
-    ``masks`` as its second statement, before it touches the backbone, the
-    config, or anything else on the model -- so nothing else needs to be real
-    here.
-    """
+    class RecordingBlock:
+        def __init__(self):
+            self.mask = None
 
-    def __init__(self, swa_mode):
-        self._spyre_swa_mode = swa_mode
-        self.config = None
+        def __call__(
+            self,
+            hidden,
+            freqs,
+            mask,
+            key_cache,
+            value_cache,
+            cache_index,
+            layer_scalar,
+            per_layer_input,
+            query_row_mask,
+        ):
+            self.mask = mask
+            return hidden, key_cache, value_cache
+
+    block = RecordingBlock()
+    config = types.SimpleNamespace(
+        layer_types=["sliding_attention"],
+        sliding_window=64,
+        enable_moe_block=False,
+    )
+    backbone = types.SimpleNamespace(
+        layers=[types.SimpleNamespace(layer_scalar=torch.tensor(1.0))],
+        norm=types.SimpleNamespace(weight=None, with_scale=False, eps=1e-6),
+    )
+    model = types.SimpleNamespace(
+        config=config,
+        model=backbone,
+        _spyre_rope={"sliding_attention": lambda hidden, positions: positions},
+        _spyre_compiled_blocks=[block],
+        _spyre_producer_of=[None],
+        _spyre_swa_mode="anchored",
+        _spyre_swa_is_causal=False,
+    )
+    monkeypatch.setattr(
+        hf_gemma4,
+        "_compiled_gemma4_rms_norm",
+        lambda hidden, weight, eps: hidden,
+    )
+
+    hidden = torch.zeros(1, 64, 8)
+    sliding_mask = torch.zeros(1, 1, 64, 64)
+    sliding_mask[..., 0, 63] = 7
+    caches = [torch.zeros(1, 1, 64, 8)]
+    _run_blocks_over_embeds(
+        model,
+        hidden,
+        torch.arange(64).view(1, -1),
+        None,
+        caches.copy(),
+        caches.copy(),
+        make_cache_index(0, 64),
+        masks={
+            "full_attention": torch.full_like(sliding_mask, -1),
+            "sliding_attention": sliding_mask,
+        },
+    )
+
+    assert block.mask is sliding_mask
 
 
-def test_caller_supplied_masks_reject_the_op_path():
-    """The VLM's own masks and the op path cannot be combined — say so loudly.
+def test_moe_sliding_layer_uses_the_compact_cache_index(monkeypatch):
+    """MoE attention must write to the anchored row, not the global position."""
 
-    The module-level branch is fixed at prepare time, so a driver cannot un-enable
-    it per call; the only correct answer is to refuse and name the opt-out.
-    """
-    import pytest
+    class RecordingMoEBlock:
+        def __init__(self):
+            self.cache_index = None
 
-    from hf_adapters.hf_common import SpyreUnsupportedFeatureError
+        def __call__(
+            self,
+            hidden,
+            freqs,
+            mask,
+            key_cache,
+            value_cache,
+            cache_index,
+            layer_scalar,
+        ):
+            self.cache_index = cache_index
+            return hidden, key_cache, value_cache
 
-    model = _MinimalGemma4(swa_mode="anchored")
-    with pytest.raises(SpyreUnsupportedFeatureError, match="_spyre_swa_mode"):
-        _run_blocks_over_embeds(
-            model,
-            torch.zeros(1, 4, 8),
-            torch.zeros(1, 4, dtype=torch.long),
-            None,
-            [],
-            [],
-            make_cache_index(0, 4),
-            masks={"full_attention": None, "sliding_attention": None},
-        )
+    window, prompt_len = 64, 256
+    state = SlidingWindowCache.after_prefill(window, prompt_len, [0])
+    block = RecordingMoEBlock()
+    config = types.SimpleNamespace(
+        layer_types=["sliding_attention"],
+        sliding_window=window,
+        enable_moe_block=True,
+    )
+    backbone = types.SimpleNamespace(
+        layers=[types.SimpleNamespace(layer_scalar=torch.tensor(1.0))],
+        norm=types.SimpleNamespace(weight=None, with_scale=False, eps=1e-6),
+    )
+    model = types.SimpleNamespace(
+        config=config,
+        model=backbone,
+        _spyre_rope={"sliding_attention": lambda hidden, positions: positions},
+        _spyre_compiled_blocks=[block],
+        _spyre_producer_of=[None],
+        _spyre_swa_mode="anchored",
+        _spyre_swa_state=state,
+        _spyre_padded_prompt_len=prompt_len,
+        _spyre_prompt_offsets=torch.tensor([0]),
+    )
+    monkeypatch.setattr(
+        hf_gemma4,
+        "_compiled_gemma4_rms_norm",
+        lambda hidden, weight, eps: hidden,
+    )
+
+    capacity = state.capacity
+    keys = [torch.zeros(1, 1, capacity, 8)]
+    values = [torch.zeros(1, 1, capacity, 8)]
+    _run_blocks_over_embeds(
+        model,
+        torch.zeros(1, 1, 8),
+        torch.tensor([[prompt_len]]),
+        torch.zeros(1, 1, 1, prompt_len + 64),
+        keys,
+        values,
+        make_cache_index(prompt_len, 1),
+    )
+
+    assert block.cache_index.tolist() == [state.anchor]

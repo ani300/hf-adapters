@@ -209,6 +209,7 @@ def _make_compiled_block(
                 value_cache,
                 attn_mask,
                 window_size=window_size,
+                is_causal=True,
                 scale=scaling,
             )
         else:

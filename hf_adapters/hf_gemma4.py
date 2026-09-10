@@ -92,7 +92,6 @@ import torch.nn.functional as F
 from hf_adapters.hf_common import (
     InvFreqShim,
     PrecomputedRotaryEmbedding,
-    SpyreUnsupportedFeatureError,
     add_causal_sliding_window_band,
     apply_rope_matmul,
     get_backbone,
@@ -306,6 +305,7 @@ class Gemma4Attention(nn.Module):
         is_sliding=False,
         window_size=None,
         swa_mode=None,
+        is_causal=True,
     ):
         super().__init__()
         self.q_proj = attn.q_proj
@@ -326,6 +326,10 @@ class Gemma4Attention(nn.Module):
         # the full-length cache as a correctness harness; anchored mode uses the
         # compact production cache.
         self.swa_mode = swa_mode
+        # This is a static access-plan guarantee, not an alternate source of
+        # mask semantics. False supports mixed masks such as causal text with
+        # bidirectional vision blocks by making the kernel scan the full cache.
+        self.is_causal = is_causal
         self._use_compiled_rms_norm = False
 
     def _rms_norm(self, hidden_states, norm):
@@ -393,6 +397,7 @@ class Gemma4Attention(nn.Module):
                 value_cache,
                 attn_mask,
                 window_size=self.window_size,
+                is_causal=self.is_causal,
                 scale=self.scaling,
             )
         else:
@@ -423,6 +428,7 @@ class Gemma4Block(nn.Module):
         is_sliding=False,
         window_size=None,
         swa_mode=None,
+        is_causal=True,
     ):
         super().__init__()
         self.self_attn = Gemma4Attention(
@@ -434,6 +440,7 @@ class Gemma4Block(nn.Module):
             is_sliding=is_sliding,
             window_size=window_size,
             swa_mode=swa_mode,
+            is_causal=is_causal,
         )
         self.mlp = layer.mlp
         self.input_layernorm = layer.input_layernorm
@@ -511,6 +518,7 @@ class Gemma4SharedBlock(nn.Module):
         is_sliding=False,
         window_size=None,
         swa_mode=None,
+        is_causal=True,
     ):
         super().__init__()
         attn = layer.self_attn
@@ -523,6 +531,7 @@ class Gemma4SharedBlock(nn.Module):
         self.is_sliding = is_sliding
         self.window_size = window_size
         self.swa_mode = swa_mode
+        self.is_causal = is_causal
         self.mlp = layer.mlp
         self.input_layernorm = layer.input_layernorm
         self.post_attention_layernorm = layer.post_attention_layernorm
@@ -564,6 +573,7 @@ class Gemma4SharedBlock(nn.Module):
                 value_cache,
                 attn_mask,
                 window_size=self.window_size,
+                is_causal=self.is_causal,
                 scale=self.scaling,
             )
         else:
@@ -603,6 +613,7 @@ def prepare_gemma4_blocks(
     layer_types,
     window_size,
     swa_mode,
+    swa_is_causal,
 ):
     """Replace Gemma 4 decoder layers with registered blocks and compile them.
 
@@ -623,6 +634,7 @@ def prepare_gemma4_blocks(
                 is_sliding=layer_types[i] == "sliding_attention",
                 window_size=window_size,
                 swa_mode=swa_mode,
+                is_causal=swa_is_causal,
             )
         else:
             block = Gemma4SharedBlock(
@@ -633,6 +645,7 @@ def prepare_gemma4_blocks(
                 is_sliding=layer_types[i] == "sliding_attention",
                 window_size=window_size,
                 swa_mode=swa_mode,
+                is_causal=swa_is_causal,
             )
         layers[i] = block
         blocks.append(torch.compile(block, dynamic=False))
@@ -658,8 +671,8 @@ def _build_layer_masks(
     entry of the block's ``cache_index`` (``int(cache_index[0])``).
 
     This is the text-decoder mask policy. The unified VLM adapter
-    (``hf_gemma4_mm``) needs a bidirectional vision overlay OR-ed into both mask
-    types, so it builds its own mask dict and passes it to
+    (``hf_gemma4_mm``) needs a bidirectional vision overlay on sliding layers,
+    so it builds its own mask dict and passes it to
     ``_run_blocks_over_embeds(..., masks=...)`` rather than calling this.
     """
     cfg = text_config(model.config)
@@ -693,8 +706,8 @@ def _run_blocks_over_embeds(
     per-layer-type mask dict and applies the final norm.
 
     ``masks`` (optional ``{layer_type: mask}``) lets a caller supply its own
-    per-type masks — the VLM passes masks with the bidirectional vision overlay
-    OR-ed in. When ``None``, the text-only causal + sliding masks are built from
+    per-type masks — the VLM passes its upstream-compatible causal-global and
+    blockwise sliding masks. When ``None``, the text-only causal + sliding masks are built from
     ``attn_mask`` via ``_build_layer_masks`` (``attn_mask`` is ignored when
     ``masks`` is given).
 
@@ -718,23 +731,6 @@ def _run_blocks_over_embeds(
     their original seven-argument call contract.
     """
     swa_mode = getattr(model, "_spyre_swa_mode", None)
-    if masks is not None and swa_mode is not None:
-        # A caller supplying its own masks is the unified VLM adapter, whose
-        # bidirectional vision overlay *widens* attention. The op cannot express
-        # that (is_causal=False raises, and an additive mask only ever removes).
-        # Each Gemma4Attention's self.swa_mode is baked in at prepare time, so
-        # this driver cannot disable the op path per call by zeroing a local --
-        # it can only refuse the combination and name the prepare-time opt-out.
-        raise SpyreUnsupportedFeatureError(
-            "_run_blocks_over_embeds received explicit per-type masks (a "
-            "caller-supplied mask dict, e.g. the VLM adapter) while "
-            f"model._spyre_swa_mode={swa_mode!r} is set. The sliding-window op "
-            "path is fixed per layer at prepare time and cannot be disabled "
-            "per call; set model._spyre_swa_mode = None before "
-            "prepare_text_decoder_for_spyre for any caller that supplies its "
-            "own masks."
-        )
-
     backbone = _gemma4_backbone(model)
     cfg = text_config(model.config)
 
@@ -832,16 +828,15 @@ def _run_blocks_over_embeds(
         # device-moved block — NOT as a Python float — so Dynamo guards on tensor
         # metadata instead of recompiling for each distinct learned value.
         if is_moe:
-            # MoE support keeps its existing call contract and remains on the
-            # mask-based attention path until its split compiled regions are
-            # validated with the custom op.
+            # MoE keeps its split compiled-region call contract, while its
+            # attention region uses the same sliding-window op and compact cache.
             h, key_caches[i], value_caches[i] = compiled_block(
                 h,
                 freqs[lt],
                 selected_mask,
                 key_caches[i],
                 value_caches[i],
-                cache_index,
+                sliding_index if is_sliding else cache_index,
                 backbone_layers[i].layer_scalar,
             )
         elif p is None:
@@ -1055,6 +1050,8 @@ def prepare_text_decoder_for_spyre(model):
     # full-cache correctness harness.
     if not hasattr(model, "_spyre_swa_mode"):
         model._spyre_swa_mode = "anchored"
+    if not hasattr(model, "_spyre_swa_is_causal"):
+        model._spyre_swa_is_causal = True
     if model._spyre_swa_mode == "anchored":
         model._spyre_cache_allocator = allocate_swa_caches
 
@@ -1068,6 +1065,7 @@ def prepare_text_decoder_for_spyre(model):
         cfg.layer_types,
         cfg.sliding_window,
         getattr(model, "_spyre_swa_mode", None),
+        model._spyre_swa_is_causal,
     )
 
 

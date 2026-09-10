@@ -155,6 +155,7 @@ def sliding_window_attention(
     attention_mask,
     *,
     window_size,
+    is_causal,
     scale,
 ):
     """Attend ``query`` against the window of a KV cache.
@@ -166,8 +167,13 @@ def sliding_window_attention(
             have the same shape (``check_window_read`` requires it) and the
             allocation must be **zero-filled**: a window may overshoot the written
             prefix, and an additive mask cannot rescue a NaN.
-        window_size: keys per query, exclusive lower bound — row at coordinate
-            ``c`` attends ``(c - window_size, c]``.
+        window_size: configured backward window, with exclusive lower bound
+            ``c - window_size``. The mask carries the exact boundary and any
+            permitted non-causal pairs.
+        is_causal: static promise that the mask never allows a future key. The
+            Spyre kernel may use narrow causal reads for square prefill when
+            true; false scans the complete physical cache and leaves all
+            attention semantics to ``attention_mask``.
         scale: ``Q·Kᵀ`` multiplier. ``None`` means ``1/sqrt(D)``. Gemma 4 attends
             **unscaled** and must pass ``1.0``.
         attention_mask: additive ``[B, 1, Lq, capacity]`` mask carrying all
@@ -183,6 +189,7 @@ def sliding_window_attention(
             value_cache,
             attention_mask,
             window_size,
+            is_causal,
             scale,
         )
     return F.scaled_dot_product_attention(
