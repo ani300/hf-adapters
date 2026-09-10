@@ -152,9 +152,9 @@ def test_anchored_decode_keeps_one_fixed_tensor_signature():
     visible_ranges = set()
     for _ in range(200):
         step = anchored_step(state, "cpu", torch.float16)
-        assert isinstance(step.cache_index, torch.Tensor), (
-            "write position must be a tensor"
-        )
+        assert isinstance(
+            step.cache_index, torch.Tensor
+        ), "write position must be a tensor"
         assert step.attention_mask.shape == (1, 1, 1, capacity)
         assert step.attention_mask.dtype == torch.float16
         visible = torch.where(step.attention_mask[0, 0, 0] == 0)[0]

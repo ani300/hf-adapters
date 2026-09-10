@@ -982,12 +982,12 @@ def _setup_gemma4_text_decoder(model, *, allow_moe=False):
     model._spyre_producer_of = _shared_producer_map(cfg)
 
     if allow_moe:
-        assert not model._spyre_has_ple, (
-            "Gemma 4 MoE adapter does not support per-layer embeddings (PLE)."
-        )
-        assert not getattr(cfg, "num_kv_shared_layers", 0), (
-            "Gemma 4 MoE adapter does not support KV-sharing across layers."
-        )
+        assert (
+            not model._spyre_has_ple
+        ), "Gemma 4 MoE adapter does not support per-layer embeddings (PLE)."
+        assert not getattr(
+            cfg, "num_kv_shared_layers", 0
+        ), "Gemma 4 MoE adapter does not support KV-sharing across layers."
     else:
         assert not getattr(cfg, "enable_moe_block", False), (
             "Gemma 4 dense adapter does not support MoE blocks "

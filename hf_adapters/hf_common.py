@@ -620,9 +620,9 @@ def pad_attention_heads(
         num_kv_heads: Number of key/value heads.
     """
     assert orig_head_dim % 2 == 0, f"head_dim must be even, got {orig_head_dim}"
-    assert padded_head_dim % 2 == 0, (
-        f"padded head_dim must be even, got {padded_head_dim}"
-    )
+    assert (
+        padded_head_dim % 2 == 0
+    ), f"padded head_dim must be even, got {padded_head_dim}"
     assert padded_head_dim > orig_head_dim, (
         f"padded_head_dim ({padded_head_dim}) must exceed "
         f"orig_head_dim ({orig_head_dim})"
@@ -694,9 +694,9 @@ def pad_attention_heads_linear(
         f"padded_head_dim ({padded_head_dim}) must exceed "
         f"orig_head_dim ({orig_head_dim})"
     )
-    assert padded_head_dim >= BLOCK_SIZE, (
-        f"padded_head_dim ({padded_head_dim}) must be >= BLOCK_SIZE ({BLOCK_SIZE})"
-    )
+    assert (
+        padded_head_dim >= BLOCK_SIZE
+    ), f"padded_head_dim ({padded_head_dim}) must be >= BLOCK_SIZE ({BLOCK_SIZE})"
 
     for attn in attentions:
         attn.q_proj = _pad_proj_output_simple(
@@ -758,9 +758,9 @@ def pad_attention_heads_simple(
         f"padded_head_dim ({padded_head_dim}) must exceed "
         f"orig_head_dim ({orig_head_dim})"
     )
-    assert padded_head_dim >= BLOCK_SIZE, (
-        f"padded_head_dim ({padded_head_dim}) must be >= BLOCK_SIZE ({BLOCK_SIZE})"
-    )
+    assert (
+        padded_head_dim >= BLOCK_SIZE
+    ), f"padded_head_dim ({padded_head_dim}) must be >= BLOCK_SIZE ({BLOCK_SIZE})"
 
     for layer in layers:
         attn = layer.attention.self
@@ -828,9 +828,9 @@ def patch_layernorm(*layernorms):
     for ln in layernorms:
         if ln is None:
             continue
-        assert isinstance(ln, torch.nn.LayerNorm), (
-            f"patch_layernorm expects nn.LayerNorm instances, got {type(ln)}"
-        )
+        assert isinstance(
+            ln, torch.nn.LayerNorm
+        ), f"patch_layernorm expects nn.LayerNorm instances, got {type(ln)}"
         ln.forward = _types.MethodType(_forward, ln)
 
 
