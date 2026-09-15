@@ -88,6 +88,7 @@ Usage::
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.integrations.tensor_parallel import all_gather
 
 from hf_adapters.hf_common import (
     InvFreqShim,
@@ -115,6 +116,36 @@ def _gemma4_backbone(model):
     matching where ``pad_lm_head`` looks.
     """
     return get_backbone(model)
+
+
+def spyre_tp_grouped_colwise_modules(model, tp_size):
+    """Return K/V projections that need replication within rank groups.
+
+    HF's colwise plan splits a projection's output dimension evenly across TP
+    ranks. That is only a valid attention shard when every rank receives an
+    integral number of ``head_dim``-wide heads. Gemma 4 A4B's full-attention
+    layers have two 512-wide KV heads, for example, so TP=4 would otherwise
+    produce invalid 256-wide half-heads. Instead, shard those projections into
+    two whole heads and replicate each head across its two corresponding ranks.
+    """
+    backbone = _gemma4_backbone(model)
+    cfg = text_config(model.config)
+    module_names = {id(module): name for name, module in model.named_modules()}
+    grouped = {}
+
+    for layer, layer_cfg in zip(backbone.layers, cfg.per_layer_config):
+        attn = layer.self_attn
+        head_dim = layer_cfg.head_dim
+        for projection_name in ("k_proj", "v_proj"):
+            projection = getattr(attn, projection_name, None)
+            if projection is None:
+                continue
+            if projection.out_features % (head_dim * tp_size) != 0:
+                num_kv_heads = projection.out_features // head_dim
+                assert tp_size % num_kv_heads == 0
+                grouped[module_names[id(projection)]] = num_kv_heads
+
+    return grouped
 
 
 def _gemma4_rms_norm(hidden_states, weight, eps):
@@ -702,7 +733,6 @@ def _run_blocks_over_embeds(
                 pli,
                 query_row_mask,
             )
-
     norm = backbone.norm
     weight = norm.weight if norm.with_scale else None
     h = _compiled_gemma4_rms_norm(h, weight, norm.eps)
@@ -769,7 +799,12 @@ def _run_forward(
     )
 
     logits = model.lm_head(h)
-
+    if model._spyre_lm_head_tp_mesh is not None:
+        # Gemma 4 ties lm_head to its rowwise-sharded token embedding.  HF's
+        # auto plan consequently leaves each rank with one contiguous vocab
+        # shard, but the adapter's custom forward bypasses HF's causal-LM
+        # output path.  Reassemble the vocabulary before CPU token selection.
+        logits = all_gather(logits, model._spyre_lm_head_tp_mesh)
     cap = text_config(model.config).final_logit_softcapping
     if cap is not None:
         logits = logits / cap
@@ -831,13 +866,34 @@ def _setup_gemma4_text_decoder(model, *, allow_moe=False):
     kv_shapes = []
     is_kv_eq_v_per_layer = []
     for i, (layer_type, layer_cfg) in enumerate(zip(cfg.layer_types, layer_configs)):
-        num_q_heads_per_layer.append(layer_cfg.num_attention_heads)
         head_dim = layer_cfg.head_dim
         assert head_dim % 2 == 0 and head_dim // 2 >= 64, (
             f"Gemma 4 layer {i} head_dim={head_dim}: head_dim/2 must be >= 64 "
             "(one Spyre stick). A padded variant is not implemented for this adapter."
         )
-        num_kv_heads = layer_cfg.num_key_value_heads
+        # HF updates the Linear metadata when its colwise TP plan shards Q/K/V.
+        # Derive local head counts from those modules rather than retaining the
+        # global config counts; otherwise a 2-way shard producing 2048 Q values
+        # is incorrectly viewed as 16 * 256 (=4096) values.
+        attn = backbone.layers[i].self_attn
+        assert attn.q_proj.out_features % head_dim == 0
+        num_q_heads = attn.q_proj.out_features // head_dim
+        k_proj = getattr(attn, "k_proj", None)
+        if k_proj is None:
+            # KV-sharing layers intentionally omit K/V projections. Reuse the
+            # already-derived local KV geometry of their producer.
+            producer = model._spyre_producer_of[i]
+            assert producer is not None
+            num_kv_heads = kv_shapes[producer][0]
+        else:
+            assert k_proj.out_features % head_dim == 0, (
+                f"Gemma 4 layer {i} has a partial KV head after TP: "
+                f"k_proj.out_features={k_proj.out_features}, head_dim={head_dim}, "
+                f"weight.shape={tuple(k_proj.weight.shape)}, "
+                f"tp_plan={getattr(k_proj, '_hf_tp_plan', None)!r}"
+            )
+            num_kv_heads = k_proj.out_features // head_dim
+        num_q_heads_per_layer.append(num_q_heads)
         kv_shapes.append((num_kv_heads, head_dim, head_dim))
         is_kv_eq_v_per_layer.append(attention_k_eq_v and layer_type == "full_attention")
     model._spyre_kv_shapes = kv_shapes
@@ -857,6 +913,15 @@ def _setup_gemma4_text_decoder(model, *, allow_moe=False):
     # LM head: smooth-padded to a stick-aligned vocab whose per-core span fits
     # the 256 MB EAR limit (see hf_common.pad_lm_head).
     pad_lm_head(model)
+    local_vocab = model.lm_head.weight.shape[0]
+    model._spyre_lm_head_tp_mesh = None
+    if local_vocab != cfg.vocab_size:
+        mesh = getattr(backbone.embed_tokens, "_hf_device_mesh", None)
+        assert mesh is not None and local_vocab * mesh.size() == cfg.vocab_size, (
+            "Gemma 4 lm_head has an unexpected local vocabulary shape: "
+            f"local={local_vocab}, global={cfg.vocab_size}"
+        )
+        model._spyre_lm_head_tp_mesh = mesh
 
     return num_q_heads_per_layer, kv_shapes, is_kv_eq_v_per_layer
 

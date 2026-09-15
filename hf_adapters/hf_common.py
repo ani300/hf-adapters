@@ -1509,45 +1509,52 @@ def _move_to_spyre_with_layout(model, dtype):
     model.to(dtype=dtype, device=DEVICE)
 
 
-def _resolve_tp_plan(model_path, auto_model_cls, tp_plan):
-    """Resolve a caller's ``tp_plan`` into a dict HF can shard on Spyre.
+def _resolve_tp_plan(model_path, auto_model_cls, tp_plan, adapter_module):
+    """Resolve and translate an HF TP plan to Spyre placement styles.
 
-    ``tp_plan="auto"`` expands (via the model's ``base_model_tp_plan`` +
-    class ``_tp_plan``) to a plan that shards attention/MLP **and** the
-    ``lm_head`` with ``colwise_gather_output``. On Spyre we keep the ``lm_head``
-    replicated instead:
-
-    - HF's ``validate_module`` rejects ``colwise_gather_output`` when
-      ``vocab_size`` isn't divisible by the rank count (e.g. granite-3.3-8b's
-      49159), which would fail at load before the model ever runs.
-    - Our ``pad_lm_head`` pads the vocab to a Spyre stick boundary *after* load,
-      so sharding the head upstream fights that layout pass.
-
-    Dropping ``lm_head`` from the plan leaves it unmatched, which HF treats as
-    replicated (full head on every rank).
-    Similarly, we also drop ``model.embed_tokens``, which is automatically added
-    for models with tied embeddings, and currently involves unsupported bool
-    comparisons of int32 tensors.
-
-    We resolve the fully-namespaced plan
-    by instantiating the model on the ``meta`` device (no weights allocated) and
-    reading its ``.tp_plan`` — this uses HF's own namespacing rather than
-    reconstructing it, so it stays correct across model families.
-
-    A dict ``tp_plan`` is returned unchanged (the caller is explicit).
+    The model is instantiated on ``meta`` both to obtain HF's fully-namespaced
+    auto plan and to find unplanned Linear/Embedding modules.  Those unplanned
+    weights also need explicit placement entries: otherwise Transformers sends
+    them through generic ``Tensor.to(spyre)`` and torch-spyre never sees enough
+    module semantics to choose the Linear or embedding DMA layout.
     """
-    if tp_plan != "auto":
-        return tp_plan
-
     from transformers import AutoConfig
+
+    from hf_adapters.spyre_tensor_parallel import prepare_spyre_tp_plan
 
     cfg = AutoConfig.from_pretrained(model_path)
     with torch.device("meta"):
         probe = auto_model_cls.from_config(cfg)
-    plan = dict(probe.tp_plan or {})
-    plan.pop("lm_head", None)
-    plan.pop("model.embed_tokens", None)
-    return plan
+    auto_plan = tp_plan == "auto"
+    plan = dict(probe.tp_plan or {}) if auto_plan else dict(tp_plan)
+    replicated_linear_modules = {"lm_head"} if auto_plan else set()
+    adapter_replication_policy = getattr(
+        adapter_module, "spyre_tp_replicated_linear_modules", None
+    )
+    if auto_plan and adapter_replication_policy is not None:
+        replicated_linear_modules.update(
+            adapter_replication_policy(probe, _resolve_tp_size())
+        )
+    grouped_colwise_policy = getattr(
+        adapter_module, "spyre_tp_grouped_colwise_modules", None
+    )
+    grouped_colwise_modules = (
+        grouped_colwise_policy(probe, _resolve_tp_size())
+        if auto_plan and grouped_colwise_policy is not None
+        else {}
+    )
+    return prepare_spyre_tp_plan(
+        probe,
+        plan,
+        cpu_staged_modules=getattr(adapter_module, "SPYRE_TP_CPU_STAGED_MODULES", ()),
+        # hf-adapters pads/prepares the output projection after loading, and
+        # historically keeps the common top-level text embedding replicated.
+        # Preserve those auto-plan policies without overriding an explicit
+        # caller-provided plan.
+        replicated_linear_modules=replicated_linear_modules,
+        replicated_embedding_modules=("model.embed_tokens",) if auto_plan else (),
+        grouped_colwise_modules=grouped_colwise_modules,
+    )
 
 
 def _resolve_tp_size():
@@ -1563,6 +1570,60 @@ def _resolve_tp_size():
     except ValueError as exc:
         raise ValueError(f"WORLD_SIZE must be an integer, got {world_size!r}") from exc
     return tp_size
+
+
+@contextmanager
+def _without_spyre_allocator_warmup():
+    """Skip Transformers' single-allocation cache warmup for Spyre TP loads.
+
+    Flex pre-allocates its device-memory regions, so the caching-allocator
+    warmup provides no benefit.  More importantly, Transformers requests one
+    allocation as large as all parameters assigned to the rank.  That can
+    exceed Flex's 16 GiB per-region limit even though the individual model
+    tensors and their aggregate fit comfortably on the device.
+    """
+    from transformers import modeling_utils
+
+    original = modeling_utils.caching_allocator_warmup
+    modeling_utils.caching_allocator_warmup = lambda *_args, **_kwargs: None
+    try:
+        yield
+    finally:
+        modeling_utils.caching_allocator_warmup = original
+
+
+@contextmanager
+def _prefer_exact_tp_plan_entries():
+    """Honor exact per-layer TP entries before Transformers' wildcard lookup.
+
+    Transformers documents exact TP rules, but its current lookup immediately
+    replaces every numeric layer index with ``*``. That makes a generic rule
+    win even when an exact override is present. Gemma 4 needs exact overrides
+    for only the full-attention K/V projections whose KV-head count is smaller
+    than the TP degree.
+    """
+    from transformers import modeling_utils
+    from transformers.integrations import tensor_parallel
+
+    original = tensor_parallel._get_parameter_tp_plan
+
+    def exact_first(parameter_name, tp_plan, is_weight=True):
+        if parameter_name in tp_plan:
+            return tp_plan[parameter_name]
+        if is_weight and "." in parameter_name:
+            module_name = parameter_name.rsplit(".", 1)[0]
+            if module_name in tp_plan:
+                return tp_plan[module_name]
+        return original(parameter_name, tp_plan, is_weight=is_weight)
+
+    original_modeling_lookup = modeling_utils._get_parameter_tp_plan
+    tensor_parallel._get_parameter_tp_plan = exact_first
+    modeling_utils._get_parameter_tp_plan = exact_first
+    try:
+        yield
+    finally:
+        tensor_parallel._get_parameter_tp_plan = original
+        modeling_utils._get_parameter_tp_plan = original_modeling_lookup
 
 
 def load_model_common(
@@ -1584,8 +1645,8 @@ def load_model_common(
         tp_plan: Optional tensor-parallel plan (e.g. ``"auto"``). When set, HF
             shards the model across the ``torchrun`` process group and
             ``device_map`` is omitted so HF's TP placement is authoritative.
-            ``"auto"`` is resolved to a plan that keeps ``lm_head`` replicated
-            (see ``_resolve_tp_plan``).
+            ``"auto"`` is resolved to an explicit, fully namespaced HF plan
+            before loading (see ``_resolve_tp_plan``).
         trust_remote_code: Passed through to the adapter's ``load_hf_model`` (or
             to HF's ``from_pretrained``) so checkpoints shipping custom modeling
             code load only when the caller explicitly opts in.
@@ -1609,14 +1670,17 @@ def load_model_common(
 
         distributed_config = DistributedConfig(
             tp_size=_resolve_tp_size(),
-            tp_plan=_resolve_tp_plan(model_path, auto_model_cls, tp_plan),
+            tp_plan=_resolve_tp_plan(
+                model_path, auto_model_cls, tp_plan, adapter_module=module
+            ),
         )
-        model = auto_model_cls.from_pretrained(
-            model_path,
-            dtype=dtype,
-            distributed_config=distributed_config,
-            trust_remote_code=trust_remote_code,
-        )
+        with _without_spyre_allocator_warmup(), _prefer_exact_tp_plan_entries():
+            model = auto_model_cls.from_pretrained(
+                model_path,
+                dtype=dtype,
+                distributed_config=distributed_config,
+                trust_remote_code=trust_remote_code,
+            )
     else:
         model = auto_model_cls.from_pretrained(
             model_path,
