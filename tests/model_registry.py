@@ -997,6 +997,13 @@ SEQ_CLASSIFICATION_MODELS = {
     },
 }
 
+NON_BLOCKING_SEQUENCE_CLASSIFICATION_MODELS: dict[str, str] = _non_blocking(
+    SEQ_CLASSIFICATION_MODELS,
+    # The shared fixture supplies single sentences to this premise/hypothesis
+    # model, leaving neutral and entailment nearly tied in fp16.
+    ("roberta_mnli",),
+)
+
 SEQ_CLASSIFICATION_PATHS: list[str] = _exclude(
     _select_representative_paths(
         SEQ_CLASSIFICATION_MODELS, include_gated=_include_gated_flag

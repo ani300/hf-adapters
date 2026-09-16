@@ -40,7 +40,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 from _seq_classification_helpers import run_seq_classification_cpu_vs_spyre
-from model_registry import REMOTE_CODE_PATHS, SEQ_CLASSIFICATION_PATHS
+from model_registry import (
+    NON_BLOCKING_SEQUENCE_CLASSIFICATION_MODELS,
+    REMOTE_CODE_PATHS,
+    SEQ_CLASSIFICATION_PATHS,
+    xfail_non_blocking,
+)
 
 from hf_adapters.auto_spyre_model import (
     SEQUENCE_CLASSIFICATION_CONFIG_TO_ADAPTER_MODULE_MAPPING,
@@ -60,7 +65,11 @@ COSINE_THRESHOLD: float = 0.99
 
 
 @pytest.mark.parametrize(
-    "model_path", SEQ_CLASSIFICATION_PATHS, ids=SEQ_CLASSIFICATION_PATHS
+    "model_path",
+    xfail_non_blocking(
+        SEQ_CLASSIFICATION_PATHS,
+        table=NON_BLOCKING_SEQUENCE_CLASSIFICATION_MODELS,
+    ),
 )
 def test_e2e_seq_classification_compare_spyre(
     model_path: str, trust_remote_code: bool | None
