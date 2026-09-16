@@ -529,10 +529,13 @@ def _finish_block(
 
     residual = h
     h = _gemma4_rms_norm(h, pre_ffn_norm_weight, spec.pre_feedforward_norm_eps)
+    original_shape = h.shape
+    h = h.reshape(-1, original_shape[-1])
     h = F.linear(
         _gemma4_mlp_activation(F.linear(h, gate_weight)) * F.linear(h, up_weight),
         down_weight,
     )
+    h = h.reshape(original_shape)
     h = residual + _gemma4_rms_norm(
         h, post_ffn_norm_weight, spec.post_feedforward_norm_eps
     )
