@@ -38,8 +38,10 @@ from hf_adapters.spyre_tensor_parallel import (
     SPYRE_REPLICATED_EMBEDDING,
     SPYRE_REPLICATED_LINEAR,
     SPYRE_ROWWISE,
+    SpyreColwiseParallel,
     SpyreEmbeddingColwiseParallel,
     SpyreEmbeddingRowwiseParallel,
+    SpyreRowwiseParallel,
     _matches_plan,
     _reassemble_all_gather_last_dim,
     prepare_spyre_tp_plan,
@@ -372,6 +374,30 @@ def test_cpu_staged_styles_return_local_cpu_shards():
     assert packed_shard.shape == (4, 16)
     assert rowwise_shard.device.type == "cpu"
     assert rowwise_shard.shape == (2, 8, 4)
+
+
+def test_linear_tp_styles_replicate_scalar_conversion_state(monkeypatch):
+    copied = []
+
+    def fake_copy_default(tensor, *, device, dtype):
+        copied.append((tensor, device, dtype))
+        return tensor.to(dtype=dtype)
+
+    monkeypatch.setattr(
+        "hf_adapters.spyre_tensor_parallel._copy_default", fake_copy_default
+    )
+    scalar = torch.tensor(3.0)
+
+    for style in (SpyreColwiseParallel(), SpyreRowwiseParallel()):
+        result = style.shard_tensor(scalar, device="spyre:0", dtype=torch.float16)
+        assert result.shape == ()
+        assert result.dtype == torch.float16
+        assert style.get_expected_sharded_shape(torch.Size([])) == ()
+
+    assert [(device, dtype) for _, device, dtype in copied] == [
+        ("spyre:0", torch.float16),
+        ("spyre:0", torch.float16),
+    ]
 
 
 def test_gemma4_tp4_groups_kv_only_when_a_shard_would_split_a_head():
