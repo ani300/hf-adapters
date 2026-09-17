@@ -398,6 +398,14 @@ def _run_backbone_forward(
                     selected_mask, capacity
                 )
             selected_mask = sliding_masks_by_capacity[capacity]
+            # A chunked-prefill cache can be a prefix view of the physical
+            # allocation on its first invocation.  The compiled in-place cache
+            # update subsequently exposes the owner, which is why the reusable
+            # mask above is sized to ``capacity``.  Match the custom op's exact
+            # Lk contract to the logical view presented by this invocation.
+            logical_width = key_caches[i].size(2)
+            if selected_mask.size(-1) != logical_width:
+                selected_mask = selected_mask[..., :logical_width]
         h, key_caches[i], value_caches[i] = compiled_block(
             h,
             freqs[lt],

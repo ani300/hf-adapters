@@ -170,6 +170,7 @@ def test_kv_sharing_sliding_layer_matches_the_band_masked_path():
         swa_mode=None,
         window_size=WINDOW,
         swa_is_causal=True,
+        tp_group_name=None,
     )
     op_spec = replace(band_spec, swa_mode="anchored")
     band = _make_block_forward(band_spec)

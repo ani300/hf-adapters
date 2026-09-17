@@ -104,6 +104,11 @@ from hf_adapters.hf_common import (
     run_lm_head,
     text_config,
 )
+from hf_adapters.spyre_tensor_parallel import (
+    SPYRE_REPLICATED_LINEAR,
+    SPYRE_ROWWISE,
+    spyre_compiled_all_reduce,
+)
 from hf_adapters.swa_attention import (
     SlidingWindowCache,
     allocate_swa_caches,
@@ -115,11 +120,6 @@ from hf_adapters.swa_attention import (
     roll_sliding_buffers,
     sliding_window_attention,
     valid_start_for,
-)
-from hf_adapters.spyre_tensor_parallel import (
-    SPYRE_REPLICATED_LINEAR,
-    SPYRE_ROWWISE,
-    spyre_compiled_all_reduce,
 )
 
 
@@ -1092,6 +1092,14 @@ def _run_blocks_over_embeds(
                     selected_mask, capacity
                 )
             selected_mask = sliding_masks_by_capacity[capacity]
+            # A chunked-prefill cache can be a prefix view of the physical
+            # allocation on its first invocation.  The compiled in-place cache
+            # update subsequently exposes the owner, which is why the reusable
+            # mask above is sized to ``capacity``.  Match the custom op's exact
+            # Lk contract to the logical view presented by this invocation.
+            logical_width = cache.size(2)
+            if selected_mask.size(-1) != logical_width:
+                selected_mask = selected_mask[..., :logical_width]
         if is_moe:
             # MoE retains its split compiled regions while sharing the custom
             # attention op and compact-cache driver.
@@ -1233,12 +1241,12 @@ def _setup_gemma4_text_decoder(model, *, allow_moe=False):
     model._spyre_producer_of = _shared_producer_map(cfg)
 
     if allow_moe:
-        assert (
-            not model._spyre_has_ple
-        ), "Gemma 4 MoE adapter does not support per-layer embeddings (PLE)."
-        assert not getattr(
-            cfg, "num_kv_shared_layers", 0
-        ), "Gemma 4 MoE adapter does not support KV-sharing across layers."
+        assert not model._spyre_has_ple, (
+            "Gemma 4 MoE adapter does not support per-layer embeddings (PLE)."
+        )
+        assert not getattr(cfg, "num_kv_shared_layers", 0), (
+            "Gemma 4 MoE adapter does not support KV-sharing across layers."
+        )
     else:
         assert not getattr(cfg, "enable_moe_block", False), (
             "Gemma 4 dense adapter does not support MoE blocks "
