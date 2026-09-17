@@ -2718,7 +2718,11 @@ def generate(
 def _standard_gqa_attention_dim_names(query, key, value):
     """Return named-dim declarations and per-tensor names for Spyre SDPA.
 
-    Names match ``spyre__sdpa_overrideable``; unit axes are omitted.
+    The K/V sequence axis is intentionally untracked. ``for_each_tile`` carries
+    that relationship structurally; propagating the full ``max_seqlen_kv`` name
+    into the tile body incorrectly treats the tile index and the within-tile
+    index as a reshape split. K/V retain names for their other axes because
+    those axes still participate in ordinary ``spyre_hint`` tiling.
     """
     q_shape = tuple(int(d) for d in query.shape)
     k_shape = tuple(int(d) for d in key.shape)
@@ -2737,19 +2741,20 @@ def _standard_gqa_attention_dim_names(query, key, value):
             f"num_kvheads must divide num_heads: {q_shape[1]}, {k_shape[1]}"
         )
 
+    kv_sequence_placeholder = f"_untracked_{k_shape[2]}"
     declarations = (
         ("_b", q_shape[0]),
         ("num_heads", q_shape[1]),
         ("num_kvheads", k_shape[1]),
         ("max_seqlen_q", q_shape[2]),
-        ("max_seqlen_kv", k_shape[2]),
+        (kv_sequence_placeholder, k_shape[2]),
         ("head_dim", q_shape[3]),
         ("value_head_dim", v_shape[3]),
     )
     logical_names = (
         ("_b", "num_heads", "max_seqlen_q", "head_dim"),
-        ("_b", "num_kvheads", "max_seqlen_kv", "head_dim"),
-        ("_b", "num_kvheads", "max_seqlen_kv", "value_head_dim"),
+        ("_b", "num_kvheads", kv_sequence_placeholder, "head_dim"),
+        ("_b", "num_kvheads", kv_sequence_placeholder, "value_head_dim"),
     )
     tensor_names = tuple(
         [name for size, name in zip(shape, names, strict=True) if size != 1]
