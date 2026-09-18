@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from hf_adapters import hf_common
 from hf_adapters.hf_common import (
     moe_decode_selected_experts,
     moe_prefill_all_experts,
@@ -477,10 +478,15 @@ def prepare_text_decoder_for_spyre(model):
         expert_scale = block.router.per_expert_scale.detach().cpu()
         block.router.route_identity = torch.eye(
             stick_size, dtype=expert_scale.dtype
-        ).to("spyre")
-        block.router.per_expert_scale_stick = dma_moe_per_expert_scale_to_spyre(
-            expert_scale
-        )
+        ).to(hf_common.DEVICE)
+        if str(hf_common.DEVICE).startswith("spyre"):
+            block.router.per_expert_scale_stick = dma_moe_per_expert_scale_to_spyre(
+                expert_scale
+            )
+        else:
+            block.router.per_expert_scale_stick = (
+                expert_scale[:, None].expand(-1, stick_size).contiguous()
+            )
         prepare_moe_expert_weights(block.experts, pad_to_multiple=stick_size)
         backbone.layers[i] = block
         blocks.append(block)
