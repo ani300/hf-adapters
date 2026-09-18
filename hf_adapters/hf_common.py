@@ -1976,15 +1976,18 @@ def load_model_common(
 
         auto_model_cls = AutoModel
 
-    if tp_plan is not None and hasattr(module, "load_hf_model"):
-        raise SpyreUnsupportedModelError(
-            "tensor-parallel loading is not supported by this adapter's custom loader"
-        )
-
     if hasattr(module, "load_hf_model"):
-        model = module.load_hf_model(
-            model_path, dtype, trust_remote_code=trust_remote_code
-        )
+        # _sig was already inspected above (for the tp_plan support check).
+        # Re-inspect here to determine which optional kwargs this loader accepts.
+        import inspect as _inspect
+
+        _sig = _inspect.signature(module.load_hf_model)
+        _kwargs: dict = {}
+        if tp_plan is not None and "tp_plan" in _sig.parameters:
+            _kwargs["tp_plan"] = tp_plan
+        if "trust_remote_code" in _sig.parameters:
+            _kwargs["trust_remote_code"] = trust_remote_code
+        model = module.load_hf_model(model_path, dtype, **_kwargs)
     elif tp_plan is not None:
         from transformers.distributed import DistributedConfig
 
@@ -2021,9 +2024,21 @@ def load_model_common(
 def move_model_to_spyre(model, module, dtype: torch.dtype) -> None:
     untie_embedding_and_lm_head(model)
     module.prepare_for_spyre(model)
+    cpu_submodules = getattr(model, "_spyre_cpu_submodules", [])
+    saved_cpu_modules = {}
+    for path in cpu_submodules:
+        parent_path, _, attr = path.rpartition(".")
+        parent = model.get_submodule(parent_path) if parent_path else model
+        saved_cpu_modules[path] = (parent, attr, getattr(parent, attr))
+        setattr(parent, attr, torch.nn.Module())
+
     _move_to_spyre_with_layout(model, dtype)
-    for submod_name in getattr(model, "_spyre_cpu_submodules", []):
-        model.get_submodule(submod_name).to("cpu")
+
+    for parent, attr, submod in saved_cpu_modules.values():
+        # Explicitly move to CPU: when DistributedConfig already placed the
+        # model on device before move_model_to_spyre runs, the saved submodule
+        # is on-device too; the restore would leave it on device rather than CPU.
+        setattr(parent, attr, submod.to(device="cpu", dtype=dtype))
     print("Model on Spyre ready.")
 
 
@@ -2732,7 +2747,11 @@ def generate(
 def _standard_gqa_attention_dim_names(query, key, value):
     """Return named-dim declarations and per-tensor names for Spyre SDPA.
 
-    Names match ``spyre__sdpa_overrideable``; unit axes are omitted.
+    The K/V sequence axis is intentionally untracked. ``for_each_tile`` carries
+    that relationship structurally; propagating the full ``max_seqlen_kv`` name
+    into the tile body incorrectly treats the tile index and the within-tile
+    index as a reshape split. K/V retain names for their other axes because
+    those axes still participate in ordinary ``spyre_hint`` tiling.
     """
     q_shape = tuple(int(d) for d in query.shape)
     k_shape = tuple(int(d) for d in key.shape)
@@ -2751,19 +2770,20 @@ def _standard_gqa_attention_dim_names(query, key, value):
             f"num_kvheads must divide num_heads: {q_shape[1]}, {k_shape[1]}"
         )
 
+    kv_sequence_placeholder = f"_untracked_{k_shape[2]}"
     declarations = (
         ("_b", q_shape[0]),
         ("num_heads", q_shape[1]),
         ("num_kvheads", k_shape[1]),
         ("max_seqlen_q", q_shape[2]),
-        ("max_seqlen_kv", k_shape[2]),
+        (kv_sequence_placeholder, k_shape[2]),
         ("head_dim", q_shape[3]),
         ("value_head_dim", v_shape[3]),
     )
     logical_names = (
         ("_b", "num_heads", "max_seqlen_q", "head_dim"),
-        ("_b", "num_kvheads", "max_seqlen_kv", "head_dim"),
-        ("_b", "num_kvheads", "max_seqlen_kv", "value_head_dim"),
+        ("_b", "num_kvheads", kv_sequence_placeholder, "head_dim"),
+        ("_b", "num_kvheads", kv_sequence_placeholder, "value_head_dim"),
     )
     tensor_names = tuple(
         [name for size, name in zip(shape, names, strict=True) if size != 1]

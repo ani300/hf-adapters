@@ -27,6 +27,13 @@ Usage (on the Spyre pod, with the project root on PYTHONPATH)::
     python scripts/profile_e2e_spyre.py --model ministral3 \\
         --hf-home /mnt/models/hf_cache
 
+To reproduce the Granite batch-4, 1K aggregate prompt-token workload used by
+the shape worker (4 rows x 256 tokens, 512 total tokens per row)::
+
+    SPYRE_DEVICES=0 python scripts/profile_e2e_spyre.py --model granite8b \\
+        --hf-home /mnt/models/hf_cache --batch 4 --prompt-tokens 256 \\
+        --max-length 512
+
 The HF hub cache lives at ``<HF_HOME>/hub``; pass ``--hf-home`` (or set the
 ``HF_HOME`` env var) to point at a shared cache instead of the default.
 
@@ -106,16 +113,40 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Chrome-trace output path (default: <model>_trace.json).",
     )
-    parser.add_argument(
+    length_group = parser.add_mutually_exclusive_group()
+    length_group.add_argument(
         "--max-new-tokens",
         type=int,
-        default=5,
+        default=None,
         help="New-token budget (default: 5, matching the smoke test).",
+    )
+    length_group.add_argument(
+        "--max-length",
+        type=int,
+        default=None,
+        help="Total prompt + generated token budget (mutually exclusive with --max-new-tokens).",
     )
     parser.add_argument(
         "--prompt",
         default=DEFAULT_PROMPT,
         help=f"Prompt to generate from (default: {DEFAULT_PROMPT!r}).",
+    )
+    parser.add_argument(
+        "--prompt-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Force each input row to exactly N tokens by repeating/truncating "
+            "the tokenized prompt (default: use its natural length)."
+        ),
+    )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of identical prompt rows (default: 1).",
     )
     parser.add_argument(
         "--hf-home",
@@ -139,11 +170,48 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_inputs(
+    tokenizer,
+    prompt: str,
+    batch_size: int,
+    prompt_tokens: int | None,
+) -> dict[str, "torch.Tensor"]:
+    """Tokenize *prompt* and return an exact, uniformly sized input batch."""
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if prompt_tokens is not None and prompt_tokens <= 0:
+        raise ValueError(f"prompt_tokens must be positive, got {prompt_tokens}")
+
+    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
+    if prompt_tokens is not None:
+        if input_ids.shape[1] < prompt_tokens:
+            # Repeat ordinary prompt tokens rather than inserting padding: the
+            # shape worker's seqlen represents real prompt tokens in every row.
+            seed = tokenizer(prompt, add_special_tokens=False, return_tensors="pt")[
+                "input_ids"
+            ]
+            if seed.numel() == 0:
+                seed = input_ids
+            missing = prompt_tokens - input_ids.shape[1]
+            repeats = (missing + seed.shape[1] - 1) // seed.shape[1]
+            input_ids = torch.cat((input_ids, seed.repeat(1, repeats)), dim=1)
+        input_ids = input_ids[:, :prompt_tokens]
+
+    input_ids = input_ids.repeat(batch_size, 1)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+    }
+
+
 def run_profile(
     model_path: str,
     dtype: "torch.dtype",
     prompt: str,
-    max_new_tokens: int,
+    max_new_tokens: int | None,
+    max_length: int | None,
+    batch_size: int,
+    prompt_tokens: int | None,
     out_path: str,
     with_stack: bool = False,
 ) -> None:
@@ -165,15 +233,27 @@ def run_profile(
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     print(f"  Load time: {time.time() - t0:.1f}s")
-    print(f"  Prompt: {prompt!r}")
+    print(f"  Prompt seed: {prompt!r}")
 
-    encoded = tokenizer(prompt, return_tensors="pt")
+    encoded = build_inputs(tokenizer, prompt, batch_size, prompt_tokens)
+    actual_prompt_len = encoded["input_ids"].shape[1]
+    if max_length is not None and max_length <= actual_prompt_len:
+        raise ValueError(
+            f"max_length ({max_length}) must exceed prompt length ({actual_prompt_len})"
+        )
+    print(
+        f"  Input shape: {list(encoded['input_ids'].shape)} "
+        f"({encoded['input_ids'].numel()} aggregate prompt tokens)"
+    )
     gen_kwargs = dict(
         **encoded,
-        max_new_tokens=max_new_tokens,
         do_sample=False,
         timing=True,
     )
+    if max_length is not None:
+        gen_kwargs["max_length"] = max_length
+    else:
+        gen_kwargs["max_new_tokens"] = max_new_tokens
 
     # --- Warmup: first generate triggers torch.compile; NOT profiled. This
     #     is what "warms the compiler cache" so the profiled run below measures
@@ -200,16 +280,25 @@ def run_profile(
 
     prof.export_chrome_trace(out_path)
 
-    output_text = tokenizer.decode(
-        outputs[0, encoded["input_ids"].shape[1] :], skip_special_tokens=True
+    output_texts = tokenizer.batch_decode(
+        outputs[:, actual_prompt_len:], skip_special_tokens=True
     )
-    print(f"\n  Output: {output_text!r}")
+    print(f"\n  Output shape: {list(outputs.shape)}")
+    for i, output_text in enumerate(output_texts):
+        print(f"  Output[{i}]: {output_text!r}")
     print(f"  trace → {out_path}")
     print("  open in https://ui.perfetto.dev/ or chrome://tracing")
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.max_new_tokens is None and args.max_length is None:
+        args.max_new_tokens = 5
+    if args.batch <= 0:
+        parser.error("--batch must be positive")
+    if args.prompt_tokens is not None and args.prompt_tokens <= 0:
+        parser.error("--prompt-tokens must be positive")
     if args.hf_home:
         # Normally already applied by _apply_hf_home() at import time; re-set
         # for the programmatic main(argv=[...]) path where import ran first.
@@ -224,6 +313,9 @@ def main(argv: list[str] | None = None) -> None:
         dtype=dtype,
         prompt=args.prompt,
         max_new_tokens=args.max_new_tokens,
+        max_length=args.max_length,
+        batch_size=args.batch,
+        prompt_tokens=args.prompt_tokens,
         out_path=out,
         with_stack=args.with_stack,
     )
