@@ -116,6 +116,7 @@ from hf_adapters.swa_attention import (
     compact_sliding_buffers,
     fit_attention_mask,
     physical_cache_capacity,
+    prefill_ring_step,
     rebind_shared_caches,
     roll_sliding_buffers,
     sliding_window_attention,
@@ -928,6 +929,7 @@ def _build_layer_masks(
     seq_len,
     batch_size,
     block_base,
+    sliding_key_cache_coords=None,
 ):
     """Build the text-only per-layer-type mask dict {full_attention, sliding_attention}.
 
@@ -950,7 +952,10 @@ def _build_layer_masks(
         batch_size, seq_len
     )
     sliding_mask = add_causal_sliding_window_band(
-        attn_mask, query_coords, cfg.sliding_window
+        attn_mask,
+        query_coords,
+        cfg.sliding_window,
+        key_cache_coords=sliding_key_cache_coords,
     )
     return {"full_attention": attn_mask, "sliding_attention": sliding_mask}
 
@@ -1015,8 +1020,27 @@ def _run_blocks_over_embeds(
     # to construct runtime tensor data and manage the compact eager cache.
     block_base = int(cache_index[0]) if masks is None or swa_mode else 0
 
+    prefill_step = None
+    if swa_mode == "anchored" and seq_len > 1:
+        prompt_len = getattr(model, "_spyre_padded_prompt_len", block_base + seq_len)
+        sliding_layer = cfg.layer_types.index("sliding_attention")
+        capacity = physical_cache_capacity(key_caches[sliding_layer])
+        if prompt_len > capacity:
+            prefill_step = prefill_ring_step(
+                block_base, seq_len, capacity, cache_index.device
+            )
+
     if masks is None:
-        masks = _build_layer_masks(model, attn_mask, seq_len, bsz, block_base)
+        masks = _build_layer_masks(
+            model,
+            attn_mask,
+            seq_len,
+            bsz,
+            block_base,
+            sliding_key_cache_coords=(
+                prefill_step.key_cache_coords if prefill_step is not None else None
+            ),
+        )
 
     if seq_len > 1 and block_base == 0:
         # A new prefill invalidates state retained by an earlier generate call.
@@ -1050,6 +1074,8 @@ def _run_blocks_over_embeds(
             )
         masks["sliding_attention"] = step.attention_mask
         sliding_index = step.cache_index
+    elif prefill_step is not None:
+        sliding_index = prefill_step.cache_index
     else:
         sliding_index = cache_index
 

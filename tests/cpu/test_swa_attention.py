@@ -26,6 +26,7 @@ from hf_adapters.hf_common import add_causal_sliding_window_band, build_prefill_
 from hf_adapters.swa_attention import (
     fit_attention_mask,
     physical_cache_capacity,
+    prefill_ring_step,
     sliding_capacity,
     sliding_window_attention,
 )
@@ -81,6 +82,97 @@ def test_attention_mask_is_fitted_to_the_physical_cache():
     assert torch.equal(expanded[..., :128], mask)
     assert torch.all(expanded[..., 128:] < 0)
     assert torch.equal(cropped, mask[..., :64])
+
+
+def test_causal_band_can_be_remapped_to_prefill_ring_order():
+    query_coords = torch.arange(8, 12)[None, :]
+    base = build_prefill_mask(
+        1,
+        4,
+        16,
+        0,
+        dtype=torch.float32,
+        query_start=8,
+    )
+    logical = add_causal_sliding_window_band(base, query_coords, 4)
+    key_cache_coords = torch.tensor([8, 9, 10, 11, 4, 5, 6, 7])
+    physical = add_causal_sliding_window_band(
+        base,
+        query_coords,
+        4,
+        key_cache_coords=key_cache_coords,
+    )
+
+    torch.testing.assert_close(
+        physical,
+        logical.index_select(-1, key_cache_coords),
+    )
+
+
+def test_causal_band_masks_unwritten_prefill_ring_rows():
+    query_coords = torch.arange(4)[None, :]
+    base = build_prefill_mask(1, 4, 16, 0, dtype=torch.float32)
+    key_cache_coords = torch.tensor([0, 1, 2, 3, -4, -3, -2, -1])
+    physical = add_causal_sliding_window_band(
+        base,
+        query_coords,
+        4,
+        key_cache_coords=key_cache_coords,
+    )
+
+    assert torch.all(physical[..., 4:] < 0)
+
+
+def test_prefill_ring_attention_matches_logical_cache_order():
+    torch.manual_seed(11)
+    batch, query_heads, kv_heads, head_dim = 1, 4, 2, 32
+    block_start, query_length, logical_capacity = 8, 4, 16
+    ring_capacity, window = 8, 4
+    query = torch.randn(batch, query_heads, query_length, head_dim)
+    logical_key = torch.randn(batch, kv_heads, logical_capacity, head_dim)
+    logical_value = torch.randn(batch, kv_heads, logical_capacity, head_dim)
+    step = prefill_ring_step(block_start, query_length, ring_capacity)
+
+    ring_key = torch.zeros(batch, kv_heads, ring_capacity, head_dim)
+    ring_value = torch.zeros_like(ring_key)
+    valid = step.key_cache_coords >= 0
+    ring_key[..., valid, :] = logical_key[..., step.key_cache_coords[valid], :]
+    ring_value[..., valid, :] = logical_value[..., step.key_cache_coords[valid], :]
+
+    query_coords = torch.arange(block_start, block_start + query_length)[None, :]
+    base_mask = build_prefill_mask(
+        batch,
+        query_length,
+        logical_capacity,
+        0,
+        dtype=query.dtype,
+        query_start=block_start,
+    )
+    logical_mask = add_causal_sliding_window_band(base_mask, query_coords, window)
+    ring_mask = add_causal_sliding_window_band(
+        base_mask,
+        query_coords,
+        window,
+        key_cache_coords=step.key_cache_coords,
+    )
+    expected = F.scaled_dot_product_attention(
+        query,
+        logical_key,
+        logical_value,
+        attn_mask=logical_mask,
+        enable_gqa=True,
+    )
+    actual = sliding_window_attention(
+        query,
+        ring_key,
+        ring_value,
+        ring_mask,
+        window_size=window,
+        is_causal=True,
+        scale=None,
+    )
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_physical_cache_capacity_uses_logical_width_on_cpu():

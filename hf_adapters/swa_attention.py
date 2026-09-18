@@ -52,6 +52,23 @@ def sliding_capacity(window_size, q_block=BLOCK_SIZE):
     return -(-(window_size + q_block - 1) // BLOCK_SIZE) * BLOCK_SIZE
 
 
+def sliding_prefill_capacity(window_size, query_chunk_size):
+    """Rows in a copy-free circular cache for chunked SWA prefill.
+
+    One invocation needs the previous ``window_size - 1`` logical rows plus
+    its complete query chunk. Rounding that span up to a whole number of query
+    chunks makes every scatter contiguous: ``block_start % capacity`` never
+    places a chunk across the physical end of the allocation.
+    """
+    if query_chunk_size <= 0 or query_chunk_size % BLOCK_SIZE != 0:
+        raise ValueError(
+            f"query_chunk_size must be a positive multiple of {BLOCK_SIZE}, "
+            f"got {query_chunk_size}"
+        )
+    required = window_size + query_chunk_size - 1
+    return -(-required // query_chunk_size) * query_chunk_size
+
+
 def fit_attention_mask(attention_mask, cache_capacity):
     """Crop or mask-pad an attention mask to a layer's physical cache width.
 
@@ -99,22 +116,27 @@ def physical_cache_capacity(cache):
 def allocate_swa_caches(model, batch_size, max_cache_len, dtype, device):
     """Allocate compact-capable caches for models with sliding attention layers.
 
-    Global layers retain the complete generation capacity. Sliding layers only
-    need enough rows for prefill and the anchored decode buffer; they are compacted
-    to ``sliding_capacity`` immediately before the first decode step. KV-sharing
-    consumers alias their producer's allocation instead of retaining unused caches.
+    Global layers retain the complete generation capacity. During chunked prefill,
+    sliding layers use a chunk-aligned circular cache just wide enough for the
+    preceding window and current query chunk; one-shot prefill retains its full
+    prompt extent. Both forms are compacted to ``sliding_capacity`` immediately
+    before the first decode step. KV-sharing consumers alias their producer's
+    allocation instead of retaining unused caches.
     """
     cfg = text_config(model.config)
     shapes = kv_cache_shapes(model)
     if len(shapes) != len(cfg.layer_types):
         raise ValueError("KV shapes and layer_types must have the same length")
     prompt_len = getattr(model, "_spyre_padded_prompt_len", max_cache_len)
+    decode_capacity = sliding_capacity(cfg.sliding_window)
+    query_chunk_size = getattr(model, "_spyre_active_prefill_chunk_size", None)
+    prefill_capacity = (
+        sliding_prefill_capacity(cfg.sliding_window, query_chunk_size)
+        if query_chunk_size is not None and prompt_len > decode_capacity
+        else max(decode_capacity, prompt_len)
+    )
     capacities = [
-        (
-            max(sliding_capacity(cfg.sliding_window), prompt_len)
-            if layer_type == "sliding_attention"
-            else max_cache_len
-        )
+        (prefill_capacity if layer_type == "sliding_attention" else max_cache_len)
         for layer_type in cfg.layer_types
     ]
     producer_of = getattr(model, "_spyre_producer_of", [None] * len(shapes))
@@ -278,14 +300,62 @@ class SlidingWindowCache:
         self.write_row += 1
 
 
+@dataclasses.dataclass(frozen=True)
+class SlidingPrefillStep:
+    """Physical write indices and logical contents of a prefill ring."""
+
+    cache_index: torch.Tensor
+    key_cache_coords: torch.Tensor
+
+
+def prefill_ring_step(block_start, query_length, cache_capacity, device=None):
+    """Map one logical query chunk into a fixed-capacity circular KV cache.
+
+    ``key_cache_coords[p]`` is the newest logical token stored in physical row
+    ``p`` after this chunk has been written. Negative values identify rows that
+    have not been written yet. The mask builder uses this mapping to place the
+    logical causal/window mask in physical cache order.
+    """
+    if block_start < 0:
+        raise ValueError(f"block_start must be non-negative, got {block_start}")
+    if query_length <= 0:
+        raise ValueError(f"query_length must be positive, got {query_length}")
+    if block_start % query_length != 0:
+        raise ValueError(
+            "block_start must be aligned to query_length, got "
+            f"block_start={block_start}, query_length={query_length}"
+        )
+    if cache_capacity <= 0 or cache_capacity % query_length != 0:
+        raise ValueError(
+            "cache_capacity must be a positive multiple of query_length, got "
+            f"cache_capacity={cache_capacity}, query_length={query_length}"
+        )
+    write_start = block_start % cache_capacity
+    if write_start + query_length > cache_capacity:
+        raise ValueError(
+            f"query chunk [{write_start}, {write_start + query_length}) wraps "
+            f"the {cache_capacity}-row cache"
+        )
+
+    newest = block_start + query_length - 1
+    physical_rows = torch.arange(cache_capacity, dtype=torch.long)
+    key_cache_coords = newest - torch.remainder(newest - physical_rows, cache_capacity)
+    cache_index = torch.arange(
+        write_start, write_start + query_length, dtype=torch.long
+    )
+    if device is not None:
+        cache_index = cache_index.to(device)
+    return SlidingPrefillStep(cache_index, key_cache_coords)
+
+
 def compact_after_prefill(key_cache, value_cache, state, prompt_len):
     """Move a prefill-sized cache's newest rows into a fresh anchored buffer.
 
-    Prefill needs ``max(sliding_capacity(W), prompt)`` rows; decode needs only
-    ``capacity``. Rather than carry the prefill allocation for the whole
-    generation — at Gemma 4 12B's 40 sliding layers and an 8192-token context that
-    is gigabytes — copy the newest ``min(prompt_len, anchor)`` rows into
-    ``[anchor - kept, anchor)`` of a compact buffer and let the big one go.
+    Prefill uses either a prompt-sized linear cache or a bounded circular cache;
+    decode needs only ``capacity``. Copy the newest ``min(prompt_len, anchor)``
+    logical rows—splitting at the circular boundary when needed—into
+    ``[anchor - kept, anchor)`` of a compact buffer and let the prefill allocation
+    go.
 
     Returns the new ``(key_cache, value_cache)``; the caller must replace its
     references, since nothing else keeps the compact buffers alive.
@@ -305,20 +375,28 @@ def compact_after_prefill(key_cache, value_cache, state, prompt_len):
         value_cache.dtype,
         device,
     )
-    _compact_copy(
-        compact_key,
-        key_cache,
-        dst_start=anchor - kept,
-        src_start=prompt_len - kept,
-        length=kept,
-    )
-    _compact_copy(
-        compact_value,
-        value_cache,
-        dst_start=anchor - kept,
-        src_start=prompt_len - kept,
-        length=kept,
-    )
+    for destination, source in (
+        (compact_key, key_cache),
+        (compact_value, value_cache),
+    ):
+        source_capacity = source.size(2)
+        src_start = (prompt_len - kept) % source_capacity
+        first_length = min(kept, source_capacity - src_start)
+        _compact_copy(
+            destination,
+            source,
+            dst_start=anchor - kept,
+            src_start=src_start,
+            length=first_length,
+        )
+        if first_length < kept:
+            _compact_copy(
+                destination,
+                source,
+                dst_start=anchor - kept + first_length,
+                src_start=0,
+                length=kept - first_length,
+            )
     return compact_key, compact_value
 
 

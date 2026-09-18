@@ -26,6 +26,7 @@ carried by a fixed-shape runtime mask, so all 64 rows reuse one decode graph.
 
 import types
 
+import pytest
 import torch
 
 from hf_adapters.hf_common import allocate_kv_caches
@@ -34,8 +35,10 @@ from hf_adapters.swa_attention import (
     allocate_swa_caches,
     compact_after_prefill,
     compact_sliding_buffers,
+    prefill_ring_step,
     roll_sliding_buffers,
     sliding_capacity,
+    sliding_prefill_capacity,
 )
 
 WINDOW = 1024
@@ -170,6 +173,29 @@ def test_capacity_uses_the_exact_staggered_width_before_rounding():
     assert sliding_capacity(65) == 128
 
 
+def test_prefill_capacity_is_chunk_aligned_and_covers_the_window():
+    assert sliding_prefill_capacity(1024, 512) == 1536
+    assert sliding_prefill_capacity(512, 512) == 1024
+    assert sliding_prefill_capacity(100, 64) == 192
+
+
+def test_prefill_ring_step_maps_physical_rows_to_logical_tokens():
+    first = prefill_ring_step(0, 512, 1536)
+    assert torch.equal(first.cache_index, torch.arange(512))
+    assert torch.equal(first.key_cache_coords[:512], torch.arange(512))
+    assert torch.all(first.key_cache_coords[512:] < 0)
+
+    wrapped = prefill_ring_step(1536, 512, 1536)
+    assert torch.equal(wrapped.cache_index, torch.arange(512))
+    assert torch.equal(wrapped.key_cache_coords[:512], torch.arange(1536, 2048))
+    assert torch.equal(wrapped.key_cache_coords[512:], torch.arange(512, 1536))
+
+
+def test_prefill_ring_step_rejects_unaligned_chunks():
+    with pytest.raises(ValueError, match="block_start must be aligned"):
+        prefill_ring_step(64, 512, 1536)
+
+
 def test_swa_allocator_uses_prompt_capacity_only_for_sliding_layers():
     model = types.SimpleNamespace(
         config=types.SimpleNamespace(
@@ -183,6 +209,44 @@ def test_swa_allocator_uses_prompt_capacity_only_for_sliding_layers():
     assert [cache.shape for cache in keys] == [(1, 2, 2048, 8), (1, 4, 4096, 16)]
     assert [cache.shape for cache in values] == [(1, 2, 2048, 8), (1, 4, 4096, 16)]
     assert all(not cache.any() for cache in [*keys, *values])
+
+
+def test_swa_allocator_bounds_chunked_prefill_capacity():
+    model = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=WINDOW,
+        ),
+        _spyre_kv_shapes=[(2, 8, 8), (4, 16, 16)],
+        _spyre_padded_prompt_len=8192,
+        _spyre_active_prefill_chunk_size=512,
+    )
+    keys, values = allocate_swa_caches(model, 1, 8704, torch.float32, "cpu")
+    assert [cache.shape for cache in keys] == [(1, 2, 1536, 8), (1, 4, 8704, 16)]
+    assert [cache.shape for cache in values] == [
+        (1, 2, 1536, 8),
+        (1, 4, 8704, 16),
+    ]
+
+
+def test_compaction_reads_the_logical_tail_from_a_wrapped_prefill_ring():
+    prompt_len = 8192
+    prefill_capacity = sliding_prefill_capacity(WINDOW, 512)
+    ring_k = torch.zeros(1, 2, prefill_capacity, 8)
+    ring_v = torch.zeros_like(ring_k)
+    for block_start in range(0, prompt_len, 512):
+        step = prefill_ring_step(block_start, 512, prefill_capacity)
+        marks = torch.arange(block_start, block_start + 512, dtype=torch.float32).view(
+            1, 1, 512, 1
+        )
+        ring_k.index_copy_(2, step.cache_index, marks.expand(1, 2, 512, 8))
+        ring_v.index_copy_(2, step.cache_index, (marks + 0.5).expand(1, 2, 512, 8))
+
+    state = SlidingWindowCache.after_prefill(WINDOW, prompt_len, offsets=[0])
+    compact_k, compact_v = compact_after_prefill(ring_k, ring_v, state, prompt_len)
+    expected = torch.arange(prompt_len - ANCHOR, prompt_len, dtype=torch.float32)
+    assert torch.equal(compact_k[0, 0, :ANCHOR, 0], expected)
+    assert torch.equal(compact_v[0, 0, :ANCHOR, 0], expected + 0.5)
 
 
 def test_common_allocator_hook_dispatches_to_swa_allocator():
