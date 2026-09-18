@@ -85,6 +85,7 @@ from hf_adapters.swa_attention import (
     compact_sliding_buffers,
     fit_attention_mask,
     physical_cache_capacity,
+    prefill_ring_step,
     roll_sliding_buffers,
     sliding_window_attention,
     valid_start_for,
@@ -329,6 +330,16 @@ def _run_backbone_forward(
     bsz, seq_len = input_ids.shape[0], input_ids.shape[1]
     block_base = int(cache_index[0])
 
+    prefill_step = None
+    if swa_mode == "anchored" and seq_len > 1:
+        prompt_len = getattr(model, "_spyre_padded_prompt_len", block_base + seq_len)
+        sliding_layer = cfg.layer_types.index("sliding_attention")
+        capacity = physical_cache_capacity(key_caches[sliding_layer])
+        if prompt_len > capacity:
+            prefill_step = prefill_ring_step(
+                block_base, seq_len, capacity, cache_index.device
+            )
+
     # Sliding mask = base mask restricted to a local window; query row j occupies
     # cache coordinate block_base + j. The op consumes this same mask directly,
     # making it the only position-dependent input to compiled attention.
@@ -339,7 +350,12 @@ def _run_backbone_forward(
         )
     else:
         sliding_mask = add_causal_sliding_window_band(
-            attn_mask, query_coords, cfg.sliding_window
+            attn_mask,
+            query_coords,
+            cfg.sliding_window,
+            key_cache_coords=(
+                prefill_step.key_cache_coords if prefill_step is not None else None
+            ),
         )
     masks = {"full_attention": attn_mask, "sliding_attention": sliding_mask}
 
@@ -371,6 +387,8 @@ def _run_backbone_forward(
             roll_sliding_buffers(cfg.layer_types, key_caches, value_caches)
         masks["sliding_attention"] = step.attention_mask
         sliding_index = step.cache_index
+    elif prefill_step is not None:
+        sliding_index = prefill_step.cache_index
     elif swa_mode:
         sliding_index = cache_index
     else:
