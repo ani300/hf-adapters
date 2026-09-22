@@ -1330,6 +1330,151 @@ def build_prefill_mask(
     return mask
 
 
+class _ChunkedPrefillMaskBuilder:
+    """Build successive chunk masks without copying every full mask from CPU.
+
+    A chunk beginning at ``s + chunk_size`` has the same causal frontier as the
+    chunk beginning at ``s``, shifted right by ``chunk_size`` columns. Keeping
+    that causal mask resident on the device therefore reduces every later mask
+    to a fixed-shape ``cat`` followed by ``minimum`` with the (small, broadcast)
+    left-padding mask. Only the first full ``[B, 1, Lq, Lk]`` causal mask
+    crosses the host/device boundary.
+
+    Gemma's causal sliding-window mask follows the same recurrence, with the
+    columns shifted in on the left encoding the moving lower window boundary.
+    Sliding states are initialized lazily because most adapters only need the
+    plain causal mask.
+    """
+
+    def __init__(
+        self,
+        batch_size,
+        chunk_size,
+        max_cache_len,
+        prompt_offsets,
+        dtype=torch.float16,
+        *,
+        device=DEVICE,
+    ):
+        self.batch_size = batch_size
+        self.chunk_size = chunk_size
+        self.max_cache_len = max_cache_len
+        self.dtype = dtype
+        self.device = device
+        self._query_start = 0
+        self._sliding_states = {}
+
+        # Keep the real batch dimension. Spyre's elementwise lowering does not
+        # reliably materialize a batch-broadcast input here.
+        self._causal = build_prefill_mask(
+            batch_size, chunk_size, max_cache_len, 0, dtype=dtype
+        ).to(device)
+        self._zero_chunk = torch.zeros(
+            (batch_size, 1, chunk_size, chunk_size), dtype=dtype
+        ).to(device)
+        self._masked_chunk = None
+
+        padding_mask = torch.zeros((batch_size, 1, 1, max_cache_len), dtype=dtype)
+        fill = _mask_fill_value(dtype)
+        if isinstance(prompt_offsets, torch.Tensor):
+            for batch_idx in range(batch_size):
+                padding_mask[batch_idx, :, :, : prompt_offsets[batch_idx].item()] = fill
+        else:
+            padding_mask[:, :, :, :prompt_offsets] = fill
+        self._padding_mask = padding_mask.to(device)
+
+    def _advance(self, state, shifted_in):
+        return torch.cat((shifted_in, state[..., : -self.chunk_size]), dim=-1)
+
+    def build(self, query_start):
+        """Return the causal mask for the next sequential query chunk."""
+        if query_start != self._query_start:
+            raise ValueError(
+                "chunked prefill masks must be requested sequentially: "
+                f"expected query_start={self._query_start}, got {query_start}"
+            )
+        if query_start:
+            self._causal = self._advance(self._causal, self._zero_chunk)
+        mask = torch.minimum(self._causal, self._padding_mask)
+        # Gemma's shared sliding-window helper sees this tensor before it enters
+        # a compiled block. Keep the builder metadata on the Python Tensor
+        # wrapper so it can use the device-resident sliding recurrence too.
+        mask._spyre_chunked_prefill_builder = self
+        mask._spyre_chunked_prefill_query_start = query_start
+        self._query_start += self.chunk_size
+        return mask
+
+    def _build_sliding_state(self, query_start, sliding_window):
+        if query_start == 0 and sliding_window >= self.chunk_size:
+            return self._causal
+
+        state = build_prefill_mask(
+            self.batch_size,
+            self.chunk_size,
+            self.max_cache_len,
+            0,
+            dtype=self.dtype,
+            query_start=query_start,
+        )
+        fill = _mask_fill_value(self.dtype)
+        for row in range(self.chunk_size):
+            lower_bound = max(0, query_start + row - sliding_window + 1)
+            state[..., row, :lower_bound] = fill
+        return state.to(self.device)
+
+    def _sliding_shifted_in(self, query_start, sliding_window):
+        """Columns inserted while advancing a clipped sliding window."""
+        first_lower_bound = max(0, query_start - sliding_window + 1)
+        last_lower_bound = max(0, query_start + self.chunk_size - sliding_window)
+        if last_lower_bound == 0:
+            return self._zero_chunk
+        if first_lower_bound >= self.chunk_size:
+            if self._masked_chunk is None:
+                self._masked_chunk = torch.full(
+                    (
+                        self.batch_size,
+                        1,
+                        self.chunk_size,
+                        self.chunk_size,
+                    ),
+                    _mask_fill_value(self.dtype),
+                    dtype=self.dtype,
+                ).to(self.device)
+            return self._masked_chunk
+
+        # Exactly one advance can straddle either edge of the fixed-size
+        # shifted-in chunk. Transfer that small [B,1,Lq,Lq] pattern once; all
+        # other advances reuse the all-zero or all-masked resident tensors.
+        shifted_in = torch.zeros(
+            (self.batch_size, 1, self.chunk_size, self.chunk_size), dtype=self.dtype
+        )
+        fill = _mask_fill_value(self.dtype)
+        for row in range(self.chunk_size):
+            lower_bound = min(
+                self.chunk_size,
+                max(0, query_start + row - sliding_window + 1),
+            )
+            shifted_in[..., row, :lower_bound] = fill
+        return shifted_in.to(self.device)
+
+    def add_causal_sliding_window(self, mask, query_start, sliding_window):
+        """Intersect ``mask`` with Gemma's causal sliding window on-device."""
+        state_entry = self._sliding_states.get(sliding_window)
+        if state_entry is None:
+            sliding_state = self._build_sliding_state(query_start, sliding_window)
+        else:
+            state_start, sliding_state = state_entry
+            if query_start == state_start + self.chunk_size:
+                shifted_in = self._sliding_shifted_in(query_start, sliding_window)
+                sliding_state = self._advance(sliding_state, shifted_in)
+            elif query_start != state_start:
+                # This is not expected from generate(), but keeps the helper
+                # correct if an adapter asks for a discontinuous chunk.
+                sliding_state = self._build_sliding_state(query_start, sliding_window)
+        self._sliding_states[sliding_window] = (query_start, sliding_state)
+        return torch.minimum(mask, sliding_state)
+
+
 def build_expansion_mask(
     batch_size,
     block_size,
@@ -1479,17 +1624,25 @@ def add_causal_sliding_window_band(mask, query_cache_coords, sliding_window):
             (column index the row's token occupies / will occupy in the cache).
         sliding_window: window size (number of keys, exclusive lower bound).
 
-    Returns a new mask with the base padding/causality preserved plus -inf on
-    every key outside ``(q - sliding_window, q]``. Same device/dtype as ``mask``.
+    Returns a new mask with the base padding/causality preserved plus a masked
+    fill value on every key outside ``(q - sliding_window, q]``. Same
+    device/dtype as ``mask``.
 
-    The band is computed on **CPU** (integer comparisons + a ``bool`` mask),
-    then added to ``mask`` **on CPU**, and the combined mask is moved back to
-    ``mask``'s original device. The comparisons must not run on Spyre: its
-    Inductor backend rejects ``int64`` compare-to-constant and ``bool``
-    intermediates. The *add* is also kept off-device because an on-device
-    ``-inf + -inf`` has been observed to produce NaN on Spyre in bf16 (see the
-    note at the return). Mirrors ``add_sliding_window_band``.
+    Ordinary masks take the CPU fallback below because Spyre's Inductor backend
+    rejects the integer comparisons and bool intermediates used to build the
+    band. Chunked-prefill masks carry a private builder that advances a
+    device-resident sliding state instead, avoiding a full mask round-trip per
+    chunk. Both paths avoid combining two masked cells on-device by addition;
+    ``-inf + -inf`` has been observed to produce NaN on Spyre in bf16.
     """
+    chunked_builder = getattr(mask, "_spyre_chunked_prefill_builder", None)
+    if chunked_builder is not None:
+        return chunked_builder.add_causal_sliding_window(
+            mask,
+            mask._spyre_chunked_prefill_query_start,
+            sliding_window,
+        )
+
     lk = mask.shape[-1]
     k_col = torch.arange(lk)[None, None, :]  # [1, 1, Lk] on CPU
     q_coord = query_cache_coords.to("cpu")[:, :, None].to(k_col.dtype)  # [B, Lq, 1]
@@ -2584,21 +2737,22 @@ def generate(
                 # Keep Lk fixed at the complete prefill extent while advancing
                 # Lq. Future cache slots are zero and masked, and fixed shapes
                 # avoid compiling one attention graph for every prefix length.
+                prefill_mask_builder = _ChunkedPrefillMaskBuilder(
+                    batch_size,
+                    query_chunk_size,
+                    prefill_kv_len,
+                    prompt_offsets,
+                    dtype=model_d_type,
+                    device=DEVICE,
+                )
                 for chunk_start in range(0, padded_len, query_chunk_size):
                     chunk_end = chunk_start + query_chunk_size
-                    prefill_mask = build_prefill_mask(
-                        batch_size,
-                        query_chunk_size,
-                        prefill_kv_len,
-                        prompt_offsets,
-                        dtype=model_d_type,
-                        query_start=chunk_start,
-                    )
+                    prefill_mask = prefill_mask_builder.build(chunk_start)
                     logits = run_forward_fn(  # type: ignore[misc]
                         model,
                         input_ids[:, chunk_start:chunk_end].to(DEVICE),
                         position_ids[:, chunk_start:chunk_end].to(DEVICE),
-                        prefill_mask.to(DEVICE),
+                        prefill_mask,
                         prefill_key_caches,
                         prefill_value_caches,
                         cache_index=make_cache_index(
