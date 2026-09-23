@@ -262,6 +262,27 @@ def test_chunked_prefill_mask_recurrence_matches_reference(sliding_window):
             expected_sliding[..., row, :lower_bound] = fill
         assert torch.equal(actual_sliding, expected_sliding)
 
+        # Compact SWA caches expose the same logical mask in physical ring
+        # order. Builder metadata must not bypass that remapping.
+        key_cache_coords = {
+            0: torch.tensor([0, 1, 2, 3, -4, -3, -2, -1]),
+            4: torch.arange(8),
+            8: torch.tensor([8, 9, 10, 11, 4, 5, 6, 7]),
+        }[query_start]
+        actual_ring = add_causal_sliding_window_band(
+            actual,
+            query_coords,
+            sliding_window,
+            key_cache_coords=key_cache_coords,
+        )
+        expected_ring = add_causal_sliding_window_band(
+            expected,
+            query_coords,
+            sliding_window,
+            key_cache_coords=key_cache_coords,
+        )
+        assert torch.equal(actual_ring, expected_ring)
+
 
 def test_token_aligned_inputs_follow_prompt_normalization():
     input_ids = torch.tensor([[11, 12, 99, 99], [0, 21, 22, 23]])

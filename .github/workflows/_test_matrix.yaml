@@ -985,7 +985,7 @@ jobs:
           pinned_torch_spyre_sha: ${{ needs.resolve-torch-spyre.outputs.torch_spyre_sha }}
           hf_adapters_sha: ${{ steps.build.outputs.target_sha }}
 
-      - name: Run test_model_components_spyre.py
+      - name: Run model component tests
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
@@ -2323,7 +2323,7 @@ jobs:
           pinned_torch_spyre_sha: ${{ needs.resolve-torch-spyre.outputs.torch_spyre_sha }}
           hf_adapters_sha: ${{ steps.build.outputs.target_sha }}
 
-      - name: Run test_model_components_spyre.py (pod-level retry)
+      - name: Run model component tests (pod-level retry)
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
