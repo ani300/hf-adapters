@@ -300,6 +300,11 @@ def run_multicard_smoke_test(
             sequences = model.generate(
                 **encoded,
                 max_new_tokens=max_new_tokens,
+                # The smoke assertions below require a non-empty decoded
+                # continuation. Make that requirement explicit so a valid
+                # first-step EOS does not turn the infrastructure smoke test
+                # into a model-quality check.
+                min_new_tokens=min(1, max_new_tokens),
                 do_sample=False,
                 timing=True,
             )
