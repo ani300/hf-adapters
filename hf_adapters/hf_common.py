@@ -23,7 +23,6 @@ compiled block functions.
 
 import math
 import os
-import sys
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -177,34 +176,6 @@ def moe_decode_selected_experts(
         return expert_out.sum(dim=1)
 
 
-@contextmanager
-def named_moe_prefill_inputs(x, gate, up, down):
-    """Name eager MoE inputs for the immediately following compiled prefill."""
-    if x.device.type != "spyre":
-        yield
-        return
-
-    named_dims = sys.modules["torch_spyre._inductor.wsr.propagate_named_dims"]
-    tokens = x.shape[0] * x.shape[1]
-    experts, hidden, intermediate = gate.shape
-    try:
-        for name, extent in (
-            ("E", experts),
-            ("T", tokens),
-            ("H", hidden),
-            ("M", intermediate),
-            ("ONE", 1),
-        ):
-            named_dims.declare_tensor_dim(name, extent)
-        named_dims.name_tensor_dims(x, ["T", "H"])
-        named_dims.name_tensor_dims(gate, ["E", "H", "M"])
-        named_dims.name_tensor_dims(up, ["E", "H", "M"])
-        named_dims.name_tensor_dims(down, ["E", "M", "H"])
-        yield
-    finally:
-        named_dims.reset()
-
-
 def moe_prefill_all_experts(x, routing_weight, gate, up, down, activation):
     """Evaluate every expert and sum its routed prefill output."""
     if activation not in ("silu", "gelu_tanh"):
@@ -214,8 +185,7 @@ def moe_prefill_all_experts(x, routing_weight, gate, up, down, activation):
         from torch_spyre._inductor.propagate_hints import spyre_hint
         from torch_spyre._inductor.wsr import for_each_tile
 
-        with spyre_hint(named_dims=["E", "T", "ONE"]):
-            route = routing_weight.permute(1, 0, 2).contiguous().clone()
+        route = routing_weight.permute(1, 0, 2).contiguous().clone()
 
         def expert_body(acc, tiles):
             x, route_tile, gate_tile, up_tile, down_tile = tiles
@@ -2884,94 +2854,8 @@ def generate(
 # ---------------------------------------------------------------------------
 
 
-def _standard_gqa_attention_dim_names(query, key, value):
-    """Return named-dim declarations and per-tensor names for Spyre SDPA.
-
-    The K/V sequence axis is intentionally untracked. ``for_each_tile`` carries
-    that relationship structurally; propagating the full ``max_seqlen_kv`` name
-    into the tile body incorrectly treats the tile index and the within-tile
-    index as a reshape split. K/V retain names for their other axes because
-    those axes still participate in ordinary ``spyre_hint`` tiling.
-    """
-    q_shape = tuple(int(d) for d in query.shape)
-    k_shape = tuple(int(d) for d in key.shape)
-    v_shape = tuple(int(d) for d in value.shape)
-    for name, shape in [("query", q_shape), ("key", k_shape), ("value", v_shape)]:
-        if len(shape) != 4:
-            raise ValueError(f"GQA requires rank-4 {name}, got {shape}")
-    if q_shape[0] != k_shape[0] or k_shape[:3] != v_shape[:3]:
-        raise ValueError(
-            f"Q/K/V batch or K/V prefix mismatch: {q_shape}, {k_shape}, {v_shape}"
-        )
-    if q_shape[3] != k_shape[3]:
-        raise ValueError(f"Q/K head_dim mismatch: {q_shape}, {k_shape}")
-    if q_shape[1] % k_shape[1] != 0:
-        raise ValueError(
-            f"num_kvheads must divide num_heads: {q_shape[1]}, {k_shape[1]}"
-        )
-
-    kv_sequence_placeholder = f"_untracked_{k_shape[2]}"
-    declarations = (
-        ("_b", q_shape[0]),
-        ("num_heads", q_shape[1]),
-        ("num_kvheads", k_shape[1]),
-        ("max_seqlen_q", q_shape[2]),
-        (kv_sequence_placeholder, k_shape[2]),
-        ("head_dim", q_shape[3]),
-        ("value_head_dim", v_shape[3]),
-    )
-    logical_names = (
-        ("_b", "num_heads", "max_seqlen_q", "head_dim"),
-        ("_b", "num_kvheads", kv_sequence_placeholder, "head_dim"),
-        ("_b", "num_kvheads", kv_sequence_placeholder, "value_head_dim"),
-    )
-    tensor_names = tuple(
-        [name for size, name in zip(shape, names, strict=True) if size != 1]
-        for shape, names in zip((q_shape, k_shape, v_shape), logical_names, strict=True)
-    )
-    return declarations, tensor_names
-
-
-def _apply_standard_gqa_attention_dim_names(
-    query, key, value, declare_tensor_dim, name_tensor_dims
-):
-    declarations, tensor_names = _standard_gqa_attention_dim_names(query, key, value)
-    for name, size in declarations:
-        declare_tensor_dim(name, size)
-    for tensor, names in zip((query, key, value), tensor_names, strict=True):
-        name_tensor_dims(tensor, names)
-
-
-@contextmanager
-def _named_standard_gqa_attention_inputs(query, key, value):
-    """Name eager Q/K/V inputs for the immediately following compiled SDPA."""
-    if query.device.type != "spyre":
-        # CPU adapter tests exercise the same block without the Spyre package.
-        yield
-        return
-
-    # Access the module registered by PyTorch's Spyre backend auto-loader.
-    # Importing torch_spyre here can recurse through backend initialization.
-    named_dims = sys.modules["torch_spyre._inductor.wsr.propagate_named_dims"]
-
-    try:
-        _apply_standard_gqa_attention_dim_names(
-            query,
-            key,
-            value,
-            named_dims.declare_tensor_dim,
-            named_dims.name_tensor_dims,
-        )
-        yield
-    finally:
-        # Compilation consumes and clears these globals itself. A cache-hit
-        # execution does not, so clear them here to avoid leaking annotations
-        # into a later, unrelated compilation.
-        named_dims.reset()
-
-
 class StandardGQAAttention(nn.Module):
-    """Split into ``pre_attn`` and ``attn_core`` for eager dim-naming."""
+    """Standard GQA attention split into projection and attention regions."""
 
     def __init__(self, attn):
         super().__init__()
@@ -3051,7 +2935,7 @@ class StandardGQAAttention(nn.Module):
 
 
 class StandardGQABlock(nn.Module):
-    """Two compiled regions with an eager dim-naming boundary between them."""
+    """Standard GQA block with independently compiled attention regions."""
 
     def __init__(self, layer, is_res_mul: bool | None = None):
         super().__init__()
@@ -3111,10 +2995,7 @@ class StandardGQABlock(nn.Module):
         q, key_cache, value_cache = self._pre_attn(
             hidden_states, selected_freqs, key_cache, value_cache, cache_index
         )
-        with _named_standard_gqa_attention_inputs(q, key_cache, value_cache):
-            h = self._attention_tail(
-                hidden_states, q, key_cache, value_cache, attn_mask
-            )
+        h = self._attention_tail(hidden_states, q, key_cache, value_cache, attn_mask)
         return h, key_cache, value_cache
 
 
