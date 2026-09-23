@@ -53,7 +53,7 @@ in several ways, so it gets a custom compiled block rather than reusing
   ``layer_scalar`` buffer (init 1.0).
 - **Unscaled attention.** ``Gemma4TextAttention.scaling == 1.0`` — Q·Kᵀ is NOT
   divided by ``sqrt(head_dim)``. SDPA is called with ``scale=1.0``.
-- **Large vocab + logit softcap.** 262K vocab → chunked LM head (like
+- **Large vocab + logit softcap.** 262K vocab → stick-padded LM head (like
   ``hf_phi3``); ``final_logit_softcapping`` (30.0) applies a
   ``cap * tanh(logits / cap)`` after the head.
 
@@ -100,8 +100,27 @@ from hf_adapters.hf_common import (
     get_backbone,
     kv_cache_update,
     optional_spyre_config_patch,
-    pad_lm_head,
+    prepare_lm_head_for_spyre,
+    run_lm_head,
     text_config,
+)
+from hf_adapters.spyre_tensor_parallel import (
+    SPYRE_REPLICATED_LINEAR,
+    SPYRE_ROWWISE,
+    spyre_compiled_all_reduce,
+)
+from hf_adapters.swa_attention import (
+    SlidingWindowCache,
+    allocate_swa_caches,
+    anchored_step,
+    compact_sliding_buffers,
+    fit_attention_mask,
+    physical_cache_capacity,
+    prefill_ring_step,
+    rebind_shared_caches,
+    roll_sliding_buffers,
+    sliding_window_attention,
+    valid_start_for,
 )
 
 
@@ -118,6 +137,36 @@ def _gemma4_backbone(model):
     matching where ``pad_lm_head`` looks.
     """
     return get_backbone(model)
+
+
+def spyre_tp_grouped_colwise_modules(model, tp_size):
+    """Return K/V projections that need replication within rank groups.
+
+    HF's colwise plan splits a projection's output dimension evenly across TP
+    ranks. That is only a valid attention shard when every rank receives an
+    integral number of ``head_dim``-wide heads. Gemma 4 A4B's full-attention
+    layers have two 512-wide KV heads, for example, so TP=4 would otherwise
+    produce invalid 256-wide half-heads. Instead, shard those projections into
+    two whole heads and replicate each head across its two corresponding ranks.
+    """
+    backbone = _gemma4_backbone(model)
+    cfg = text_config(model.config)
+    module_names = {id(module): name for name, module in model.named_modules()}
+    grouped = {}
+
+    for layer, layer_cfg in zip(backbone.layers, cfg.per_layer_config):
+        attn = layer.self_attn
+        head_dim = layer_cfg.head_dim
+        for projection_name in ("k_proj", "v_proj"):
+            projection = getattr(attn, projection_name, None)
+            if projection is None:
+                continue
+            if projection.out_features % (head_dim * tp_size) != 0:
+                num_kv_heads = projection.out_features // head_dim
+                assert tp_size % num_kv_heads == 0
+                grouped[module_names[id(projection)]] = num_kv_heads
+
+    return grouped
 
 
 def _gemma4_rms_norm(hidden_states, weight, eps):
@@ -291,7 +340,18 @@ class Gemma4Attention(nn.Module):
     through ``v_norm``, mirroring stock HF.
     """
 
-    def __init__(self, attn, num_q_heads, num_kv_heads, head_dim, is_kv_eq_v):
+    def __init__(
+        self,
+        attn,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        is_kv_eq_v,
+        is_sliding=False,
+        window_size=None,
+        swa_mode=None,
+        is_causal=True,
+    ):
         super().__init__()
         self.q_proj = attn.q_proj
         self.k_proj = attn.k_proj
@@ -305,6 +365,10 @@ class Gemma4Attention(nn.Module):
         self.head_dim = head_dim
         self.is_kv_eq_v = is_kv_eq_v
         self.scaling = attn.scaling  # 1.0 for Gemma 4
+        self.is_sliding = is_sliding
+        self.window_size = window_size
+        self.swa_mode = swa_mode
+        self.is_causal = is_causal
 
     def forward(
         self,
@@ -338,15 +402,26 @@ class Gemma4Attention(nn.Module):
         key_cache, value_cache = kv_cache_update(
             k, v, key_cache, value_cache, cache_index
         )
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            key_cache,
-            value_cache,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            scale=self.scaling,
-            enable_gqa=True,
-        )
+        if self.is_sliding and self.swa_mode is not None:
+            attn_out = sliding_window_attention(
+                q,
+                key_cache,
+                value_cache,
+                attn_mask,
+                window_size=self.window_size,
+                is_causal=self.is_causal,
+                scale=self.scaling,
+            )
+        else:
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                key_cache,
+                value_cache,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                scale=self.scaling,
+                enable_gqa=True,
+            )
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out), key_cache, value_cache
 
@@ -423,6 +498,7 @@ class _Gemma4BlockSpec:
     activation: str
     is_kv_eq_v: bool
     attention_bias: bool
+    tp_group_name: str | None
     has_ple: bool
     ple_dim: int
     scaling: float
@@ -434,6 +510,9 @@ class _Gemma4BlockSpec:
     pre_feedforward_norm_eps: float
     post_feedforward_norm_eps: float
     post_ple_norm_eps: float
+    swa_mode: str | None
+    window_size: int
+    swa_is_causal: bool
 
 
 def _gemma4_mlp_activation(hidden_states):
@@ -522,7 +601,14 @@ def _finish_block(
     per_layer_input,
     query_row_mask,
 ):
-    attn_out = F.linear(attn_out, o_weight, o_bias)
+    # These functional linears bypass the Transformers module hooks which
+    # normally complete a rowwise projection. Reduce the rank-local partial
+    # sums explicitly, before adding a replicated bias or residual.
+    attn_out = F.linear(attn_out, o_weight)
+    if spec.tp_group_name is not None:
+        attn_out = spyre_compiled_all_reduce(attn_out, spec.tp_group_name)
+    if o_bias is not None:
+        attn_out = attn_out + o_bias
     h = residual + _gemma4_rms_norm(
         attn_out, post_attn_norm_weight, spec.post_attention_norm_eps
     )
@@ -535,6 +621,8 @@ def _finish_block(
         _gemma4_mlp_activation(F.linear(h, gate_weight)) * F.linear(h, up_weight),
         down_weight,
     )
+    if spec.tp_group_name is not None:
+        h = spyre_compiled_all_reduce(h, spec.tp_group_name)
     h = h.reshape(original_shape)
     h = residual + _gemma4_rms_norm(
         h, post_ffn_norm_weight, spec.post_feedforward_norm_eps
@@ -649,15 +737,26 @@ def _make_block_forward(spec):
         else:
             q = apply_rope_matmul(q, selected_freqs)
 
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            key_cache,
-            value_cache,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            scale=spec.scaling,
-            enable_gqa=True,
-        )
+        if spec.layer_type == "sliding_attention" and spec.swa_mode is not None:
+            attn_out = sliding_window_attention(
+                q,
+                key_cache,
+                value_cache,
+                attn_mask,
+                window_size=spec.window_size,
+                is_causal=spec.swa_is_causal,
+                scale=spec.scaling,
+            )
+        else:
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                key_cache,
+                value_cache,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                scale=spec.scaling,
+                enable_gqa=True,
+            )
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         h = _finish_block(
             spec,
@@ -683,7 +782,7 @@ def _make_block_forward(spec):
     return forward
 
 
-def _block_spec(block, layer_type):
+def _block_spec(block, layer_type, window_size, swa_mode, swa_is_causal):
     kind, attn = _block_kind_and_attention(block)
     if kind == "writer":
         num_kv_heads = attn.num_kv_heads
@@ -738,6 +837,48 @@ def _block_spec(block, layer_type):
         raise SpyreUnsupportedModelError(
             "Gemma 4 requires an unscaled RMSNorm for v_norm"
         )
+
+    # Transformers normally all-reduces rowwise projections in module output
+    # hooks. The compiled executor uses their weights through F.linear instead,
+    # so carry the process-group name into the graph and reduce explicitly.
+    rowwise_projections = (attn.o_proj, block.mlp.down_proj)
+    device_meshes = [
+        getattr(projection, "_hf_device_mesh", None)
+        for projection in rowwise_projections
+    ]
+    if any(mesh is not None for mesh in device_meshes):
+        if any(mesh is None for mesh in device_meshes):
+            raise ValueError(
+                "Gemma 4 TP requires both o_proj and down_proj on a device mesh"
+            )
+        plans = [
+            getattr(projection, "_hf_tp_plan", None)
+            for projection in rowwise_projections
+        ]
+        if any(plan != SPYRE_ROWWISE for plan in plans):
+            raise ValueError(
+                "Gemma 4 compiled TP requires rowwise o_proj and down_proj"
+            )
+        group_names = [mesh.get_group().group_name for mesh in device_meshes]
+        if group_names[0] != group_names[1]:
+            raise ValueError("Gemma 4 o_proj and down_proj must use the same TP group")
+        tp_group_name = group_names[0]
+    else:
+        tp_group_name = None
+
+    # Gemma 4's base TP plan deliberately omits the PLE projections. The
+    # adapter's plan completion therefore replicates them, and unlike o_proj
+    # and down_proj their functional calls need no collective.
+    if block.has_ple and tp_group_name is not None:
+        ple_projections = (
+            block.per_layer_input_gate,
+            block.per_layer_projection,
+        )
+        if any(
+            getattr(projection, "_hf_tp_plan", None) != SPYRE_REPLICATED_LINEAR
+            for projection in ple_projections
+        ):
+            raise ValueError("Gemma 4 PLE projections must be replicated for TP")
     return _Gemma4BlockSpec(
         kind=kind,
         layer_type=layer_type,
@@ -748,6 +889,7 @@ def _block_spec(block, layer_type):
         activation=activation,
         is_kv_eq_v=is_kv_eq_v,
         attention_bias=attention_bias,
+        tp_group_name=tp_group_name,
         has_ple=block.has_ple,
         ple_dim=ple_dim,
         scaling=attn.scaling,
@@ -759,6 +901,9 @@ def _block_spec(block, layer_type):
         pre_feedforward_norm_eps=block.pre_feedforward_layernorm.eps,
         post_feedforward_norm_eps=block.post_feedforward_layernorm.eps,
         post_ple_norm_eps=post_ple_eps,
+        swa_mode=swa_mode,
+        window_size=window_size,
+        swa_is_causal=swa_is_causal,
     )
 
 
@@ -770,6 +915,9 @@ def prepare_gemma4_blocks(
     is_kv_eq_v_per_layer,
     producer_of,
     has_ple,
+    window_size,
+    swa_mode,
+    swa_is_causal,
 ):
     """Install registered blocks and share compiled executors by structure."""
     compiled_by_spec = {}
@@ -786,7 +934,13 @@ def prepare_gemma4_blocks(
             has_ple,
         )
         layers[i] = block
-        spec = _block_spec(block, layer_types[i])
+        spec = _block_spec(
+            block,
+            layer_types[i],
+            window_size,
+            swa_mode,
+            swa_is_causal,
+        )
         if spec not in compiled_by_spec:
             compiled_by_spec[spec] = torch.compile(
                 _make_block_forward(spec), dynamic=False, fullgraph=True
@@ -801,6 +955,7 @@ def _build_layer_masks(
     seq_len,
     batch_size,
     block_base,
+    sliding_key_cache_coords=None,
 ):
     """Build the text-only per-layer-type mask dict {full_attention, sliding_attention}.
 
@@ -823,7 +978,10 @@ def _build_layer_masks(
         batch_size, seq_len
     )
     sliding_mask = add_causal_sliding_window_band(
-        attn_mask, query_coords, cfg.sliding_window
+        attn_mask,
+        query_coords,
+        cfg.sliding_window,
+        key_cache_coords=sliding_key_cache_coords,
     )
     return {"full_attention": attn_mask, "sliding_attention": sliding_mask}
 
@@ -873,6 +1031,7 @@ def _run_blocks_over_embeds(
     shared layer's own cache entry is never written). Dedicated MoE blocks keep
     their original seven-argument call contract.
     """
+    swa_mode = getattr(model, "_spyre_swa_mode", None)
     backbone = _gemma4_backbone(model)
     cfg = text_config(model.config)
 
@@ -882,25 +1041,77 @@ def _run_blocks_over_embeds(
         for layer_type, rope in model._spyre_rope.items()
     }
 
+    bsz, seq_len = h.shape[0], h.shape[1]
+    # Read once per step, outside every compiled layer. The position is used only
+    # to construct runtime tensor data and manage the compact eager cache.
+    block_base = int(cache_index[0]) if masks is None or swa_mode else 0
+
+    prefill_step = None
+    if swa_mode == "anchored" and seq_len > 1:
+        prompt_len = getattr(model, "_spyre_padded_prompt_len", block_base + seq_len)
+        sliding_layer = cfg.layer_types.index("sliding_attention")
+        capacity = physical_cache_capacity(key_caches[sliding_layer])
+        if prompt_len > capacity:
+            prefill_step = prefill_ring_step(
+                block_base, seq_len, capacity, cache_index.device
+            )
+
     if masks is None:
-        bsz, seq_len = h.shape[0], h.shape[1]
-        # The sliding-window band needs each query row's cache coordinate: row j
-        # sits at block_base + j, where block_base is the first cache slot this
-        # block writes — the first entry of cache_index.
-        #
-        # The scalar read syncs from the device; deliberately not optimized. This
-        # runs once per step (not per layer — the mask dict is reused across all
-        # layers) in eager code outside the compiled block, and
-        # add_causal_sliding_window_band already round-trips the whole mask
-        # through CPU by necessity. See the same note in hf_gemma3.
-        block_base = int(cache_index[0])
-        masks = _build_layer_masks(model, attn_mask, seq_len, bsz, block_base)
+        masks = _build_layer_masks(
+            model,
+            attn_mask,
+            seq_len,
+            bsz,
+            block_base,
+            sliding_key_cache_coords=(
+                prefill_step.key_cache_coords if prefill_step is not None else None
+            ),
+        )
+
+    if seq_len > 1 and block_base == 0:
+        # A new prefill invalidates state retained by an earlier generate call.
+        model._spyre_swa_state = None
+    state = getattr(model, "_spyre_swa_state", None)
+
+    if swa_mode == "anchored" and state is None and seq_len == 1:
+        # Compact only once all prefill chunks have populated the owning caches.
+        prompt_len = getattr(model, "_spyre_padded_prompt_len", block_base)
+        state = SlidingWindowCache.after_prefill(
+            cfg.sliding_window, prompt_len, valid_start_for(model, bsz)
+        )
+        compact_sliding_buffers(
+            cfg.layer_types,
+            key_caches,
+            value_caches,
+            state,
+            prompt_len,
+            producer_of=model._spyre_producer_of,
+        )
+        model._spyre_swa_state = state
+
+    if swa_mode and state is not None:
+        step = anchored_step(state, cache_index.device, h.dtype)
+        if step.do_shift:
+            roll_sliding_buffers(
+                cfg.layer_types,
+                key_caches,
+                value_caches,
+                producer_of=model._spyre_producer_of,
+            )
+        masks["sliding_attention"] = step.attention_mask
+        sliding_index = step.cache_index
+    elif prefill_step is not None:
+        sliding_index = prefill_step.cache_index
+    else:
+        sliding_index = cache_index
 
     backbone_layers = backbone.layers
     producer_of = model._spyre_producer_of
     is_moe = bool(getattr(cfg, "enable_moe_block", False))
+    sliding_masks_by_capacity = {}
     for i, compiled_block in enumerate(model._spyre_compiled_blocks):
         lt = cfg.layer_types[i]
+        is_sliding = lt == "sliding_attention"
         # Each PLE slice needs fresh offset-0 storage at the graph boundary. A
         # singleton decode slice reports contiguous despite retaining the
         # parent's nonzero storage offset, so contiguous() is not sufficient;
@@ -914,17 +1125,43 @@ def _run_blocks_over_embeds(
         )
         p = producer_of[i]
         block = backbone_layers[i]
+        selected_mask = masks[lt]
+        if is_sliding and swa_mode:
+            cache = key_caches[i] if p is None else key_caches[p]
+            capacity = physical_cache_capacity(cache)
+            if (
+                swa_mode == "anchored"
+                and state is not None
+                and seq_len == 1
+                and capacity != state.capacity
+            ):
+                raise RuntimeError(
+                    f"anchored SWA layer {i} has cache capacity {capacity}, "
+                    f"expected compact capacity {state.capacity}"
+                )
+            if capacity not in sliding_masks_by_capacity:
+                sliding_masks_by_capacity[capacity] = fit_attention_mask(
+                    selected_mask, capacity
+                )
+            selected_mask = sliding_masks_by_capacity[capacity]
+            # A chunked-prefill cache can be a prefix view of the physical
+            # allocation on its first invocation.  The compiled in-place cache
+            # update subsequently exposes the owner, which is why the reusable
+            # mask above is sized to ``capacity``.  Match the custom op's exact
+            # Lk contract to the logical view presented by this invocation.
+            logical_width = cache.size(2)
+            if selected_mask.size(-1) != logical_width:
+                selected_mask = selected_mask[..., :logical_width]
         if is_moe:
-            # The dedicated MoE blocks predate the dense/E optional inputs and
-            # compile their attention and FFN regions internally. Preserve that
-            # call contract while sharing the surrounding Gemma 4 driver.
+            # MoE retains its split compiled regions while sharing the custom
+            # attention op and compact-cache driver.
             h, key_caches[i], value_caches[i] = compiled_block(
                 h,
                 freqs[lt],
-                masks[lt],
+                selected_mask,
                 key_caches[i],
                 value_caches[i],
-                cache_index,
+                sliding_index if is_sliding else cache_index,
                 backbone_layers[i].layer_scalar,
             )
         elif p is None:
@@ -932,10 +1169,10 @@ def _run_blocks_over_embeds(
                 _block_state(block),
                 h,
                 freqs[lt],
-                masks[lt],
+                selected_mask,
                 key_caches[i],
                 value_caches[i],
-                cache_index,
+                sliding_index if is_sliding else cache_index,
                 pli,
                 query_row_mask,
             )
@@ -945,13 +1182,18 @@ def _run_blocks_over_embeds(
                 _block_state(block),
                 h,
                 freqs[lt],
-                masks[lt],
+                selected_mask,
                 key_caches[p],
                 value_caches[p],
                 None,
                 pli,
                 query_row_mask,
             )
+    # Shared-layer list entries must follow any producer cache replacement.
+    rebind_shared_caches(key_caches, value_caches, producer_of)
+
+    if swa_mode == "anchored" and state is not None and seq_len == 1:
+        state.advance()
 
     norm = backbone.norm
     weight = norm.weight if norm.with_scale else None
@@ -1018,14 +1260,7 @@ def _run_forward(
         cache_index,
     )
 
-    logits = model.lm_head(h)
-
-    cap = text_config(model.config).final_logit_softcapping
-    if cap is not None:
-        logits = logits / cap
-        logits = torch.tanh(logits)
-        logits = logits * cap
-    return logits
+    return run_lm_head(model, h)
 
 
 def _setup_gemma4_text_decoder(model, *, allow_moe=False):
@@ -1045,7 +1280,7 @@ def _setup_gemma4_text_decoder(model, *, allow_moe=False):
       2. Patch ``Gemma4RMSNorm`` for the fp16 Spyre path.
       3. Build one ``PrecomputedRotaryEmbedding`` per layer type.
       4. Record per-layer KV-cache shapes (sliding vs global differ).
-      5. Chunk the LM head for the large vocab.
+      5. Prepare the padded LM head and a TP vocabulary gather when needed.
 
     Returns ``(num_q_heads_per_layer, kv_shapes, is_kv_eq_v_per_layer)`` — the
     per-layer geometry the caller needs to compile its blocks.
@@ -1081,13 +1316,34 @@ def _setup_gemma4_text_decoder(model, *, allow_moe=False):
     kv_shapes = []
     is_kv_eq_v_per_layer = []
     for i, (layer_type, layer_cfg) in enumerate(zip(cfg.layer_types, layer_configs)):
-        num_q_heads_per_layer.append(layer_cfg.num_attention_heads)
         head_dim = layer_cfg.head_dim
         assert head_dim % 2 == 0 and head_dim // 2 >= 64, (
             f"Gemma 4 layer {i} head_dim={head_dim}: head_dim/2 must be >= 64 "
             "(one Spyre stick). A padded variant is not implemented for this adapter."
         )
-        num_kv_heads = layer_cfg.num_key_value_heads
+        # HF updates the Linear metadata when its colwise TP plan shards Q/K/V.
+        # Derive local head counts from those modules rather than retaining the
+        # global config counts; otherwise a 2-way shard producing 2048 Q values
+        # is incorrectly viewed as 16 * 256 (=4096) values.
+        attn = backbone.layers[i].self_attn
+        assert attn.q_proj.out_features % head_dim == 0
+        num_q_heads = attn.q_proj.out_features // head_dim
+        k_proj = getattr(attn, "k_proj", None)
+        if k_proj is None:
+            # KV-sharing layers intentionally omit K/V projections. Reuse the
+            # already-derived local KV geometry of their producer.
+            producer = model._spyre_producer_of[i]
+            assert producer is not None
+            num_kv_heads = kv_shapes[producer][0]
+        else:
+            assert k_proj.out_features % head_dim == 0, (
+                f"Gemma 4 layer {i} has a partial KV head after TP: "
+                f"k_proj.out_features={k_proj.out_features}, head_dim={head_dim}, "
+                f"weight.shape={tuple(k_proj.weight.shape)}, "
+                f"tp_plan={getattr(k_proj, '_hf_tp_plan', None)!r}"
+            )
+            num_kv_heads = k_proj.out_features // head_dim
+        num_q_heads_per_layer.append(num_q_heads)
         kv_shapes.append((num_kv_heads, head_dim, head_dim))
         is_kv_eq_v_per_layer.append(attention_k_eq_v and layer_type == "full_attention")
     model._spyre_kv_shapes = kv_shapes
@@ -1104,9 +1360,16 @@ def _setup_gemma4_text_decoder(model, *, allow_moe=False):
             InvFreqShim(inv_freq, scaling)
         )
 
-    # LM head: smooth-padded to a stick-aligned vocab whose per-core span fits
-    # the 256 MB EAR limit (see hf_common.pad_lm_head).
-    pad_lm_head(model)
+    cap = cfg.final_logit_softcapping
+
+    def process_logits(logits):
+        if cap is not None:
+            logits = logits / cap
+            logits = torch.tanh(logits)
+            logits = logits * cap
+        return logits
+
+    prepare_lm_head_for_spyre(model, logits_processor=process_logits)
 
     return num_q_heads_per_layer, kv_shapes, is_kv_eq_v_per_layer
 
@@ -1126,6 +1389,13 @@ def prepare_text_decoder_for_spyre(model):
         model, allow_moe=False
     )
 
+    if not hasattr(model, "_spyre_swa_mode"):
+        model._spyre_swa_mode = "anchored"
+    if not hasattr(model, "_spyre_swa_is_causal"):
+        model._spyre_swa_is_causal = True
+    if model._spyre_swa_mode == "anchored":
+        model._spyre_cache_allocator = allocate_swa_caches
+
     model._spyre_compiled_blocks = prepare_gemma4_blocks(
         backbone.layers,
         cfg.layer_types,
@@ -1134,6 +1404,9 @@ def prepare_text_decoder_for_spyre(model):
         is_kv_eq_v_per_layer,
         model._spyre_producer_of,
         model._spyre_has_ple,
+        cfg.sliding_window,
+        model._spyre_swa_mode,
+        model._spyre_swa_is_causal,
     )
 
 
