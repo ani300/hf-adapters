@@ -14,8 +14,11 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
+from safetensors import safe_open
+from safetensors.torch import save_file
 from transformers.integrations.tensor_parallel import ALL_PARALLEL_STYLES
 
 from hf_adapters import hf_gemma4, hf_gemma4_mm, hf_gemma4_moe
@@ -38,10 +41,12 @@ from hf_adapters.spyre_tensor_parallel import (
     SPYRE_REPLICATED_EMBEDDING,
     SPYRE_REPLICATED_LINEAR,
     SPYRE_ROWWISE,
+    SpyreColwiseGatherOutputParallel,
     SpyreColwiseParallel,
     SpyreEmbeddingColwiseParallel,
     SpyreEmbeddingRowwiseParallel,
     SpyreRowwiseParallel,
+    SpyreRowwiseSplitInputParallel,
     _matches_plan,
     _reassemble_all_gather_last_dim,
     prepare_spyre_tp_plan,
@@ -376,7 +381,19 @@ def test_cpu_staged_styles_return_local_cpu_shards():
     assert rowwise_shard.shape == (2, 8, 4)
 
 
-def test_linear_tp_styles_replicate_scalar_conversion_state(monkeypatch):
+@pytest.mark.parametrize(
+    "style_cls",
+    (
+        SpyreColwiseParallel,
+        SpyreColwiseGatherOutputParallel,
+        SpyreRowwiseParallel,
+        SpyreRowwiseSplitInputParallel,
+    ),
+)
+@pytest.mark.parametrize("checkpoint_slice", (False, True))
+def test_linear_tp_styles_replicate_scalar_conversion_state(
+    monkeypatch, tmp_path, style_cls, checkpoint_slice
+):
     copied = []
 
     def fake_copy_default(tensor, *, device, dtype):
@@ -388,14 +405,24 @@ def test_linear_tp_styles_replicate_scalar_conversion_state(monkeypatch):
     )
     scalar = torch.tensor(3.0)
 
-    for style in (SpyreColwiseParallel(), SpyreRowwiseParallel()):
-        result = style.shard_tensor(scalar, device="spyre:0", dtype=torch.float16)
+    def check_scalar(param):
+        style = style_cls()
+        result = style.shard_tensor(param, device="spyre:0", dtype=torch.float16)
         assert result.shape == ()
         assert result.dtype == torch.float16
+        assert result.item() == scalar.item()
         assert style.get_expected_sharded_shape(torch.Size([])) == ()
+        assert style.get_expected_sharded_shape([]) == ()
+
+    if checkpoint_slice:
+        checkpoint = tmp_path / "scalar.safetensors"
+        save_file({"clip_bound": scalar}, checkpoint)
+        with safe_open(checkpoint, framework="pt", device="cpu") as tensors:
+            check_scalar(tensors.get_slice("clip_bound"))
+    else:
+        check_scalar(scalar)
 
     assert [(device, dtype) for _, device, dtype in copied] == [
-        ("spyre:0", torch.float16),
         ("spyre:0", torch.float16),
     ]
 
