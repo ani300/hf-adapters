@@ -103,7 +103,7 @@ token-compare-tests: ## Run token-compare tests (suite key: token_compare)
 	$(PYTEST) $(PYTEST_ARGS) --suite token_compare tests/spyre/test_e2e_token_compare_spyre.py $(K_ARGS) $(MODEL_PATH_ARGS) $(if $(JUNIT_XML),--junitxml=$(JUNIT_XML))
 
 model-components-tests: ## Run model component tests (suite key: model_components)
-	$(PYTEST) $(PYTEST_ARGS) --suite model_components tests/spyre/test_model_components_spyre.py $(if $(JUNIT_XML),--junitxml=$(JUNIT_XML))
+	$(PYTEST) $(PYTEST_ARGS) --suite model_components tests/spyre/test_model_components_spyre.py tests/spyre/test_swa_layer_ab_spyre.py $(if $(JUNIT_XML),--junitxml=$(JUNIT_XML))
 
 embed-compare-tests: ## Run embed-compare tests (suite key: embed_compare)
 	$(PYTEST) $(PYTEST_ARGS) --suite embed_compare tests/spyre/test_e2e_embed_compare_spyre.py $(K_ARGS) $(MODEL_PATH_ARGS) $(if $(JUNIT_XML),--junitxml=$(JUNIT_XML))
@@ -139,6 +139,9 @@ edge-cases-tests: ## Run edge-case tests (suite key: edge_cases; EDGE_CASE_FILE=
 # MODULE_CONFIG narrows model-module-tests to one YAML config (matrix-style
 # per-config CI jobs pass this); empty = run every config in tests/configs/module_tests.
 MODULE_CONFIG ?=
+# MODULE_TEST_FILTER partitions one config with pytest's -k expression. CI uses
+# this for the measured slow configs; empty keeps local and aggregate runs whole.
+MODULE_TEST_FILTER ?=
 # --junit-xml is resolved to an absolute path: run_test.sh cd's into each
 # test file's own directory before invoking pytest, so a relative path
 # would land under that directory instead of RESULTS_DIR.
@@ -167,7 +170,8 @@ model-module-tests: ## Run oot_framework module tests (suite key: model_module; 
 	    junit_arg="--junit-xml=$$(cd "$(RESULTS_DIR)" && pwd)/model-module-$${cfg}.xml"; \
 	  fi; \
 	  TORCH_DEVICE_ROOT="$$PWD" bash "$$_run_test" \
-	    "tests/configs/module_tests/$${cfg}" $(PYTEST_ARGS) $${junit_arg} || rc=1; \
+	    "tests/configs/module_tests/$${cfg}" $(PYTEST_ARGS) \
+	    $(if $(MODULE_TEST_FILTER),-k "$(MODULE_TEST_FILTER)") $${junit_arg} || rc=1; \
 	done; \
 	exit $$rc
 

@@ -66,6 +66,11 @@ on:
         required: false
         type: string
         default: ''
+      prebaked_image:
+        description: When true, skip resolve-torch-spyre and use the runner image's torch-spyre as-is.
+        required: false
+        type: boolean
+        default: false
       test_type:
         description: >-
           Test tier to run: unit | integration | regression | trunk -- literal,
@@ -95,6 +100,15 @@ on:
           - integration
           - regression
           - trunk
+      run_id:
+        description: >-
+          UUID for this TEST RUN, minted by the dispatching orchestrator above the CI split.
+          Threaded so artifact_results (Jenkins-written) and test_case_runs (ingest-written)
+          share ONE identity instead of each hashing its own run coordinate. Empty on a
+          GHA-initiated run, which derives its own.
+        required: false
+        type: string
+        default: ''
       models:
         description: >-
           Space-separated list of model paths to restrict every matrix job
@@ -160,6 +174,35 @@ jobs:
             echo "| hf-adapters ref | ${{ inputs.ref || github.sha }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # push-test-results-to-clickhouse.yaml ALREADY looks for this artifact (see its
+      # "Recover threaded run_id" step) -- nothing was uploading it, so that step always
+      # recovered empty and the ingest derived its own id. Measured: 0 of 227 hf-adapters
+      # runs in spyre_v2 join artifact_results, against 60 of 233 for torch-spyre.
+      #
+      # An artifact is the channel because that workflow runs on workflow_run, AFTER this
+      # one, so it cannot receive a dispatch input; it is also the channel it already
+      # enumerates to find the junit XML, so the uuid rides an existing transport.
+      #
+      # Uploaded from `provenance` because it is the first job and needs no runner of its
+      # own: the id is a workflow INPUT, known before any test starts, so a later job would
+      # only narrow the window in which the ingest could find it.
+      #
+      # Skipped when empty, so a GHA-initiated run uploads nothing and the ingest derives
+      # its own id, exactly as before.
+      - name: Record threaded run_id for the ingest
+        if: ${{ inputs.run_id != '' }}
+        env:
+          THREADED_RUN_ID: ${{ inputs.run_id }}
+        run: printf '%s' "${THREADED_RUN_ID}" > run-id.txt
+
+      - name: Upload threaded run_id
+        if: ${{ inputs.run_id != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: run-id
+          path: run-id.txt
+          retention-days: 1
+
   # ---------------------------------------------------------------------------
   # Read tests/model_lists/integration.yaml and emit a space-separated model
   # list as a step output. Only runs when test_type is "integration" (the
@@ -215,6 +258,7 @@ jobs:
     needs: [provenance, resolve-models]
     uses: ./.github/workflows/_test_matrix.yaml
     with:
+      run_id: ${{ inputs.run_id }}
       image_label: ${{ inputs.runner_label || 'image_torch_spyre' }}
       extra_test_flags: -vvv -s
       extra_test_flags_multi_spyre: -vvv -s
@@ -222,13 +266,8 @@ jobs:
       repository: ${{ inputs.repository || '' }}
       test_type: ${{ inputs.test_type || 'integration' }}
       models: ${{ (inputs.models != '' && inputs.models) || needs.resolve-models.outputs.models || '' }}
-      # Run on the torch-spyre baked into the (possibly ephemeral, per-PR) image
-      # this run was dispatched onto -- do NOT resolve/pin origin/main, which
-      # would `git checkout --force` away the exact torch-spyre version this
-      # integration run exists to test (issue #449 review). Every other caller
-      # (test_pull_request / test_daily / push-to-clickhouse) omits this, keeping
-      # the default false = pin origin/main once across the run.
-      prebaked_image: true
+      # Caller's choice: true for a per-PR/ephemeral image already baked with the exact torch-spyre under test;default false pins origin/main like every other caller.
+      prebaked_image: ${{ inputs.prebaked_image }}
 
   # ----------------------------------------------------------------------------------
   # Fan-in gate job so callers can poll a single stable job name for pass/fail.
