@@ -2996,7 +2996,7 @@ class StandardGQAAttention(nn.Module):
 
 
 class StandardGQABlock(nn.Module):
-    """Standard GQA block with independently compiled attention regions."""
+    """Standard GQA block compiled as one graph by its factory."""
 
     def __init__(self, layer, is_res_mul: bool | None = None):
         super().__init__()
@@ -3006,11 +3006,6 @@ class StandardGQABlock(nn.Module):
         self.post_attention_layernorm = layer.post_attention_layernorm
         self.residual_multiplier = layer.residual_multiplier if is_res_mul else None
         self.train(layer.training)
-        # Compile the two regions independently. torch.compile is lazy, so
-        # tracing still happens on the first forward (after the model is moved
-        # to Spyre), exactly as when the whole block was compiled.
-        self._pre_attn = torch.compile(self._region_pre_attn, dynamic=False)
-        self._attention_tail = torch.compile(self._region_attention_tail, dynamic=False)
 
     def _region_pre_attn(
         self,
@@ -3053,29 +3048,27 @@ class StandardGQABlock(nn.Module):
         value_cache,
         cache_index,
     ):
-        q, key_cache, value_cache = self._pre_attn(
+        q, key_cache, value_cache = self._region_pre_attn(
             hidden_states, selected_freqs, key_cache, value_cache, cache_index
         )
-        h = self._attention_tail(hidden_states, q, key_cache, value_cache, attn_mask)
+        h = self._region_attention_tail(
+            hidden_states, q, key_cache, value_cache, attn_mask
+        )
         return h, key_cache, value_cache
 
 
 def make_standard_gqa_block(layer, is_res_mul: bool | None = None):
-    """Build one standard GQA block; its two regions are compiled internally."""
-    return StandardGQABlock(layer, is_res_mul)
+    """Build and compile one complete standard GQA block."""
+    return torch.compile(StandardGQABlock(layer, is_res_mul), dynamic=False)
 
 
 def prepare_standard_gqa_blocks(layers, is_res_mul: bool | None = None):
-    """Replace decoder layers with registered Spyre blocks.
-
-    Each block compiles its two regions internally and is returned un-compiled
-    at the top level (the backbone driver still calls ``block(h, ...)``).
-    """
+    """Replace decoder layers with registered, fully compiled Spyre blocks."""
     blocks = []
     for i, layer in enumerate(list(layers)):
         block = StandardGQABlock(layer, is_res_mul)
         layers[i] = block
-        blocks.append(block)
+        blocks.append(torch.compile(block, dynamic=False))
     return blocks
 
 
