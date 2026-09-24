@@ -34,20 +34,24 @@ def test_only_measured_slow_configs_are_sharded(tmp_path: Path) -> None:
 
     assert entries[0] == {
         "config": "Ministral-3-14B-Instruct-2512.yaml",
-        "shard": "forward",
-        "pytest_filter": "test_forward",
+        "shard": "with-cpu-prefill",
+        "pytest_filter": (
+            "not test_forward and not test_eager_vs_compile and "
+            "test_with_cpu and prefill"
+        ),
     }
-    assert [entry["shard"] for entry in entries[:5]] == [
-        "forward",
-        "with-cpu",
-        "eager-prefill",
-        "eager-other",
-        "remaining",
-    ]
-    assert entries[5] == {
+    assert entries[1] == {
+        "config": "Ministral-3-14B-Instruct-2512.yaml",
+        "shard": "with-cpu-other",
+        "pytest_filter": (
+            "not test_forward and not test_eager_vs_compile and "
+            "test_with_cpu and not prefill"
+        ),
+    }
+    assert entries[2] == {
         "config": "ordinary.yaml",
         "shard": "all",
-        "pytest_filter": "",
+        "pytest_filter": "test_with_cpu",
     }
 
 
@@ -64,11 +68,11 @@ def test_cli_writes_compact_github_output(
 
     assert github_output.read_text() == (
         'module_config_matrix={"include":[{"config":"ordinary.yaml",'
-        '"shard":"all","pytest_filter":""}]}\n'
+        '"shard":"all","pytest_filter":"test_with_cpu"}]}\n'
     )
 
 
-def test_repository_matrix_shards_each_timing_outlier_five_ways() -> None:
+def test_repository_matrix_shards_each_timing_outlier_two_ways() -> None:
     config_dir = Path(__file__).resolve().parent / "configs" / "module_tests"
 
     entries = module_test_matrix.generate_matrix(config_dir)["include"]
@@ -77,7 +81,7 @@ def test_repository_matrix_shards_each_timing_outlier_five_ways() -> None:
     assert {
         config for config, count in counts.items() if count > 1
     } == module_test_matrix.SHARDED_CONFIGS
-    assert all(counts[config] == 5 for config in module_test_matrix.SHARDED_CONFIGS)
+    assert all(counts[config] == 2 for config in module_test_matrix.SHARDED_CONFIGS)
 
 
 def test_empty_config_directory_is_rejected(tmp_path: Path) -> None:

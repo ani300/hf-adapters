@@ -20,27 +20,17 @@ SHARDED_CONFIGS = frozenset(
     }
 )
 
-# The filters are mutually exclusive and collectively exhaustive. Keeping the
-# final shard as the complement means a newly-added test method is still run
-# even before this list is updated.
-_NOT_FORWARD_OR_CPU = "not test_forward and not test_with_cpu"
+# Only test_with_cpu is currently monitored by model-module CI. Split that test
+# into mutually exclusive prefill and non-prefill shards for the slow configs.
+_NOT_FORWARD_OR_EAGER = "not test_forward and not test_eager_vs_compile"
 SHARDS = (
-    {"shard": "forward", "pytest_filter": "test_forward"},
     {
-        "shard": "with-cpu",
-        "pytest_filter": "not test_forward and test_with_cpu",
+        "shard": "with-cpu-prefill",
+        "pytest_filter": f"{_NOT_FORWARD_OR_EAGER} and test_with_cpu and prefill",
     },
     {
-        "shard": "eager-prefill",
-        "pytest_filter": f"{_NOT_FORWARD_OR_CPU} and test_eager_vs_compile and prefill",
-    },
-    {
-        "shard": "eager-other",
-        "pytest_filter": f"{_NOT_FORWARD_OR_CPU} and test_eager_vs_compile and not prefill",
-    },
-    {
-        "shard": "remaining",
-        "pytest_filter": f"{_NOT_FORWARD_OR_CPU} and not test_eager_vs_compile",
+        "shard": "with-cpu-other",
+        "pytest_filter": f"{_NOT_FORWARD_OR_EAGER} and test_with_cpu and not prefill",
     },
 )
 
@@ -56,7 +46,9 @@ def generate_matrix(config_dir: Path) -> dict[str, list[dict[str, str]]]:
         if config in SHARDED_CONFIGS:
             entries.extend({"config": config, **shard} for shard in SHARDS)
         else:
-            entries.append({"config": config, "shard": "all", "pytest_filter": ""})
+            entries.append(
+                {"config": config, "shard": "all", "pytest_filter": "test_with_cpu"}
+            )
     return {"include": entries}
 
 
