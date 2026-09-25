@@ -280,7 +280,7 @@ def test_vlm_generate_spyre(model_path: str, trust_remote_code: bool | None) -> 
             del ref_model
             gc.collect()
 
-    reference, cache_hit = get_or_create_vlm_reference(
+    reference, cache_status = get_or_create_vlm_reference(
         cache_dir=cache_dir,
         model_path=model_path,
         model_revision=model_revision,
@@ -295,14 +295,16 @@ def test_vlm_generate_spyre(model_path: str, trust_remote_code: bool | None) -> 
     ref_logits = reference.logits
     ref_tokens = reference.token_ids
     ref_text = reference.text
-    if cache_hit:
+    if cache_status == "hit":
         print(f"  Stock CPU reference cache hit: {cache_dir}")
     elif cache_dir is None:
         print(f"  Stock CPU reference generated ({VLM_REFERENCE_CACHE_ENV} unset)")
     elif model_revision is None:
         print("  Stock CPU reference generated (model revision is not immutable)")
-    else:
+    elif cache_status == "saved":
         print(f"  Stock CPU reference generated and cached: {cache_dir}")
+    else:
+        print(f"  Stock CPU reference generated (cache write failed: {cache_dir})")
 
     # --- Adapter on Spyre ---
     print("  Loading model for Spyre ...")

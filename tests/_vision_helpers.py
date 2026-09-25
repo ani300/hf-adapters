@@ -28,11 +28,12 @@ import hashlib
 import inspect
 import json
 import os
+import stat
 import tempfile
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Literal, Mapping
 
 import torch
 from huggingface_hub import hf_hub_download
@@ -326,6 +327,11 @@ def _save_cached_vlm_reference(
 ) -> None:
     """Publish a complete cache file atomically for concurrent CI jobs."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Readers need directory search permission as well as readable cache files.
+    # Override restrictive umasks while preserving shared write and special bits.
+    directory_mode = stat.S_IMODE(path.parent.stat().st_mode)
+    if directory_mode & 0o055 != 0o055:
+        path.parent.chmod(directory_mode | 0o055)
     payload = {
         "cache_key": cache_key,
         "logits": torch.stack(reference.logits).float().cpu(),
@@ -358,14 +364,16 @@ def get_or_create_vlm_reference(
     max_new_tokens: int,
     num_compare_steps: int,
     compute: Callable[[], VLMReference],
-) -> tuple[VLMReference, bool]:
+) -> tuple[VLMReference, Literal["hit", "saved", "disabled", "write_failed"]]:
     """Load a stock VLM reference, or compute and persist it on a cache miss.
 
-    Returns ``(reference, cache_hit)``. Caching is deliberately opt-in via
-    ``cache_dir`` and requires an immutable model revision.
+    Returns ``(reference, cache_status)`` with status ``hit``, ``saved``,
+    ``disabled``, or ``write_failed``. Caching is deliberately opt-in via
+    ``cache_dir`` and requires an immutable model revision. A write failure
+    still returns the computed reference.
     """
     if cache_dir is None or model_revision is None:
-        return compute(), False
+        return compute(), "disabled"
 
     cache_key = _reference_cache_key(
         model_path=model_path,
@@ -381,7 +389,7 @@ def get_or_create_vlm_reference(
     if path.is_file():
         cached = _load_cached_vlm_reference(path, cache_key, num_compare_steps)
         if cached is not None:
-            return cached, True
+            return cached, "hit"
 
     reference = compute()
     if len(reference.logits) != num_compare_steps:
@@ -401,7 +409,8 @@ def get_or_create_vlm_reference(
             f"Could not write VLM reference cache entry {path}: {exc}",
             stacklevel=2,
         )
-    return reference, False
+        return reference, "write_failed"
+    return reference, "saved"
 
 
 def stock_vlm_reference(
