@@ -235,7 +235,7 @@ jobs:
         with:
           name: run-id
           path: run-id.txt
-          retention-days: 1
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # Resolve the torch-spyre revision ONCE per run and pin it (issue #449).

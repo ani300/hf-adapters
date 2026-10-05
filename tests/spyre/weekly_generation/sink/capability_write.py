@@ -37,8 +37,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
-# model_support scans HuggingFace Hub checkpoints, not a build of ours, so these rows join no
-# artifact -- unlike model_ops, whose subject IS something we built.
+# The subjects are Hub checkpoints, but the spyre verdicts depend on the image that ran them:
+# artifact_link.py ties each scan to it with one artifact_results leg.
 TEST_TYPE = "model_support"
 COMPONENT = "hf-adapters"
 
@@ -47,10 +47,11 @@ COMPONENT = "hf-adapters"
 # one -- doing so would mint three run_ids for one scan and invent an arch that does not exist.
 ARCH = "x86_64"
 
-# The three v1 booleans, as the backend vocabulary benchmark_runs already uses.
+# The v1 booleans the scan actually establishes, as benchmark_runs' backend vocabulary. No gpu:
+# the scan has no GPU leg (verified_on_gpu is always False), so a gpu verdict would read as a
+# failure on every model rather than as "not tested".
 _BACKENDS = (
     ("verified_on_cpu", "cpu"),
-    ("verified_on_gpu", "gpu"),
     ("verified_on_spyre", "spyre"),
 )
 
@@ -70,9 +71,9 @@ def _shard_of(model_list_file: str | None) -> str:
 def capability_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """One v2 result per (model, backend) from the v1 per-model rows.
 
-    UNROLLS the three ``verified_on_*`` booleans, which is a real row-count change: ~195k v1
-    rows become ~580k. That is the point -- a backend that is a value can be grouped and
-    joined, and the three-column shape cannot.
+    UNROLLS the tested ``verified_on_*`` booleans (see ``_BACKENDS``), which is a real
+    row-count change: ~195k v1 rows become ~390k. That is the point -- a backend that is a
+    value can be grouped and joined, and the three-column shape cannot.
 
     ``fail_reason`` carries v1's ``failure_category`` (a closed 13-value vocabulary worth
     grouping by) and is stamped only on a FAILING backend: the category describes why the

@@ -201,7 +201,7 @@ jobs:
         with:
           name: run-id
           path: run-id.txt
-          retention-days: 1
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # Read tests/model_lists/integration.yaml and emit a space-separated model

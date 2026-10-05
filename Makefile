@@ -169,8 +169,9 @@ model-module-tests: ## Run oot_framework module tests (suite key: model_module; 
 	  if [[ -n "$(JUNIT_XML)" ]]; then \
 	    junit_arg="--junit-xml=$$(cd "$(RESULTS_DIR)" && pwd)/model-module-$${cfg}.xml"; \
 	  fi; \
-	  TORCH_DEVICE_ROOT="$$PWD" bash "$$_run_test" \
-	    "tests/configs/module_tests/$${cfg}" $(PYTEST_ARGS) \
+	  TORCH_DEVICE_ROOT="$$PWD" PYTHONPATH="$$PWD$${PYTHONPATH:+:$$PYTHONPATH}" \
+	  bash "$$_run_test" "tests/configs/module_tests/$${cfg}" \
+	    -p tests.module_capability_plugin $(PYTEST_ARGS) \
 	    $(if $(MODULE_TEST_FILTER),-k "$(MODULE_TEST_FILTER)") $${junit_arg} || rc=1; \
 	done; \
 	exit $$rc
