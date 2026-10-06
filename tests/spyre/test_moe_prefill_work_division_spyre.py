@@ -25,6 +25,7 @@ from torch_spyre._inductor.spyre_kernel import _iter_op_specs
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
 
+from hf_adapters import hf_qwen3_5_moe
 from hf_adapters.hf_common import moe_prefill_all_experts
 from hf_adapters.hf_gemma4_moe import Gemma4MoEBlock
 from hf_adapters.hf_olmoe import OlmoeMoEBlock
@@ -128,3 +129,106 @@ def test_prefill_driver_preserves_token_work_division(
         assert math.prod(size for size, _ in token_dimensions) == tokens, dimensions
         assert math.prod(split for _, split in token_dimensions) == 32, dimensions
         assert math.prod(split for _, split in dimensions) == 32, dimensions
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("attention_type", ["full_attention", "linear_attention"])
+def test_qwen_prefill_driver_preserves_token_work_division(
+    monkeypatch, batch, attention_type
+):
+    # Qwen3.5-35B-A3B geometry also leaves most cores idle without input names.
+    experts, tokens, hidden, intermediate = 256, 512, 2048, 512
+    torch.manual_seed(0)
+    x = torch.randn(batch, tokens // batch, hidden, dtype=torch.float16) * 0.1
+    gate = torch.randn(experts, hidden, intermediate, dtype=torch.float16) * 0.01
+    up = torch.randn_like(gate) * 0.01
+    down = torch.randn(experts, intermediate, hidden, dtype=torch.float16) * 0.01
+    selected = torch.rand(tokens, experts).topk(8, dim=-1).indices
+    routes = torch.zeros(tokens, experts).scatter(-1, selected, 0.125).half()
+
+    xf = x.float().reshape(tokens, hidden)
+    expected = torch.zeros_like(xf)
+    for expert in range(experts):
+        activated = F.silu(xf @ gate[expert].float()) * (xf @ up[expert].float())
+        expected += (activated @ down[expert].float()) * routes[:, expert, None]
+
+    weights = SimpleNamespace(
+        gate_proj=dma_moe_expert_weight_to_spyre(gate),
+        up_proj=dma_moe_expert_weight_to_spyre(up),
+        down_proj=dma_moe_expert_weight_to_spyre(down),
+    )
+    device_x = x.reshape(tokens, hidden).to("spyre")
+    device_routes = routes.to("spyre")
+    residual = x.to("spyre")
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(experts=weights),
+        self_attn=None,
+        input_layernorm=None,
+        post_attention_layernorm=None,
+    )
+
+    # Keep both production prefill dispatchers and their compiled routed-expert
+    # function. Stub unrelated stages at their existing compilation boundaries;
+    # normalization supplies the flattened [T, H] input used by real Qwen blocks.
+    stage_stubs = {
+        "finish_attention": lambda residual, *args: residual,
+        "normalize_ffn_input": lambda hidden_states: device_x,
+        "finish_ffn": lambda hidden_states, x, routed: routed,
+    }
+    real_compile = torch.compile
+
+    def compile_routed_only(function, **kwargs):
+        if function.__name__ == "prefill_routed_experts":
+            return real_compile(function, **kwargs)
+        return stage_stubs.get(function.__name__, function)
+
+    monkeypatch.setattr(
+        hf_qwen3_5_moe, "_moe_prefill_routing", lambda *args: device_routes
+    )
+    monkeypatch.setattr(
+        hf_qwen3_5_moe, "_make_dense_linear_attention_block", lambda layer: (None,) * 16
+    )
+    with monkeypatch.context() as construction:
+        construction.setattr(torch, "compile", compile_routed_only)
+        if attention_type == "full_attention":
+            block = hf_qwen3_5_moe._make_attention_block(layer, None, None, 64, 8, 64)
+            prefill, call_args = block[6], (residual, None, None)
+        else:
+            block = hf_qwen3_5_moe._make_linear_attention_block(layer, 8, 64)
+            prefill, call_args = block[14], (residual,)
+
+    emitted = []
+    real_sdsc = SpyreAsyncCompile.sdsc
+
+    def capture(self, name, specs, *args, **kwargs):
+        emitted.extend(_iter_op_specs(specs))
+        return real_sdsc(self, name, specs, *args, **kwargs)
+
+    monkeypatch.setattr(SpyreAsyncCompile, "sdsc", capture)
+    torch._dynamo.reset()
+    with fresh_inductor_cache(), torch.no_grad():
+        actual = prefill(*call_args)
+        torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-5, rtol=2e-2)
+        repeated = prefill(*call_args)
+        torch.testing.assert_close(repeated.cpu(), actual.cpu(), atol=0, rtol=0)
+
+    matmuls = [op for op in emitted if op.op == "batchmatmul"]
+    assert len(matmuls) == 3
+    for op in matmuls:
+        # T and M are both 512, so identify token axes by their presence only
+        # in the left operand, rather than by their extent or generated name.
+        input_axes = [
+            {
+                symbol
+                for coord in arg.device_coordinates
+                for symbol in coord.free_symbols
+            }
+            for arg in op.args
+            if arg.is_input
+        ]
+        token_dimensions = [
+            op.iteration_space[symbol] for symbol in input_axes[0] - input_axes[1]
+        ]
+        assert math.prod(size for size, _ in token_dimensions) == tokens
+        assert math.prod(split for _, split in token_dimensions) == 32
+        assert math.prod(split for _, split in op.iteration_space.values()) == 32
