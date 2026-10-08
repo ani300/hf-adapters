@@ -179,6 +179,11 @@ env:
   # regenerate on CPU. The test keys these compact references by model commit,
   # stack versions, generation settings, dtype, prompt, and input tensor bytes.
   HF_ADAPTERS_VLM_REF_CACHE: /storage-1/hf-adapters/.cache/vlm-references
+  # Line-buffered test output, so the step log timestamps each phase print
+  # instead of receiving the whole test's stdout in one block at exit.
+  # (Thread-pool sizes come from the build-hf-adapters action: a workflow-level
+  # env cannot read the runner pod's CPU limit.)
+  PYTHONUNBUFFERED: "1"
   # Single source of truth for the set of models exercised by the CPU
   # test matrix's `-k` filter. PR is the fast smoke — qwen3 (causal LM) and
   # bge_base (embedding) on CPU; the same bge_base runs on the Spyre
