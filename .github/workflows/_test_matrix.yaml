@@ -277,7 +277,8 @@ jobs:
       - spyre_pf_x1
       - linux
       - ${{ inputs.image_label }}
-    timeout-minutes: 15
+    # TRIAL: was 15; priming a cold store takes a few minutes.
+    timeout-minutes: 45
     outputs:
       torch_spyre_sha: ${{ steps.resolve.outputs.torch_spyre_sha }}
     steps:
@@ -311,6 +312,23 @@ jobs:
             echo "| job | hf-adapters SHA | torch-spyre SHA |"
             echo "|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # TRIAL ONLY (shared dependency-setup comparison): prime the shared store
+      # on this one pod before the Spyre jobs start. Every Spyre job already
+      # needs this job (for the pinned SHA), so they all measure the WARM path.
+      # Not for merging: in production the Prune workflow does this.
+      - name: Checkout composite actions (trial priming)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+      - name: Prime the shared uv cache (trial)
+        uses: ./.github/actions/build-hf-adapters
+        with:
+          uv_groups: "dev spyre test"
+          ref: ${{ inputs.ref }}
+          repository: ${{ inputs.repository }}
+          prime_shared_uv_cache: 'true'
 
   # One `artifact-id` record per run for push-test-results-to-clickhouse's v2 ingest. Must run
   # on the image under test: the base artifact_id lives in its filesystem. Never gates the run.
