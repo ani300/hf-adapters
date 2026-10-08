@@ -53,6 +53,14 @@ inputs:
       /home/senuser/torch-spyre source.
     required: false
     default: 'false'
+  prime_shared_uv_cache:
+    description: >
+      'true' = instead of installing anything, check out the target commit and
+      fill the shared uv cache on the storage PVC with every registry wheel
+      its uv.lock pins (all groups), from this one job (see install-deps.sh).
+      'false' (default) = install as usual.
+    required: false
+    default: 'false'
 outputs:
   target_sha:
     description: The resolved commit SHA that was checked out
@@ -107,6 +115,17 @@ runs:
             echo "${var}=${cpus}"
           fi
         done
+
+    # The next step replaces the workspace (which holds this action) with the
+    # target commit, which need not have these scripts (Test-With: refs), so
+    # keep the copies the action was loaded with.
+    - name: Stage the install scripts
+      shell: bash
+      run: |
+        dest="${RUNNER_TEMP}/build-hf-adapters"
+        mkdir -p "$dest"
+        cp "${GITHUB_ACTION_PATH}/install-deps.sh" "$dest/"
+        echo "HFA_INSTALL_DEPS=${dest}/install-deps.sh" >> "$GITHUB_ENV"
 
     - name: Checkout target commit
       id: resolve-sha
@@ -183,10 +202,16 @@ runs:
         # 'true' = trust the image's pre-installed torch-spyre; install nothing
         # for it here (issue #449 review). See the input description above.
         PREBAKED_IMAGE: ${{ inputs.prebaked_image }}
+        PRIME_SHARED_UV_CACHE: ${{ inputs.prime_shared_uv_cache }}
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
         git config --global --add safe.directory '*'
+        # Shared uv cache of registry wheels on the storage PVC that already
+        # holds HF_HOME (install-deps.sh). Jobs only read it; it is never
+        # exported as UV_CACHE_DIR.
+        export SHARED_UV_CACHE_DIR="${SHARED_UV_CACHE_DIR:-${STORAGE_1_DIR:-/storage-1/hf-adapters}/.cache/uv}"
+        source "$HFA_INSTALL_DEPS"
 
         # -------------------------------------------------------------------
         # Diagnostics: `uv: command not found` (exit 127) has been observed
@@ -216,6 +241,18 @@ runs:
         for group in $UV_GROUPS; do
           GROUP_FLAGS="$GROUP_FLAGS --group $group"
         done
+
+        if [[ "$PRIME_SHARED_UV_CACHE" == "true" ]]; then
+          # Fill the shared uv cache for this checkout's uv.lock and stop; this
+          # job installs nothing. Own `bash -e`, so a failure only warns.
+          cd "$CLONED_HF_ADAPTERS_DIR"
+          lock_opts=$(findmnt -no OPTIONS -T "$(dirname "$SHARED_UV_CACHE_DIR")" | tr ',' '\n' | grep -E '^(vers|nolock|lock|local_lock)' | paste -sd, - || true)
+          echo "shared uv cache: ${SHARED_UV_CACHE_DIR}, filesystem: $(findmnt -no FSTYPE -T "$(dirname "$SHARED_UV_CACHE_DIR")" || echo unknown) (${lock_opts:-no lock options})"
+          if ! bash -e -o pipefail -c 'source "$HFA_INSTALL_DEPS"; fill_shared_uv_cache'; then
+            echo "::warning::filling the shared uv cache failed; jobs download what it lacks"
+          fi
+          exit 0
+        fi
 
         if [[ "$PREBAKED_IMAGE" == "true" ]]; then
           # -----------------------------------------------------------------
@@ -268,18 +305,19 @@ runs:
           # Same install tail as the unpinned branch below -- the ONLY difference
           # is the fetch/checkout preamble above, so a pinned run behaves exactly
           # like today's install, just at a fixed SHA.
-          uv add torch-spyre /home/senuser/torch-spyre
-          uv lock --upgrade-package torch-spyre
-          uv sync --frozen --verbose --refresh $GROUP_FLAGS
+          # install_hf_adapters (install-deps.sh): uv add torch-spyre
+          # /home/senuser/torch-spyre; uv lock --upgrade-package torch-spyre;
+          # uv sync --frozen --verbose --refresh $GROUP_FLAGS -- with the
+          # registry packages first installed offline from the shared uv cache
+          # when it has them.
+          install_hf_adapters
         else
           cd "$CLONED_HF_ADAPTERS_DIR"
           # though we pin to main
           # frozen installation takes pinned commit when locked
           # we want to relax on torch-spyre to use floating version
           # and have other dependencies locked
-          uv add torch-spyre /home/senuser/torch-spyre
-          uv lock --upgrade-package torch-spyre
-          uv sync --frozen --verbose --refresh $GROUP_FLAGS
+          install_hf_adapters
         fi
         # Post-install diagnostics. On the prebaked path there is no project
         # .venv (we ran no sync) -- the relevant environment is the image's

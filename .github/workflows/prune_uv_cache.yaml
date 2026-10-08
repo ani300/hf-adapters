@@ -1,0 +1,153 @@
+name: Prune uv cache
+
+# The Spyre jobs read a shared uv cache of registry wheels on the storage PVC
+# (SHARED_UV_CACHE_DIR in .github/actions/build-hf-adapters, see its
+# install-deps.sh); they install from it offline and never write to it. This
+# workflow is its only writer:
+#   * weekly (and on dispatch) it prunes the cache, or clears it once it exceeds
+#     a size cap -- `uv cache prune` only drops dangling entries, so wheels of
+#     versions the lockfile no longer pins stay reachable;
+#   * after that, and whenever uv.lock changes on main, it fills the cache with
+#     every wheel the lockfile pins, from one process.
+#
+# prune and clean need uv's exclusive cache lock (<cache>/.lock), which waits
+# until no job is inside its shared-cache `uv sync`; while held, newly starting
+# syncs wait for it (up to their UV_LOCK_TIMEOUT, then they download instead).
+# prune holds it for one quick pass over the cache. A clean renames the cache
+# aside under the lock (instant) and deletes the old copy afterwards without
+# blocking anyone.
+
+on:
+  schedule:
+    # Sundays at 04:43 UTC, alongside the VLM reference cache prune.
+    - cron: "43 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      max_size_gib:
+        description: Clear the whole cache when it exceeds this many GiB
+        type: string
+        default: "40"
+        required: true
+      dry_run:
+        description: Report cache size and the planned action without changing anything
+        type: boolean
+        default: true
+        required: true
+  push:
+    branches: [main]
+    paths:
+      - uv.lock
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/prune_uv_cache.yaml
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prune:
+    name: Prune shared uv cache
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_torch_spyre
+    timeout-minutes: 30
+    concurrency:
+      group: prune-uv-cache
+      cancel-in-progress: false
+    env:
+      UV_CACHE_DIR: /storage-1/hf-adapters/.cache/uv
+      # How long to wait for running syncs to leave the cache (uv's default is
+      # 300 s, after which it fails).
+      UV_LOCK_TIMEOUT: "1200"
+      MAX_SIZE_GIB: ${{ inputs.max_size_gib || '40' }}
+      # Pull requests only ever get the read-only report.
+      DRY_RUN: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    steps:
+      - name: Prune uv cache
+        # A uv.lock change on main only needs the fill below.
+        if: github.event_name != 'push'
+        run: |
+          source "$HOME/.bashrc"
+          # uv coordinates concurrent jobs with flock(). On NFS that is only
+          # cluster-wide when the mount does not use nolock or local_lock=flock|all.
+          fstype=$(findmnt -no FSTYPE -T "$(dirname "$UV_CACHE_DIR")" || echo unknown)
+          lock_opts=$(findmnt -no OPTIONS -T "$(dirname "$UV_CACHE_DIR")" | tr ',' '\n' | grep -E '^(vers|nolock|lock|local_lock)' | paste -sd, - || true)
+          echo "filesystem: ${fstype} (${lock_opts:-no lock options})"
+          if [[ ! -d "$UV_CACHE_DIR" ]]; then
+            echo "uv cache does not exist: $UV_CACHE_DIR"
+            exit 0
+          fi
+          uv --version
+
+          # du rather than `uv cache size`, which is still a preview command.
+          size_bytes=$(du -sb "$UV_CACHE_DIR" | cut -f1)
+          max_bytes=$(( MAX_SIZE_GIB * 1024 * 1024 * 1024 ))
+          echo "size: $(du -sh "$UV_CACHE_DIR" | cut -f1) (cap ${MAX_SIZE_GIB} GiB)"
+          if (( size_bytes > max_bytes )); then
+            action=clean
+          else
+            action=prune
+          fi
+
+          if [[ "$DRY_RUN" != "false" ]]; then
+            echo "Dry run: would run 'uv cache ${action}'"
+            exit 0
+          fi
+          # A clean that failed or timed out on an earlier run leaves its
+          # renamed copy behind; finish deleting it.
+          for stale in "${UV_CACHE_DIR}".old-*; do
+            if [[ -d "$stale" ]]; then
+              uv cache clean --cache-dir "$stale"
+            fi
+          done
+          if [[ "$action" == prune ]]; then
+            # No --force: waits (UV_LOCK_TIMEOUT) for running syncs to finish.
+            uv cache prune
+            echo "size after prune: $(du -sh "$UV_CACHE_DIR" | cut -f1)"
+            exit 0
+          fi
+          # Size cap exceeded. Rename the cache aside while holding uv's lock
+          # exclusively (flock(2), the same lock uv takes), so no sync is using
+          # it; jobs starting afterwards create a fresh cache at the old path.
+          old_dir="${UV_CACHE_DIR}.old-$(date -u +%Y%m%dT%H%M%SZ)"
+          python3 - "$UV_CACHE_DIR" "$old_dir" "$UV_LOCK_TIMEOUT" <<'PY'
+          import fcntl, os, signal, sys
+          cache, old, timeout = sys.argv[1], sys.argv[2], int(sys.argv[3])
+          fd = os.open(os.path.join(cache, ".lock"), os.O_RDWR | os.O_CREAT, 0o666)
+          signal.alarm(timeout)  # SIGALRM ends the process if the lock never frees
+          fcntl.flock(fd, fcntl.LOCK_EX)
+          signal.alarm(0)
+          os.rename(cache, old)
+          # A sync that was already blocked on the old .lock resumes after we
+          # release it and keeps using the cache *path*; give it a directory.
+          os.mkdir(cache)
+          print(f"moved {cache} -> {old}", flush=True)
+          PY
+          # Delete the old copy with uv, which waits for any straggler still
+          # holding the old lock file; nothing new uses that directory.
+          uv cache clean --cache-dir "$old_dir"
+
+      # Fill the cache with every registry wheel uv.lock pins, from a single
+      # process (filling it from many pods at once would contend on uv's
+      # per-wheel locks, which NFS hands from waiter to waiter only every
+      # ~20-30 s). Cheap when everything is already cached.
+      - name: Check out hf-adapters for its uv.lock
+        if: env.DRY_RUN == 'false'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Fill the shared uv cache
+        if: env.DRY_RUN == 'false'
+        env:
+          SHARED_UV_CACHE_DIR: /storage-1/hf-adapters/.cache/uv
+          UV_PROJECT_ENVIRONMENT: /home/senuser/.venv
+        working-directory: ${{ github.workspace }}
+        run: |
+          source "$HOME/.bashrc"
+          source .github/actions/build-hf-adapters/install-deps.sh
+          fill_shared_uv_cache
