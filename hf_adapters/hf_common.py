@@ -2866,58 +2866,60 @@ def generate(
             prefill_value_caches = _prefill_cache_inputs(
                 value_caches, prefill_kv_len, chunked_prefill
             )
-            if prefill_fn is not None:
-                prefill_mask = build_prefill_mask(
-                    batch_size,
-                    padded_len,
-                    prefill_kv_len,
-                    prompt_offsets,
-                    dtype=model_d_type,
-                )
-                logits = prefill_fn(
-                    model=model,
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    attention_mask=prefill_mask,
-                    key_caches=prefill_key_caches,
-                    value_caches=prefill_value_caches,
-                    cache_index=make_cache_index(0, padded_len, DEVICE),
-                    **normalized_token_inputs,
-                )
-            else:
-                # Keep Lk fixed at the complete prefill extent while advancing
-                # Lq. Future cache slots are zero and masked, and fixed shapes
-                # avoid compiling one attention graph for every prefix length.
-                prefill_mask_builder = _ChunkedPrefillMaskBuilder(
-                    batch_size,
-                    query_chunk_size,
-                    prefill_kv_len,
-                    prompt_offsets,
-                    dtype=model_d_type,
-                    device=DEVICE,
-                )
-                text_prefill_fn = prefill_backbone_fn or run_forward_fn
-                for chunk_start in range(0, padded_len, query_chunk_size):
-                    chunk_end = chunk_start + query_chunk_size
-                    prefill_mask = prefill_mask_builder.build(chunk_start)
-                    prefill_output = text_prefill_fn(  # type: ignore[misc]
-                        model,
-                        input_ids[:, chunk_start:chunk_end].to(DEVICE),
-                        position_ids[:, chunk_start:chunk_end].to(DEVICE),
-                        prefill_mask,
-                        prefill_key_caches,
-                        prefill_value_caches,
-                        cache_index=make_cache_index(
-                            chunk_start, query_chunk_size, DEVICE
-                        ),
+            # Include the LM head as well as the backbone in the forward span.
+            with torch.profiler.record_function("prefill/model_forward"):
+                if prefill_fn is not None:
+                    prefill_mask = build_prefill_mask(
+                        batch_size,
+                        padded_len,
+                        prefill_kv_len,
+                        prompt_offsets,
+                        dtype=model_d_type,
                     )
-                # Every chunk must populate KV, but only the final prompt
-                # token needs a vocabulary projection for generation.
-                logits = (
-                    run_lm_head(model, prefill_output, logits_to_keep=1)
-                    if prefill_backbone_fn is not None
-                    else prefill_output
-                )
+                    logits = prefill_fn(
+                        model=model,
+                        input_ids=input_ids,
+                        position_ids=position_ids,
+                        attention_mask=prefill_mask,
+                        key_caches=prefill_key_caches,
+                        value_caches=prefill_value_caches,
+                        cache_index=make_cache_index(0, padded_len, DEVICE),
+                        **normalized_token_inputs,
+                    )
+                else:
+                    # Keep Lk fixed at the complete prefill extent while advancing
+                    # Lq. Future cache slots are zero and masked, and fixed shapes
+                    # avoid compiling one attention graph for every prefix length.
+                    prefill_mask_builder = _ChunkedPrefillMaskBuilder(
+                        batch_size,
+                        query_chunk_size,
+                        prefill_kv_len,
+                        prompt_offsets,
+                        dtype=model_d_type,
+                        device=DEVICE,
+                    )
+                    text_prefill_fn = prefill_backbone_fn or run_forward_fn
+                    for chunk_start in range(0, padded_len, query_chunk_size):
+                        chunk_end = chunk_start + query_chunk_size
+                        prefill_mask = prefill_mask_builder.build(chunk_start)
+                        prefill_output = text_prefill_fn(  # type: ignore[misc]
+                            model,
+                            input_ids[:, chunk_start:chunk_end].to(DEVICE),
+                            position_ids[:, chunk_start:chunk_end].to(DEVICE),
+                            prefill_mask,
+                            prefill_key_caches,
+                            prefill_value_caches,
+                            cache_index=make_cache_index(
+                                chunk_start, query_chunk_size, DEVICE
+                            ),
+                        )
+                    # Every chunk must populate KV, but only the final prompt
+                    # token needs a vocabulary projection for generation.
+                    logits = (
+                        run_lm_head(model, prefill_output, logits_to_keep=1)
+                        if prefill_backbone_fn is not None
+                        else prefill_output
+                    )
             # Only the last chunk's final-token logits matter for next-token
             # selection. Slice on Spyre so the D2H copy transfers [B, V]
             # instead of the full [B, S, V] prefill output.
@@ -2947,26 +2949,27 @@ def generate(
                     decode_mask, decode_mask_heads
                 )
             cache_index = make_cache_index(current_cache_len, 1, DEVICE)
-            if decode_fn is None:
-                logits = run_forward_fn(  # type: ignore[misc]
-                    model,
-                    next_input,
-                    decode_pos.to(DEVICE),
-                    decode_mask.to(DEVICE),
-                    key_caches,
-                    value_caches,
-                    cache_index=cache_index,
-                )
-            else:
-                logits = decode_fn(
-                    model=model,
-                    input_ids=next_input,
-                    position_ids=decode_pos.to(DEVICE),
-                    attention_mask=decode_mask.to(DEVICE),
-                    key_caches=key_caches,
-                    value_caches=value_caches,
-                    cache_index=cache_index,
-                )
+            with torch.profiler.record_function("decode/model_forward"):
+                if decode_fn is None:
+                    logits = run_forward_fn(  # type: ignore[misc]
+                        model,
+                        next_input,
+                        decode_pos.to(DEVICE),
+                        decode_mask.to(DEVICE),
+                        key_caches,
+                        value_caches,
+                        cache_index=cache_index,
+                    )
+                else:
+                    logits = decode_fn(
+                        model=model,
+                        input_ids=next_input,
+                        position_ids=decode_pos.to(DEVICE),
+                        attention_mask=decode_mask.to(DEVICE),
+                        key_caches=key_caches,
+                        value_caches=value_caches,
+                        cache_index=cache_index,
+                    )
             # Keep the transfer shape consistent with prefill. Decode normally
             # has S == 1, but slicing first avoids copying unused rows for any
             # adapter that returns a wider decode output.
