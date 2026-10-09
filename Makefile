@@ -11,10 +11,12 @@ SHELL := /bin/bash
 #   regression  — everything
 #   trunk       — same coverage as regression; push-to-main CI label (see
 #                 resolve_test_type.sh)
-#   perf        — SCAFFOLD ONLY: no benchmark harness yet, writes a placeholder
-#                 empty JUnit XML (no .benchmark classname, so ingest reads it
-#                 as 0 rows). A real producer (like torch-spyre's
-#                 spyre-perf-suite) is a follow-up.
+#   perf        — spyre-perf-suite's MODEL benchmarks (--hf-only). The op/kernel
+#                 half of that suite is measured in torch-spyre instead
+#                 (--ops-only there), so each image measures the layer it owns
+#                 and the op suite is not run twice. Models live here because
+#                 they need hf-adapters' exact transformers pin, which only this
+#                 image carries. -dev only: -minimal has no perf wheel.
 # Also accepts a space-separated list of individual suite keys (matches
 # _test_matrix.yaml's `test_type` semantics), e.g. TEST_TYPE="smoke load".
 # Empty / unset defaults to "regression" (every suite).
@@ -251,12 +253,16 @@ tests: ## Run the suites selected by TEST_TYPE into RESULTS_DIR (JUnit per suite
 	                      done ;; \
 	    model_support)    $(MAKE) model-support-tests RESULTS_DIR="$(RESULTS_DIR)" || rc=1 ;; \
 	    edge_cases)       mkdir -p "$(RESULTS_DIR)/junit-edge-cases" && $(MAKE) edge-cases-tests        JUNIT_XML="$(RESULTS_DIR)/junit-edge-cases/junit-edge-cases.xml" MODEL_KEY="$(MODEL_KEY)" MODEL_PATH="$$model_path" EDGE_CASE_FILE="$(EDGE_CASE_FILE)" || rc=1 ;; \
-	    perf)             printf '%s\n' \
-	                        '<?xml version="1.0" encoding="utf-8"?>' \
-	                        '<testsuites name="hf-adapters-perf">' \
-	                        '  <testsuite name="hf-adapters-perf" tests="0" skipped="0" failures="0" errors="0"/>' \
-	                        '</testsuites>' > "$(RESULTS_DIR)/report.xml"; \
-	                      echo "hf-adapters has no perf harness yet (scaffold stub): wrote placeholder $(RESULTS_DIR)/report.xml" ;; \
+	    perf)             command -v spyre-perf-suite >/dev/null 2>&1 || { \
+	                        echo "ERROR: spyre-perf-suite is not installed in this image. The perf suite ships as a wheel into hf-adapters-dev; a -minimal image has no perf harness." >&2; \
+	                        rc=1; break; \
+	                      }; \
+	                      spyre-perf-suite --no-experimental --stacks torch-spyre --hf-only \
+	                        --report "$$(cd "$(RESULTS_DIR)" && pwd)/report.txt" || rc=1; \
+	                      test -s "$(RESULTS_DIR)/report.xml" || { \
+	                        echo "ERROR: spyre-perf-suite did not emit $(RESULTS_DIR)/report.xml -- the run measured nothing" >&2; \
+	                        rc=1; \
+	                      } ;; \
 	    *) echo "Unknown suite key '$$suite'. Valid: adapter_coverage smoke load token_compare model_components embed_compare vlm reranker_compare masked_lm_compare question_answering_compare seq_classification_compare token_classification_compare model_module model_support edge_cases perf"; rc=1 ;; \
 	  esac; \
 	done; \
