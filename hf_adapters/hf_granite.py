@@ -30,7 +30,6 @@ Usage::
 import torch
 
 from hf_adapters.hf_common import (
-    _SDPA_MAX_SEQUENCE_TILE_SIZE,
     embed_text_tokens,
     get_backbone,
     prepare_lm_head_for_spyre,
@@ -101,4 +100,6 @@ def prepare_for_spyre(model):
     backbone = get_backbone(model)
     model._spyre_compiled_blocks = prepare_standard_gqa_blocks(backbone.layers, True)
     model._spyre_compiled_norm = torch.compile(backbone.norm, dynamic=False)
-    model._spyre_prefill_chunk_size = _SDPA_MAX_SEQUENCE_TILE_SIZE
+    # Use one-shot, stick-aligned prefill so a 64-token prompt stays 64 tokens.
+    # The generation loop independently reserves SDPA-compatible KV capacity.
+    model._spyre_prefill_chunk_size = None
