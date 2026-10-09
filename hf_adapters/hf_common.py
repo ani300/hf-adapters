@@ -23,6 +23,7 @@ compiled block functions.
 
 import math
 import os
+import sys
 import time
 import warnings
 from contextlib import contextmanager, nullcontext
@@ -177,6 +178,45 @@ def moe_decode_selected_experts(
         return expert_out.sum(dim=1)
 
 
+@contextmanager
+def named_moe_prefill_inputs(x, gate, up, down):
+    """Keep the prefill token work division attached to its eager inputs.
+
+    The expert loop's ``work_div={"T": 32}`` needs these names to resolve to
+    the token axis. Without them the compiler can leave most cores idle.
+    Accept flattened [T, H] or batched [B, T, H] inputs. Keep batch and sequence
+    names separate so flattening them for the expert loop and restoring the
+    batch shape both preserve dimension propagation.
+    """
+    if x.device.type != "spyre":
+        yield
+        return
+
+    named_dims = sys.modules["torch_spyre._inductor.wsr.propagate_named_dims"]
+    batch, tokens, _ = (1, *x.shape) if x.ndim == 2 else x.shape
+    input_names = ("T", "H") if x.ndim == 2 else ("B", "T", "H")
+    experts, hidden, intermediate = gate.shape
+    try:
+        for name, extent in (
+            ("B", batch),
+            ("E", experts),
+            ("T", tokens),
+            ("H", hidden),
+            ("M", intermediate),
+        ):
+            named_dims.declare_tensor_dim(name, extent)
+        named_dims.name_tensor_dims(
+            x, [name for name, size in zip(input_names, x.shape) if size != 1]
+        )
+        named_dims.name_tensor_dims(gate, ["E", "H", "M"])
+        named_dims.name_tensor_dims(up, ["E", "H", "M"])
+        named_dims.name_tensor_dims(down, ["E", "M", "H"])
+        yield
+    finally:
+        # Compilation consumes these globals; a cache hit does not.
+        named_dims.reset()
+
+
 def moe_prefill_all_experts(x, routing_weight, gate, up, down, activation):
     """Evaluate every expert and sum its routed prefill output."""
     if activation not in ("silu", "gelu_tanh"):
@@ -270,6 +310,28 @@ def assert_spyre_dimensions(config, model_name):
         )
 
 
+def to_default_device_layout(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Copy the embedding output into the default Spyre layout.
+
+    The embedding gives layer 0 its input in a different device layout than
+    the one each block gives the next layer. Dynamo checks the layout of
+    every block input, so layer 0 compiles its own copy of the block. One copy
+    into the default layout (the layout every block returns) lets all layers
+    use the same compiled block. If the layout is already the default, the
+    tensor does not change. Tensors that are not on Spyre are returned as is.
+    """
+    if hidden_states.device.type != "spyre":
+        return hidden_states
+    from torch_spyre._C import SpyreTensorLayout  # type: ignore[import-not-found]
+
+    target = SpyreTensorLayout(hidden_states.size(), hidden_states.dtype)
+    # ``device_layout=`` is added to Tensor.to by torch-spyre.
+    out: torch.Tensor = hidden_states.to(  # type: ignore[call-overload]
+        device_layout=target
+    )
+    return out
+
+
 def get_backbone(model):
     """Return the transformer backbone of an HF model or task wrapper object.
 
@@ -303,12 +365,26 @@ def get_backbone(model):
     return getattr(inner, "language_model", inner)
 
 
-def embed_text_tokens(model, input_ids):
-    """Embed text token ids using the model backbone's embedding policy."""
-    backbone = get_backbone(model)
+def embed_text_tokens(model, input_ids, backbone=None):
+    """Embed text token ids. All adapters use this for their token embedding.
+
+    Moves ``input_ids`` to the embedding's device, looks them up in
+    ``embed_tokens``, and multiplies by ``embedding_multiplier`` when the
+    backbone has one (Granite). Then copies the result into the default Spyre
+    layout (see ``to_default_device_layout``), so layer 0 gets its input in the
+    same layout as the other layers.
+
+    ``backbone`` defaults to ``get_backbone(model)``. Pass it for models that
+    keep ``embed_tokens`` somewhere else (OPT keeps it on ``decoder``).
+    """
+    if backbone is None:
+        backbone = get_backbone(model)
     input_ids = input_ids.to(backbone.embed_tokens.weight.device)
     hidden_states = backbone.embed_tokens(input_ids)
-    return hidden_states * getattr(backbone, "embedding_multiplier", 1.0)
+    multiplier = getattr(backbone, "embedding_multiplier", None)
+    if multiplier is not None:
+        hidden_states = hidden_states * multiplier
+    return to_default_device_layout(hidden_states)
 
 
 def text_config(config):
@@ -3268,8 +3344,7 @@ def standard_gqa_backbone_forward(
     Returns ``last_hidden_state`` (no ``lm_head``). Used directly by embedding
     callers; wrapped by ``standard_gqa_forward`` for causal-LM callers.
     """
-    backbone = get_backbone(model)
-    h = backbone.embed_tokens(input_ids)
+    h = embed_text_tokens(model, input_ids)
 
     selected_freqs = model._spyre_rope(h, position_ids)
 
@@ -3881,7 +3956,7 @@ def prefill_question_answering(
     attention_mask,
     token_type_ids=None,
 ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
-    """Run an encoder on Spyre and its extractive-QA head on CPU."""
+    """Run an encoder and its extractive-QA head on Spyre."""
     last_hidden_state = prefill_encoder(
         run_encoder_forward_fn,
         model,
@@ -3913,7 +3988,7 @@ def prefill_sequence_classification(
     attention_mask,
     token_type_ids=None,
 ) -> torch.Tensor:
-    """Run an encoder on Spyre and its sequence-classification head on CPU."""
+    """Run an encoder and its sequence-classification head on Spyre."""
     last_hidden_state = prefill_encoder(
         run_encoder_forward_fn,
         model,
@@ -3940,15 +4015,12 @@ def prefill_token_classification(
     attention_mask,
     token_type_ids=None,
 ) -> torch.Tensor:
-    """Run an encoder on Spyre and its token-classification head on CPU.
+    """Run an encoder and its token-classification head on Spyre.
 
     Drives the encoder backbone via ``prefill_encoder``, then applies
     ``model.classifier`` (a single linear layer whose output dim equals
-    ``config.num_labels``) to every token position.  The head is kept on
-    CPU (via ``_spyre_cpu_submodules``) to avoid:
-
-    - ``aten.slice`` (index operations that don't lower on Spyre).
-    - Any Dropout path that uses ``torch.bernoulli``.
+    ``config.num_labels``) to every token position on device, so only the
+    ``[B, L, num_labels]`` logits are copied to CPU.
 
     Args:
         run_encoder_forward_fn: ``fn(model, input_ids, attn_mask, position_ids,

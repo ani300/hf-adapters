@@ -29,6 +29,7 @@ from hf_adapters.hf_common import (
     PrecomputedRotaryEmbedding,
     allocate_kv_cache_tensor,
     apply_rope_matmul,
+    embed_text_tokens,
     get_backbone,
     kv_cache_update,
     pad_attention_heads,
@@ -295,8 +296,7 @@ def _run_backbone_forward(
     value_caches,
     cache_index,
 ):
-    backbone = get_backbone(model)
-    h = backbone.embed_tokens(input_ids)
+    h = embed_text_tokens(model, input_ids)
     selected_freqs = model._spyre_rope(h, position_ids)
     padding_mask = _padding_mask(attn_mask, h.shape[1], cache_index)
 

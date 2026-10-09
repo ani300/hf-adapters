@@ -58,6 +58,7 @@ import torch
 from hf_adapters import hf_siglip_vision
 from hf_adapters.hf_common import (
     DEVICE,
+    embed_text_tokens,
     get_backbone,
     get_model_dtype,
     prepare_lm_head_for_spyre,
@@ -90,19 +91,6 @@ def prepare_for_spyre(model):
     backbone = get_backbone(model)
     model._spyre_text_blocks = prepare_standard_gqa_blocks(backbone.layers, True)
     model._spyre_compiled_norm = torch.compile(backbone.norm, dynamic=False)
-
-
-def _embed_text(model, input_ids):
-    """Token embeddings * embedding_multiplier (Granite scales its embeddings).
-
-    The gather runs on ``embed_tokens``' device — after the Spyre device move
-    the table lives on Spyre, so ``input_ids`` is moved to match (mirrors the
-    decode-step ``embed_ids``). Returns embeddings on the embedding's device.
-    """
-    backbone = get_backbone(model)
-    ids = input_ids.to(backbone.embed_tokens.weight.device)
-    h = backbone.embed_tokens(ids)
-    return h * backbone.embedding_multiplier
 
 
 def _deepstack_features(model, pixel_values, image_sizes):
@@ -289,12 +277,12 @@ def _prefill_forward(
     prefill and decode sequence.
     """
     model_d_type = get_model_dtype(model)
-    # _embed_text returns embeds on the embedding table's device (Spyre after
-    # the layout move). Zero the <image> slots by multiplying with a keep factor
+    # embed_text_tokens returns embeds on the embedding table's device (Spyre
+    # after the layout move). Zero the <image> slots by multiplying with a keep factor
     # (0 at image positions, 1 elsewhere): masked_fill_ does not lower on the
     # Spyre eager backend, but elementwise mul does. The keep factor is built on
     # CPU (the bool/not op also doesn't lower) then moved to the embeds' device.
-    inputs_embeds = _embed_text(model, input_ids)
+    inputs_embeds = embed_text_tokens(model, input_ids)
     vision_mask = _vision_mask(model, input_ids)
     keep = (~vision_mask).to(model_d_type).to(inputs_embeds.device)
     inputs_embeds = inputs_embeds * keep

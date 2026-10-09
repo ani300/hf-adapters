@@ -69,6 +69,7 @@ import torch
 from hf_adapters import hf_pixtral_vision
 from hf_adapters.hf_common import (
     DEVICE,
+    embed_text_tokens,
     get_backbone,
     get_model_dtype,
     prepare_lm_head_for_spyre,
@@ -202,13 +203,6 @@ def _inject_image_features(hidden_states, features, vision_mask):
 # ---------------------------------------------------------------------------
 
 
-def _embed_text(model, input_ids):
-    """Token embeddings (Mistral has no embedding multiplier)."""
-    backbone = get_backbone(model)
-    ids = input_ids.to(backbone.embed_tokens.weight.device)
-    return backbone.embed_tokens(ids)
-
-
 def _run_text_backbone(
     model,
     inputs_embeds,
@@ -303,7 +297,7 @@ def _prefill_forward(
     """
     model_dtype = get_model_dtype(model)
 
-    inputs_embeds = _embed_text(model, input_ids)
+    inputs_embeds = embed_text_tokens(model, input_ids)
     vision_mask = _vision_mask(model, input_ids)
     # Zero the <image> slots: multiply by a (0/1) keep factor built on CPU.
     # aten::masked_fill_ is not yet supported on Spyre (torch-spyre#1004);

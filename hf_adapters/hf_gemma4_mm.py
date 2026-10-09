@@ -71,6 +71,7 @@ import torch
 from hf_adapters import hf_gemma4, hf_gemma4_moe, hf_gemma4_vision
 from hf_adapters.hf_common import (
     DEVICE,
+    embed_text_tokens,
     get_backbone,
     get_model_dtype,
     patch_layernorm,
@@ -302,7 +303,8 @@ def _embed_and_scatter(model, input_ids, image_features):
     # The additive feature scatter still needs CPU indexing. Only its compact
     # mask crosses back; token IDs and their image-to-pad selection stay on device.
     image_mask = image_mask.to(device="cpu", dtype=torch.bool)
-    h = backbone.embed_tokens(ids)  # scaled word embeddings, on embed device
+    # Scaled word embeddings, on the embedding's device.
+    h = embed_text_tokens(model, ids)
 
     n_image_tokens = int(image_mask.sum())
     hidden = h.shape[-1]

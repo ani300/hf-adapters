@@ -97,6 +97,7 @@ from hf_adapters.hf_common import (
     SpyreUnsupportedModelError,
     add_causal_sliding_window_band,
     apply_rope_matmul,
+    embed_text_tokens,
     get_backbone,
     kv_cache_update,
     optional_spyre_config_patch,
@@ -1187,8 +1188,7 @@ def _run_backbone_forward(
     models), then delegate to ``_run_blocks_over_embeds`` (no blockwise vision
     band).
     """
-    backbone = _gemma4_backbone(model)
-    h = backbone.embed_tokens(input_ids)
+    h = embed_text_tokens(model, input_ids)
     # Only prefill can contain fully-masked left-pad query rows. Avoid the CPU
     # mask transfer and reduction on every single-token decode step.
     query_row_mask = None
