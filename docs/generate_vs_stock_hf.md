@@ -75,6 +75,13 @@ Not supported:
 
 ## Other behavioral notes
 
+- Gemma 4 MoE decode with multiple batch rows evaluates selected experts one
+  row at a time inside the compiled graph, avoiding unsupported batched routing
+  layouts. Each token still evaluates its configured top-k experts (eight for
+  26B-A4B). Attention, router projection, prefill, and tensor-parallel reduction
+  remain batched. This scheduling can affect inter-token latency and increases
+  compiled graph size with batch size; it is a compatibility path, not a fully
+  batched expert kernel.
 - Rich output is deliberately minimal: attentions and hidden states remain
   unsupported, and `past_key_values` is `None` because the internal Spyre tensor
   caches are not a stock HF `Cache`. Text and multimodal generation share this

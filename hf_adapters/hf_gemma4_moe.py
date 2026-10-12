@@ -93,6 +93,31 @@ def _compiled_moe_loop_region(
         router_scalar_root_size,
         eps,
     )
+    if x_expert.device.type == "spyre" and x_expert.shape[0] > 1:
+        # Batched top-k packs tokens inside a stick, which cannot broadcast
+        # onto the hidden-sticked selected-expert output. Keep the existing
+        # singleton gather path for each token inside this compiled region.
+        # Attention, routing projection, and the TP reduction remain batched.
+        outputs = []
+        for token in range(x_expert.shape[0]):
+            weights, expert_indices = moe_topk(probs[token : token + 1], top_k)
+            weights = weights / weights.sum(-1, keepdim=True)
+            outputs.append(
+                moe_decode_selected_experts(
+                    x_expert[token : token + 1],
+                    weights,
+                    expert_indices,
+                    gate_dev,
+                    up_dev,
+                    down_dev,
+                    top_k,
+                    tile,
+                    stick_size,
+                    "gelu_tanh",
+                    per_expert_scale_stick=per_expert_scale_stick,
+                )
+            )
+        return torch.cat(outputs, dim=0)
     weights, expert_indices = moe_topk(probs, top_k)
     weights = weights / weights.sum(-1, keepdim=True)
     return moe_decode_selected_experts(

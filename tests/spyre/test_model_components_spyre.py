@@ -23,6 +23,10 @@ Run them explicitly on a Spyre pod::
 import pytest
 import torch
 import torch.nn.functional as F
+from torch_spyre.model_utils import (
+    dma_moe_expert_weight_to_spyre,
+    dma_moe_per_expert_scale_to_spyre,
+)
 from transformers import GraniteConfig, PixtralVisionConfig
 from transformers.models.granite.modeling_granite import (
     GraniteAttention,
@@ -37,12 +41,100 @@ from hf_adapters.hf_common import (
     pad_lm_head,
     prepare_rope_and_heads,
 )
+from hf_adapters.hf_gemma4_moe import _compiled_moe_loop_region
 from hf_adapters.hf_pixtral_vision import (
     _make_compiled_pixtral_block,
     _pad_pixtral_heads,
 )
 
 pytestmark = pytest.mark.requires_spyre
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_gemma4_selected_expert_decode(batch, dtype):
+    """Compile real Gemma routing and decode with different experts per row."""
+    # Gemma 4 26B-A4B geometry with the TP=4 local intermediate padded from
+    # 704 / 4 = 176 to 192. This test needs only one card and no checkpoint.
+    experts, hidden, intermediate, top_k = 128, 2816, 192, 8
+    generator = torch.Generator().manual_seed(27)
+    x = torch.randn(batch, hidden, generator=generator, dtype=dtype) * 0.1
+    gate = (
+        torch.randn(experts, hidden, intermediate, generator=generator, dtype=dtype)
+        * 0.1
+    )
+    up = (
+        torch.randn(experts, hidden, intermediate, generator=generator, dtype=dtype)
+        * 0.1
+    )
+    down = (
+        torch.randn(experts, intermediate, hidden, generator=generator, dtype=dtype)
+        * 0.1
+    )
+    expert_scale = (torch.rand(experts, generator=generator) + 0.5).to(dtype)
+
+    # Well-separated logits avoid a top-k boundary changing under DL16
+    # rounding. Disjoint, nonconsecutive expert sets expose row mixing and
+    # incorrect scale gathers; nonuniform weights exercise normalization.
+    router_input = torch.eye(batch, hidden, dtype=dtype)
+    router_weight = torch.zeros(experts, hidden, dtype=dtype)
+    selected = torch.randperm(experts, generator=generator)[: batch * top_k]
+    selected = selected.reshape(batch, top_k)
+    for row in range(batch):
+        router_weight[:, row] = -2
+        router_weight[selected[row], row] = torch.linspace(2, 4, top_k).to(dtype)
+    router_scale = torch.linspace(0.8, 1.2, hidden).to(dtype)
+    root_size = torch.tensor(hidden**-0.5, dtype=dtype)
+    eps = 1e-6
+
+    # Independent float32 mathematical reference, including RMS normalization,
+    # router projection, selected-expert normalization, and per-expert scales.
+    router_float = router_input.float()
+    normalized = router_float * torch.rsqrt(
+        router_float.square().mean(-1, keepdim=True) + eps
+    )
+    logits = F.linear(
+        normalized * router_scale.float() * root_size.float(), router_weight.float()
+    )
+    weights, indices = logits.softmax(-1).topk(top_k, dim=-1)
+    weights /= weights.sum(-1, keepdim=True)
+    expected = torch.zeros(batch, hidden)
+    for row in range(batch):
+        for slot in range(top_k):
+            expert = indices[row, slot]
+            activated = F.gelu(
+                x[row].float() @ gate[expert].float(), approximate="tanh"
+            ) * (x[row].float() @ up[expert].float())
+            expected[row] += (
+                (activated @ down[expert].float())
+                * weights[row, slot]
+                * expert_scale[expert].float()
+            )
+
+    args = (
+        router_input.to("spyre"),
+        x.to("spyre"),
+        router_weight.to("spyre"),
+        router_scale.to("spyre"),
+        root_size.to("spyre"),
+        dma_moe_per_expert_scale_to_spyre(expert_scale),
+        dma_moe_expert_weight_to_spyre(gate),
+        dma_moe_expert_weight_to_spyre(up),
+        dma_moe_expert_weight_to_spyre(down),
+        top_k,
+        32,
+        64,
+        eps,
+    )
+    compiled = torch.compile(_compiled_moe_loop_region, dynamic=False, fullgraph=True)
+    with torch.inference_mode():
+        actual = compiled(*args).cpu()
+        repeated = compiled(*args).cpu()
+    assert actual.dtype == dtype
+    # Allow DL16 rounding through the complete router and three expert GEMMs,
+    # including cancellation near zero in the weighted expert sum.
+    torch.testing.assert_close(actual.float(), expected, atol=2e-3, rtol=0.05)
+    torch.testing.assert_close(repeated, actual, atol=0, rtol=0)
 
 
 class _Layer(torch.nn.Module):
