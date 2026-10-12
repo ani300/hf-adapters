@@ -41,6 +41,14 @@ stopping, but diverges from stock HF in several ways worth documenting.
 python scripts/profile_e2e_spyre.py --model gemma4_26b_a4b --max-new-tokens 10 --batch 1
 ```
 
+Use `--dtype float16` or `--dtype bfloat16` to explicitly override the checkpoint
+policy. For example, to profile Gemma MoE in FP16 with tensor parallelism:
+
+```bash
+SPYRE_DEVICES=0,1 torchrun --nproc-per-node=2 scripts/profile_e2e_spyre.py \
+    --model gemma4_26b_a4b --dtype float16 --max-new-tokens 10 --batch 1
+```
+
 Chat templates supply the instruct model's turn delimiters and generation
 prefix. Gemma 4's direct tokenizer does not add BOS, so a raw prompt can produce
 repetitive output even when stock CPU inference receives the same input.

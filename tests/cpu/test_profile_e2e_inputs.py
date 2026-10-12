@@ -94,3 +94,29 @@ def test_profile_resolves_checkpoint_dtype(tmp_path, monkeypatch):
     profiler.main(["--model", "gemma4_26b_a4b"])
     assert captured["dtype"] == torch.bfloat16
     assert captured["raw_prompt"] is False
+
+
+@pytest.mark.parametrize(
+    ("dtype_name", "expected"),
+    [("float16", torch.float16), ("bfloat16", torch.bfloat16)],
+)
+def test_profile_dtype_override_bypasses_checkpoint_policy(
+    monkeypatch, dtype_name, expected
+):
+    def unexpected_policy_lookup(*args, **kwargs):
+        pytest.fail("An explicit dtype must bypass the checkpoint dtype policy")
+
+    monkeypatch.setattr(profiler, "dtype_for_model_path", unexpected_policy_lookup)
+    captured = {}
+    monkeypatch.setattr(
+        profiler, "run_profile", lambda **kwargs: captured.update(kwargs)
+    )
+    profiler.main(["--model", "gemma4_26b_a4b", "--dtype", dtype_name])
+    assert captured["dtype"] == expected
+
+
+def test_profile_rejects_unsupported_dtype(capsys):
+    with pytest.raises(SystemExit) as error:
+        profiler.main(["--dtype", "float32"])
+    assert error.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err

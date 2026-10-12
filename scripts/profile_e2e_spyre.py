@@ -52,9 +52,11 @@ adds per-event overhead and enlarges the trace.
 Open the resulting trace in https://ui.perfetto.dev/ or chrome://tracing.
 
 Prompts use the model's chat template when available, as in the e2e tests.
-Use ``--raw-prompt`` to profile unformatted text. ``--prompt-tokens`` creates
-a synthetic fixed-length workload by repeating/truncating tokenized inputs;
-its output is not a semantic correctness check.
+Use ``--dtype float16`` or ``--dtype bfloat16`` to override the checkpoint's
+default dtype, and ``--raw-prompt`` to profile unformatted text.
+``--prompt-tokens`` creates a synthetic fixed-length workload by
+repeating/truncating tokenized inputs; its output is not a semantic correctness
+check.
 """
 
 import argparse
@@ -104,6 +106,11 @@ MODELS: dict[str, str] = {
     "granite8b": "ibm-granite/granite-3.3-8b-instruct",
 }
 
+DTYPES: dict[str, torch.dtype] = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
 DEFAULT_PROMPT = "The capital of France is"
 
 
@@ -114,6 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="ministral3",
         choices=sorted(MODELS),
         help="Registry key to profile (default: ministral3).",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=sorted(DTYPES),
+        default=None,
+        help="Override the model dtype (default: shared checkpoint dtype policy).",
     )
     parser.add_argument(
         "--out",
@@ -323,7 +336,11 @@ def main(argv: list[str] | None = None) -> None:
 
     print(f"  HF hub cache: {constants.HF_HUB_CACHE}")
     path = MODELS[args.model]
-    dtype = dtype_for_model_path(path, target_device="spyre")
+    dtype = (
+        DTYPES[args.dtype]
+        if args.dtype is not None
+        else dtype_for_model_path(path, target_device="spyre")
+    )
     out = args.out or f"{args.model}_trace.json"
     run_profile(
         model_path=path,
