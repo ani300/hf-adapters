@@ -1398,8 +1398,9 @@ def build_prefill_mask(
             mask[b, :, :, : prompt_offsets[b].item()] = fill
     else:
         mask[:, :, :, :prompt_offsets] = fill
-    for i in range(padded_len):
-        mask[:, :, i, query_start + i + 1 :] = fill
+    query_positions = query_start + torch.arange(padded_len)
+    future = torch.arange(max_cache_len).unsqueeze(0) > query_positions.unsqueeze(1)
+    mask.masked_fill_(future, fill)
     return mask
 
 
@@ -1442,9 +1443,9 @@ class _ChunkedPrefillMaskBuilder:
         self._causal = build_prefill_mask(
             batch_size, chunk_size, max_cache_len, 0, dtype=dtype
         ).to(device)
-        self._zero_chunk = torch.zeros(
-            (batch_size, 1, chunk_size, chunk_size), dtype=dtype
-        ).to(device)
+        # Single-chunk prefill never advances. Avoid allocating, converting and
+        # transferring the potentially large advance-only buffer in that case.
+        self._zero_chunk = None
         self._masked_chunk = None
 
         padding_mask = torch.zeros((batch_size, 1, 1, max_cache_len), dtype=dtype)
@@ -1467,6 +1468,11 @@ class _ChunkedPrefillMaskBuilder:
                 f"expected query_start={self._query_start}, got {query_start}"
             )
         if query_start:
+            if self._zero_chunk is None:
+                self._zero_chunk = torch.zeros(
+                    (self.batch_size, 1, self.chunk_size, self.chunk_size),
+                    dtype=self.dtype,
+                ).to(self.device)
             self._causal = self._advance(self._causal, self._zero_chunk)
         mask = torch.minimum(self._causal, self._padding_mask)
         # Gemma's shared sliding-window helper sees this tensor before it enters
