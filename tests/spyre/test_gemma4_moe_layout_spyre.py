@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch_spyre._C import get_spyre_tensor_layout
 
 from hf_adapters.hf_common import (
+    moe_chunk_entry_constants,
     moe_decode_selected_experts,
     moe_topk,
     prepare_moe_expert_weights,
@@ -98,6 +99,8 @@ def test_compiled_chunked_decode_matches_independent_expert_reference(intermedia
             output = activated @ down[expert].float().T
             expected[row] += output * float(routing[row, slot]) * float(scale[expert])
 
+    chunk_scale, chunk_offsets = moe_chunk_entry_constants(4)
+
     def decode(x_device, scores_device):
         values, indices = moe_topk(scores_device, top_k)
         return moe_decode_selected_experts(
@@ -113,6 +116,8 @@ def test_compiled_chunked_decode_matches_independent_expert_reference(intermedia
             "gelu_tanh",
             per_expert_scale_stick=scale_stick,
             decode_chunks=4,
+            chunk_scale=chunk_scale,
+            chunk_offsets=chunk_offsets,
         )
 
     compiled = torch.compile(decode, dynamic=False, fullgraph=True)

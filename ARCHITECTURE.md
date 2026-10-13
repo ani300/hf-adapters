@@ -66,15 +66,20 @@ CPU Accurate does not apply: DiffusionGemma has no greedy AR token sequence to c
 
 **Gemma 4 26B-A4B (MoE):** 128 experts, top-8 routing. Prefill uses a persistent
 expert loop (all experts evaluated, routed via `keep_by_index` + coarse-tile
-carried sum). Decode gathers four 704-wide hidden/output chunks per selected
-expert and sums gate/up projections **before** GELU; down outputs are concatenated.
-Gate/up keep their prefill layout, and down is stored in matmul-weight order.
-All three decode chunk views alias the prefill expert pools, avoiding a second
-weight stack. Decode still runs attention, layernorms, FFN and MoE on Spyre.
-Run `scripts/benchmark_gemma4_decode_moe.py` with either
-`--layout baseline` or `--layout chunked` to time the isolated decode MoE at
-production expert dimensions; the smoke and token-compare tests cover full-model
-generation.
+carried sum). Decode gathers hidden/output chunks per selected expert through
+expert-major views that alias the prefill pools: gate/up keep their gather
+layout (down stored in matmul-weight order), so no second weight stack exists.
+The chunk count is derived once at load — the fewest stick-legal chunks that
+spread the `top_k * chunks` gathered entries over the most cores (4 for Gemma 4
+on 32 cores); `SPYRE_MOE_CHUNKS` overrides it. Entry construction broadcasts
+the widened expert index against load-time device constants (one kernel, no
+per-call constants), gate/up partial sums reduce a contiguous chunk axis
+before the activation, and the down parts reshape in place. A derived count of
+1 keeps the whole-expert `for_each_tile` path instead. Decode still runs
+attention, layernorms, FFN and MoE on Spyre. Run
+`scripts/benchmark_gemma4_decode_moe.py` with either `--layout baseline` or
+`--layout chunked` to time the isolated decode MoE at production expert
+dimensions; the smoke and token-compare tests cover full-model generation.
 
 **OLMoE 1B-7B:** 64 experts, top-8 routing with the checkpoint's
 unnormalized selected probabilities. Prefill evaluates all experts persistently;

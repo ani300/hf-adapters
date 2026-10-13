@@ -63,7 +63,11 @@ __all__ = [
 ]
 
 _MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
-_MOE_CHUNKS = 4  # One 704-wide hidden slice per selected-expert gather entry.
+
+
+def _derive_decode_chunks(hidden_size, top_k, stick_size):
+    """Chunks for gathered decode; derived from cores, override via SPYRE_MOE_CHUNKS."""
+    return hf_common.derive_moe_chunks(hidden_size, top_k, stick_size)
 
 
 def _router_probs(x, weight, scale, root_size, eps):
@@ -85,6 +89,9 @@ def _compiled_moe_loop_region(
     tile,
     stick_size,
     eps,
+    decode_chunks=1,
+    chunk_scale=None,
+    chunk_offsets=None,
 ):
     """Run the routed decode FFN and combine its expert outputs on device."""
     probs = _router_probs(
@@ -108,7 +115,9 @@ def _compiled_moe_loop_region(
         stick_size,
         "gelu_tanh",
         per_expert_scale_stick=per_expert_scale_stick,
-        decode_chunks=_MOE_CHUNKS,
+        decode_chunks=decode_chunks,
+        chunk_scale=chunk_scale,
+        chunk_offsets=chunk_offsets,
     )
 
 
@@ -332,6 +341,9 @@ class Gemma4MoEBlock(nn.Module):
             _MOE_TILE,
             self._stick_size,
             self._moe_rms_eps,
+            self._decode_chunks,
+            experts.decode_chunk_scale,
+            experts.decode_chunk_offsets,
         )
         moe_out = moe_out.to(expert_input.dtype)
         return dense_out, moe_out
@@ -489,9 +501,14 @@ def prepare_text_decoder_for_spyre(model):
             block.router.per_expert_scale_stick = (
                 expert_scale[:, None].expand(-1, stick_size).contiguous()
             )
+        hidden_size = block.experts.gate_up_proj.shape[-1]
+        # Derived from core count (SPYRE_MOE_CHUNKS overrides); 1 keeps the
+        # whole-expert for_each_tile path instead of chunked gather.
+        decode_chunks = _derive_decode_chunks(hidden_size, moe_k, stick_size)
         prepare_moe_expert_weights(
-            block.experts, pad_to_multiple=stick_size, decode_chunks=_MOE_CHUNKS
+            block.experts, pad_to_multiple=stick_size, decode_chunks=decode_chunks
         )
+        block._decode_chunks = decode_chunks
         backbone.layers[i] = block
         blocks.append(block)
 

@@ -39,6 +39,7 @@ from torch.profiler import ProfilerActivity, profile
 from torch_spyre.ops.fallbacks import FallbackWarning
 
 from hf_adapters.hf_common import (
+    derive_moe_chunks,
     moe_decode_selected_experts,
     moe_topk,
     prepare_moe_expert_weights,
@@ -67,11 +68,14 @@ def _prepare_weights(seed, layout):
     )
     scales = torch.rand(EXPERTS, dtype=torch.float16, generator=generator) + 0.5
     experts = SimpleNamespace(gate_up_proj=gate_up, down_proj=down)
+    decode_chunks = (
+        derive_moe_chunks(HIDDEN, TOP_K, STICK) if layout == "chunked" else 1
+    )
     prepare_moe_expert_weights(
-        experts, pad_to_multiple=STICK, decode_chunks=4 if layout == "chunked" else 1
+        experts, pad_to_multiple=STICK, decode_chunks=decode_chunks
     )
     scale_stick = scales[:, None].expand(-1, STICK).contiguous().to("spyre")
-    return experts, gate_up, down, router, scales, scale_stick
+    return experts, gate_up, down, router, scales, scale_stick, decode_chunks
 
 
 def _reference(x, gate_up, down, router, scales):
@@ -99,7 +103,7 @@ def _reference(x, gate_up, down, router, scales):
 
 
 def _run(batch, prepared, warmup, iterations, trace, layout):
-    experts, gate_up, down, router, scales, scale_stick = prepared
+    experts, gate_up, down, router, scales, scale_stick, decode_chunks = prepared
     generator = torch.Generator().manual_seed(20 + batch)
     x = torch.randn(batch, HIDDEN, dtype=torch.float16, generator=generator) * 0.5
     expected = _reference(x, gate_up, down, router, scales)
@@ -137,6 +141,9 @@ def _run(batch, prepared, warmup, iterations, trace, layout):
             32,
             STICK,
             1e-6,
+            decode_chunks,
+            experts.decode_chunk_scale,
+            experts.decode_chunk_offsets,
         )
 
     compiled = torch.compile(region, dynamic=False, fullgraph=True)
