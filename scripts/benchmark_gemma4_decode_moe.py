@@ -47,19 +47,22 @@ from hf_adapters.hf_common import (
 from hf_adapters.hf_gemma4_moe import _compiled_moe_loop_region, _router_probs
 
 EXPERTS, HIDDEN, INTERMEDIATE, TOP_K, STICK = 128, 2816, 704, 8, 64
+_TP_SHARDS = {"tp1": 1, "tp2": 2, "tp4": 4}
 
 
-def _prepare_weights(seed, layout):
+def _prepare_weights(seed, layout, tp_shard):
     generator = torch.Generator().manual_seed(seed)
+    # TP shards only the expert intermediate dim, like the real adapter.
+    intermediate = INTERMEDIATE // tp_shard
     gate_up = (
         torch.randn(
-            EXPERTS, 2 * INTERMEDIATE, HIDDEN, dtype=torch.float16, generator=generator
+            EXPERTS, 2 * intermediate, HIDDEN, dtype=torch.float16, generator=generator
         )
         * 0.05
     )
     down = (
         torch.randn(
-            EXPERTS, HIDDEN, INTERMEDIATE, dtype=torch.float16, generator=generator
+            EXPERTS, HIDDEN, intermediate, dtype=torch.float16, generator=generator
         )
         * 0.05
     )
@@ -87,13 +90,14 @@ def _reference(x, gate_up, down, router, scales):
     probs = torch.softmax(F.linear(normalized, router), dim=-1)
     values, indices = torch.topk(probs, TOP_K, dim=-1)
     weights = values / values.sum(-1, keepdim=True)
+    intermediate = gate_up.shape[1] // 2
     output = torch.zeros_like(x, dtype=torch.float32)
     for token in range(x.shape[0]):
         row = x[token].float()
         for slot in range(TOP_K):
             expert = int(indices[token, slot])
-            gate = row @ gate_up[expert, :INTERMEDIATE].float().T
-            up = row @ gate_up[expert, INTERMEDIATE:].float().T
+            gate = row @ gate_up[expert, :intermediate].float().T
+            up = row @ gate_up[expert, intermediate:].float().T
             active = F.gelu(gate, approximate="tanh") * up
             partial = active @ down[expert].float().T
             output[token] += (
@@ -102,7 +106,7 @@ def _reference(x, gate_up, down, router, scales):
     return output
 
 
-def _run(batch, prepared, warmup, iterations, trace, layout):
+def _run(batch, prepared, warmup, iterations, trace, layout, tp="tp1"):
     experts, gate_up, down, router, scales, scale_stick, decode_chunks = prepared
     generator = torch.Generator().manual_seed(20 + batch)
     x = torch.randn(batch, HIDDEN, dtype=torch.float16, generator=generator) * 0.5
@@ -185,6 +189,7 @@ def _run(batch, prepared, warmup, iterations, trace, layout):
         raise RuntimeError("no Spyre kernel events in the decode MoE trace")
     return {
         "layout": layout,
+        "tp": tp,
         "batch": batch,
         "warmup": warmup,
         "iterations": iterations,
@@ -204,6 +209,7 @@ def main():
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--layout", choices=["baseline", "chunked"], default="chunked")
+    parser.add_argument("--tp", choices=sorted(_TP_SHARDS), default="tp1")
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--trace", type=Path, default=Path("/tmp/gemma4-decode-moe-trace.json")
@@ -218,11 +224,15 @@ def main():
     args.trace.parent.mkdir(parents=True, exist_ok=True)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-    prepared = _prepare_weights(args.seed, args.layout)
+    prepared = _prepare_weights(args.seed, args.layout, _TP_SHARDS[args.tp])
     results = []
     for batch in args.batches:
-        trace = args.trace.with_name(f"{args.trace.stem}-b{batch}{args.trace.suffix}")
-        result = _run(batch, prepared, args.warmup, args.iterations, trace, args.layout)
+        trace = args.trace.with_name(
+            f"{args.trace.stem}-{args.tp}-b{batch}{args.trace.suffix}"
+        )
+        result = _run(
+            batch, prepared, args.warmup, args.iterations, trace, args.layout, args.tp
+        )
         results.append(result)
         print(
             json.dumps(
@@ -230,6 +240,7 @@ def main():
                     key: result[key]
                     for key in (
                         "layout",
+                        "tp",
                         "batch",
                         "wall_median_ms",
                         "kernel_event_sum_ms",
