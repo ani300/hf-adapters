@@ -260,6 +260,10 @@ def prepare_moe_expert_weights(experts, *, pad_to_multiple=None, decode_chunks=1
         experts.decode_gate_proj = _moe_decode_weight_view(
             experts.gate_proj, decode_chunks
         )
+    else:
+        # One chunk: the persistent pools are the decode views, and the
+        # whole-expert for_each_tile path consumes them directly.
+        experts.decode_gate_proj = experts.gate_proj
     del gate
 
     up = gate_up[:, intermediate_size:].transpose(1, 2).contiguous()
@@ -268,6 +272,8 @@ def prepare_moe_expert_weights(experts, *, pad_to_multiple=None, decode_chunks=1
     experts.up_proj = _move_moe_expert_weight(up)
     if decode_chunks != 1:
         experts.decode_up_proj = _moe_decode_weight_view(experts.up_proj, decode_chunks)
+    else:
+        experts.decode_up_proj = experts.up_proj
     del up
     del gate_up
 
@@ -284,6 +290,11 @@ def prepare_moe_expert_weights(experts, *, pad_to_multiple=None, decode_chunks=1
         )
         experts.decode_chunk_scale, experts.decode_chunk_offsets = (
             moe_chunk_entry_constants(decode_chunks)
+        )
+    else:
+        experts.decode_down_proj = experts.down_proj
+        experts.decode_chunk_scale, experts.decode_chunk_offsets = (
+            moe_chunk_entry_constants(1)
         )
 
 

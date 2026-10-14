@@ -219,17 +219,24 @@ def main():
         parser.error("batch sizes must be positive powers of two")
     if args.iterations < 1 or args.warmup < 0:
         parser.error("iterations must be positive and warmup nonnegative")
-    if args.output and args.trace == args.output:
-        parser.error("output and trace must be different paths")
+    trace_paths = {}
+    for batch in args.batches:
+        trace = args.trace.with_name(
+            f"{args.trace.stem}-{args.layout}-{args.tp}-b{batch}{args.trace.suffix}"
+        )
+        if args.output and trace == args.output:
+            parser.error(
+                f"the trace for batch {batch} is written to {trace}, which is "
+                "also --output; pick a different --trace or --output"
+            )
+        trace_paths[batch] = trace
     args.trace.parent.mkdir(parents=True, exist_ok=True)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
     prepared = _prepare_weights(args.seed, args.layout, _TP_SHARDS[args.tp])
     results = []
     for batch in args.batches:
-        trace = args.trace.with_name(
-            f"{args.trace.stem}-{args.tp}-b{batch}{args.trace.suffix}"
-        )
+        trace = trace_paths[batch]
         result = _run(
             batch, prepared, args.warmup, args.iterations, trace, args.layout, args.tp
         )
