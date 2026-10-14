@@ -93,31 +93,47 @@ def _compiled_moe_loop_region(
     chunk_scale=None,
     chunk_offsets=None,
 ):
-    """Run the routed decode FFN and combine its expert outputs on device."""
-    probs = _router_probs(
-        x_router,
-        router_proj_w,
-        router_scale,
-        router_scalar_root_size,
-        eps,
-    )
-    weights, expert_indices = moe_topk(probs, top_k)
-    weights = weights / weights.sum(-1, keepdim=True)
-    return moe_decode_selected_experts(
-        x_expert,
-        weights,
-        expert_indices,
-        gate_dev,
-        up_dev,
-        down_dev,
-        top_k,
-        tile,
-        stick_size,
-        "gelu_tanh",
-        per_expert_scale_stick=per_expert_scale_stick,
-        decode_chunks=decode_chunks,
-        chunk_scale=chunk_scale,
-        chunk_offsets=chunk_offsets,
+    """Run routed decode on single-token slices; gather cannot lower packed top-k rows."""
+
+    def decode_token(router_input, expert_input):
+        probs = _router_probs(
+            router_input,
+            router_proj_w,
+            router_scale,
+            router_scalar_root_size,
+            eps,
+        )
+        weights, expert_indices = moe_topk(probs, top_k)
+        weights = weights / weights.sum(-1, keepdim=True)
+        return moe_decode_selected_experts(
+            expert_input,
+            weights,
+            expert_indices,
+            gate_dev,
+            up_dev,
+            down_dev,
+            top_k,
+            tile,
+            stick_size,
+            "gelu_tanh",
+            per_expert_scale_stick=per_expert_scale_stick,
+            decode_chunks=decode_chunks,
+            chunk_scale=chunk_scale,
+            chunk_offsets=chunk_offsets,
+        )
+
+    if x_router.shape[0] == 1:
+        return decode_token(x_router, x_expert)
+    # Top-k produces [tokens, top_k] with sub-stick rows. Flattening and
+    # widening them together creates floor(row/top_k) stick coordinates that
+    # Spyre cannot lower. Slice the stick-aligned hidden rows first, then let
+    # each token's routed gather compile as a single-token region.
+    return torch.cat(
+        [
+            decode_token(x_router[token : token + 1], x_expert[token : token + 1])
+            for token in range(x_router.shape[0])
+        ],
+        dim=0,
     )
 
 

@@ -26,6 +26,7 @@ from hf_adapters.hf_common import (
     moe_topk,
     prepare_moe_expert_weights,
 )
+from hf_adapters.hf_gemma4_moe import _compiled_moe_loop_region
 
 pytestmark = pytest.mark.requires_spyre
 
@@ -129,3 +130,71 @@ def test_compiled_chunked_decode_matches_independent_expert_reference(
         torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
         repeated = compiled(*inputs).cpu().float()
         torch.testing.assert_close(repeated, actual, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "decode_chunks"),
+    [(2, 4), (4, 4), (2, 1)],
+    ids=["batch2", "batch4", "one_chunk"],
+)
+def test_compiled_routed_decode_for_multiple_tokens(tokens, decode_chunks):
+    experts, hidden, intermediate, top_k, stick = 128, 256, 192, 8, 64
+    generator = torch.Generator().manual_seed(341)
+    gate_up = (
+        torch.randn(experts, 2 * intermediate, hidden, generator=generator).half()
+        * 0.05
+    )
+    down = torch.randn(experts, hidden, intermediate, generator=generator).half() * 0.05
+    pools = SimpleNamespace(gate_up_proj=gate_up, down_proj=down)
+    prepare_moe_expert_weights(
+        pools, pad_to_multiple=stick, decode_chunks=decode_chunks
+    )
+    router = torch.randn(experts, hidden, generator=generator).half() * 0.05
+    x_router = torch.randn(tokens, hidden, generator=generator).half() * 0.5
+    x_expert = torch.randn(tokens, hidden, generator=generator).half() * 0.5
+    scale = torch.rand(experts, generator=generator).half() + 0.5
+    scale_stick = scale[:, None].expand(-1, stick).contiguous().to("spyre")
+
+    normalized = x_router.float() * torch.rsqrt(
+        x_router.float().square().mean(-1, keepdim=True) + 1e-6
+    )
+    probabilities = torch.softmax(F.linear(normalized.half(), router), dim=-1)
+    values, indices = torch.topk(probabilities, top_k, dim=-1)
+    routing = values / values.sum(-1, keepdim=True)
+    expected = torch.zeros(tokens, hidden, dtype=torch.float32)
+    for token in range(tokens):
+        for slot in range(top_k):
+            expert = int(indices[token, slot])
+            gate = x_expert[token].float() @ gate_up[expert, :intermediate].float().T
+            up = x_expert[token].float() @ gate_up[expert, intermediate:].float().T
+            activated = F.gelu(gate, approximate="tanh") * up
+            output = activated @ down[expert].float().T
+            expected[token] += (
+                output * float(routing[token, slot]) * float(scale[expert])
+            )
+
+    compiled = torch.compile(_compiled_moe_loop_region, dynamic=False, fullgraph=True)
+    with torch.no_grad():
+        actual = (
+            compiled(
+                x_router.to("spyre"),
+                x_expert.to("spyre"),
+                router.to("spyre"),
+                1.0,
+                1.0,
+                scale_stick,
+                pools.decode_gate_proj,
+                pools.decode_up_proj,
+                pools.decode_down_proj,
+                top_k,
+                32,
+                stick,
+                1e-6,
+                decode_chunks,
+                pools.decode_chunk_scale,
+                pools.decode_chunk_offsets,
+            )
+            .cpu()
+            .float()
+        )
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)

@@ -79,6 +79,13 @@ before the activation, and the down parts reshape in place. A derived count of
 attention, layernorms, FFN and MoE on Spyre. The smoke and token-compare tests
 cover full-model generation.
 
+For decode batches, the routed MoE region slices the stick-aligned hidden rows
+into single-token inputs and concatenates their outputs inside the compiled
+block. Spyre cannot lower a flattened multi-token `[tokens, top_k]` gather:
+its packed sub-stick rows produce an unsupported `floor(row/top_k)` stick
+coordinate. The batch-1 path is unchanged, and the remaining block work (dense
+FFN, attention, TP reduction) stays batched.
+
 **OLMoE 1B-7B:** 64 experts, top-8 routing with the checkpoint's
 unnormalized selected probabilities. Prefill evaluates all experts persistently;
 decode gathers only the selected experts. The BF16 path compiles and runs
