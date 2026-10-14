@@ -96,3 +96,72 @@ def test_one_chunk_decode_through_bound_attributes():
         chunk_offsets=weights.decode_chunk_offsets,
     )
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_chunked_decode_matches_per_expert_reference():
+    # The chunked kernel's entry map (e*chunks+c), pre-activation chunk sums,
+    # and in-place down reshape must reproduce the dense per-expert math.
+    experts, hidden, tokens, top_k, stick, chunks = 16, 256, 3, 8, 64, 4
+    intermediate = 192
+    weights, gate_up, down = _prepared(
+        experts, hidden, intermediate, top_k, stick, chunks
+    )
+    x = torch.randn(tokens, hidden) * 0.5
+    scores = torch.arange(1, experts + 1).expand(tokens, -1).contiguous()
+    values, indices = moe_topk(scores, top_k)
+    routing = values / values.sum(-1, keepdim=True)
+    expected = torch.zeros(tokens, hidden)
+    for token in range(tokens):
+        for slot in range(top_k):
+            expert = int(indices[token, slot])
+            gate = x[token] @ gate_up[expert, :intermediate].T
+            up = x[token] @ gate_up[expert, intermediate:].T
+            active = F.gelu(gate, approximate="tanh") * up
+            expected[token] += (active @ down[expert].T) * float(routing[token, slot])
+    actual = moe_decode_selected_experts(
+        x,
+        routing,
+        indices,
+        weights.decode_gate_proj,
+        weights.decode_up_proj,
+        weights.decode_down_proj,
+        top_k,
+        32,
+        stick,
+        "gelu_tanh",
+        decode_chunks=chunks,
+        chunk_scale=weights.decode_chunk_scale,
+        chunk_offsets=weights.decode_chunk_offsets,
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    # No host constants: the region must also build them itself.
+    actual_selfbuilt = moe_decode_selected_experts(
+        x,
+        routing,
+        indices,
+        weights.decode_gate_proj,
+        weights.decode_up_proj,
+        weights.decode_down_proj,
+        top_k,
+        32,
+        stick,
+        "gelu_tanh",
+        decode_chunks=chunks,
+    )
+    torch.testing.assert_close(actual_selfbuilt, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_chunk_view_rejects_indivisible_dims():
+    # A pool whose chunked dim does not divide must fail loudly here, not
+    # reshape to a misshapen view. prepare_moe_expert_weights validates the
+    # hidden side upstream, so this guards direct view construction.
+    import torch
+
+    from hf_adapters.hf_common import _moe_decode_weight_view
+
+    pool = torch.randn(16, 190, 128)
+    with pytest.raises(ValueError, match="contract dim 190 must divide into 3"):
+        _moe_decode_weight_view(pool, 3)
+    down_pool = torch.randn(16, 128, 190)
+    with pytest.raises(ValueError, match="free dim 190 must divide into 3"):
+        _moe_decode_weight_view(down_pool, 3, down=True)

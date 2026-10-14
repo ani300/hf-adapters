@@ -62,13 +62,6 @@ __all__ = [
     "spyre_tp_grouped_colwise_modules",
 ]
 
-_MOE_TILE = 32  # Decode gather requires tiles with at least two rows.
-
-
-def _derive_decode_chunks(hidden_size, top_k, stick_size):
-    """Chunks for gathered decode; derived from cores, override via SPYRE_MOE_CHUNKS."""
-    return hf_common.derive_moe_chunks(hidden_size, top_k, stick_size)
-
 
 def _router_probs(x, weight, scale, root_size, eps):
     x = _gemma4_rms_norm(x, None, eps)
@@ -354,7 +347,7 @@ class Gemma4MoEBlock(nn.Module):
             experts.decode_up_proj,
             experts.decode_down_proj,
             self._moe_k,
-            _MOE_TILE,
+            32,
             self._stick_size,
             self._moe_rms_eps,
             self._decode_chunks,
@@ -520,7 +513,7 @@ def prepare_text_decoder_for_spyre(model):
         hidden_size = block.experts.gate_up_proj.shape[-1]
         # Derived from core count (SPYRE_MOE_CHUNKS overrides); 1 keeps the
         # whole-expert for_each_tile path instead of chunked gather.
-        decode_chunks = _derive_decode_chunks(hidden_size, moe_k, stick_size)
+        decode_chunks = hf_common.derive_moe_chunks(hidden_size, moe_k, stick_size)
         prepare_moe_expert_weights(
             block.experts, pad_to_multiple=stick_size, decode_chunks=decode_chunks
         )
