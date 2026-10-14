@@ -76,10 +76,8 @@ the widened expert index against load-time device constants (one kernel, no
 per-call constants), gate/up partial sums reduce a contiguous chunk axis
 before the activation, and the down parts reshape in place. A derived count of
 1 keeps the whole-expert `for_each_tile` path instead. Decode still runs
-attention, layernorms, FFN and MoE on Spyre. Run
-`scripts/benchmark_gemma4_decode_moe.py` with either `--layout baseline` or
-`--layout chunked` to time the isolated decode MoE at production expert
-dimensions; the smoke and token-compare tests cover full-model generation.
+attention, layernorms, FFN and MoE on Spyre. The smoke and token-compare tests
+cover full-model generation.
 
 **OLMoE 1B-7B:** 64 experts, top-8 routing with the checkpoint's
 unnormalized selected probabilities. Prefill evaluates all experts persistently;
