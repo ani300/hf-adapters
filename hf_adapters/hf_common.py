@@ -3774,13 +3774,11 @@ def fairseq_position_ids(input_ids: torch.Tensor, padding_idx: int) -> torch.Ten
     if input_ids.device.type == "spyre" and not torch.compiler.is_compiling():
         return _compiled_fairseq_position_ids(input_ids, padding_idx)
     is_token = input_ids != padding_idx
-    counts = torch.where(is_token, torch.ones_like(input_ids, dtype=torch.int32), 0)
+    counts = is_token.to(torch.int32)
     incremental = torch.cumsum(counts, dim=1, dtype=torch.int32)
-    positions = torch.where(is_token, incremental, 0)
+    positions = incremental * counts
     if input_ids.device.type == "spyre":
-        # Spyre supports int32 indices but not int32 addition. Sequence
-        # positions fit exactly in fp32, and int64 casts would fall back again.
-        return (positions.float() + padding_idx).to(torch.int32)
+        return positions + padding_idx
     return (positions.long() + padding_idx).to(DEVICE)
 
 

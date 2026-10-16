@@ -81,16 +81,22 @@ def test_causal_query_validity_matches_the_cache_diagonal(
     torch.testing.assert_close(actual_lfm2.cpu(), expected, rtol=0, atol=0)
 
 
-def test_fairseq_positions_handle_internal_padding_and_large_token_ids():
+@pytest.mark.parametrize("padding_idx", (0, 1, 262144))
+def test_fairseq_positions_handle_internal_padding_and_large_token_ids(padding_idx):
     ids = torch.tensor(
-        [[1, 128001, 1, 128002, 128003, 1, 1, 1], [128001, 128002, 1, 1, 1, 1, 1, 1]],
+        [
+            [1, 128001, 1, 128002, 128003, 1, 1, 1],
+            [128001, 128002, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 1, 1, 1],
+        ],
         dtype=torch.int32,
     ).repeat(1, 8)
-    expected = torch.ones_like(ids)
+    ids[ids == 1] = padding_idx
+    expected = torch.full_like(ids, padding_idx)
     for row in range(ids.shape[0]):
-        position = 1
+        position = padding_idx
         for col in range(ids.shape[1]):
-            if ids[row, col] != 1:
+            if ids[row, col] != padding_idx:
                 position += 1
                 expected[row, col] = position
 
@@ -100,7 +106,7 @@ def test_fairseq_positions_handle_internal_padding_and_large_token_ids():
             message="aten.cumsum.default is falling back to cpu",
             category=FallbackWarning,
         )
-        actual = fairseq_position_ids(ids.to("spyre"), padding_idx=1)
+        actual = fairseq_position_ids(ids.to("spyre"), padding_idx=padding_idx)
 
     assert actual.device.type == "spyre"
     assert actual.dtype == torch.int32
