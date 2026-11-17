@@ -367,6 +367,35 @@ def moe_topk(probabilities, top_k):
     return weights[:tokens], expert_indices[:tokens]
 
 
+def configure_sparse_moe(block, experts, top_k):
+    """Prepare RFC 48 constants outside the compiled block."""
+    mode = os.getenv("SPYRE_MOE_IMPL", "current")
+    if mode not in ("current", "sparse_prefill", "sparse"):
+        raise ValueError(f"invalid SPYRE_MOE_IMPL: {mode!r}")
+    block._sparse_prefill = mode != "current"
+    block._sparse_decode = mode == "sparse"
+    if mode != "current":
+        expert_weight = getattr(experts, "gate_proj", None)
+        if expert_weight is None:
+            # Blocks are created before expert DMA; their source can still be on CPU.
+            expert_weight = experts.gate_up_proj
+            device = DEVICE
+        else:
+            device = expert_weight.device
+        num_experts = expert_weight.shape[0]
+        chunk = 512 * ((num_experts + top_k - 1) // top_k)
+        block.register_buffer(
+            "_moe_token_ids",
+            torch.arange(chunk, dtype=torch.int32).to(device),
+            persistent=False,
+        )
+        block.register_buffer(
+            "_moe_expert_ids",
+            torch.arange(num_experts, dtype=torch.int32).to(device),
+            persistent=False,
+        )
+
+
 def moe_decode_selected_experts(
     x,
     weights,

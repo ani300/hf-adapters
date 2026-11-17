@@ -29,6 +29,7 @@ from hf_adapters.hf_common import (
     SpyreUnsupportedFeatureError,
     SpyreUnsupportedModelError,
     apply_rope_matmul,
+    configure_sparse_moe,
     get_backbone,
     kv_cache_update,
     moe_decode_selected_experts,
@@ -96,6 +97,7 @@ def _moe_prefill_route_packed(
     norm_topk_prob,
     stick_size,
     route_identity,
+    dense=False,
 ):
     """Compute packed prefill routing weights."""
     probs, weights, selected = _router_topk(x, router_weight, top_k, norm_topk_prob)
@@ -107,6 +109,8 @@ def _moe_prefill_route_packed(
     else:
         routing = x.new_zeros(probs.shape).scatter(-1, selected, weights)
 
+    if dense:
+        return routing
     # ReLU materializes the expansion; the identity BMM puts it on a stick.
     packed = torch.relu(routing.unsqueeze(-1).expand(-1, -1, stick_size))
     return packed @ route_identity
@@ -171,6 +175,7 @@ class OlmoeMoEBlock(nn.Module):
         self._top_k = top_k
         self._norm_topk_prob = norm_topk_prob
         self._stick_size = stick_size
+        configure_sparse_moe(self, self.experts, top_k)
         self._compiled_decode = torch.compile(
             self._full_decode_forward, dynamic=False, fullgraph=True
         )
@@ -207,6 +212,28 @@ class OlmoeMoEBlock(nn.Module):
         hidden_size = residual.shape[-1]
         x = self.post_attention_layernorm(residual).reshape(-1, hidden_size)
         experts = self.experts
+        if self._sparse_decode:
+            from hf_adapters.sparse_moe import sparse_decode
+
+            route = _moe_prefill_route_packed(
+                x,
+                self.gate.weight,
+                self._top_k,
+                self._norm_topk_prob,
+                self._stick_size,
+                self.gate.route_identity,
+                dense=True,
+            )
+            moe_out = sparse_decode(
+                x,
+                route,
+                experts.gate_proj,
+                experts.up_proj,
+                experts.down_proj,
+                self._moe_expert_ids,
+                "silu",
+            )
+            return residual + moe_out.to(residual.dtype).reshape_as(residual)
         moe_out = _moe_decode(
             x,
             self.gate.weight,
@@ -249,11 +276,25 @@ class OlmoeMoEBlock(nn.Module):
             self._norm_topk_prob,
             self._stick_size,
             self.gate.route_identity,
-        )[..., :1]
+            dense=self._sparse_prefill,
+        )
         experts = self.experts
+        if self._sparse_prefill:
+            from hf_adapters.sparse_moe import sparse_prefill
+
+            moe_out = sparse_prefill(
+                x,
+                routing_weight,
+                experts.gate_proj,
+                experts.up_proj,
+                experts.down_proj,
+                self._moe_token_ids,
+                "silu",
+            )
+            return residual + moe_out.to(residual.dtype).reshape_as(residual)
         moe_out = moe_prefill_all_experts(
             x,
-            routing_weight,
+            routing_weight[..., :1],
             experts.gate_proj,
             experts.up_proj,
             experts.down_proj,

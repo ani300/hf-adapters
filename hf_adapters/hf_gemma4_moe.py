@@ -25,6 +25,7 @@ import torch.nn.functional as F
 
 from hf_adapters import hf_common
 from hf_adapters.hf_common import (
+    configure_sparse_moe,
     moe_decode_selected_experts,
     moe_prefill_all_experts,
     moe_topk,
@@ -142,6 +143,7 @@ def _moe_route_persistent_packed(
     stick_size,
     eps,
     route_identity,
+    dense=False,
 ):
     """Compute packed prefill routing weights on device."""
     probs = _router_probs(
@@ -156,6 +158,8 @@ def _moe_route_persistent_packed(
     weights = weights / weights.sum(-1, keepdim=True)
     weights = weights * per_expert_scale
 
+    if dense:
+        return weights
     # ReLU materializes the expansion; the identity BMM puts it on a stick.
     packed = torch.relu(weights.unsqueeze(-1).expand(-1, -1, stick_size))
     return packed @ route_identity
@@ -214,6 +218,7 @@ class Gemma4MoEBlock(nn.Module):
         self._moe_k = moe_k
         self._stick_size = stick_size
         self._moe_rms_eps = self.router.eps
+        configure_sparse_moe(self, self.experts, moe_k)
         decode_forward = (
             self._full_tp_decode_forward
             if self._tp_device_mesh is not None
@@ -338,6 +343,31 @@ class Gemma4MoEBlock(nn.Module):
         )
         experts = self.experts
         router = self.router
+        if self._sparse_decode:
+            from hf_adapters.sparse_moe import sparse_decode
+
+            route = _moe_route_persistent_packed(
+                router_input,
+                router.proj.weight,
+                router.scale,
+                router.scalar_root_size,
+                router.per_expert_scale,
+                self._moe_k,
+                self._stick_size,
+                self._moe_rms_eps,
+                router.route_identity,
+                dense=True,
+            )
+            moe_out = sparse_decode(
+                expert_input,
+                route,
+                experts.gate_proj,
+                experts.up_proj,
+                experts.down_proj,
+                self._moe_expert_ids,
+                "gelu_tanh",
+            )
+            return dense_out, moe_out.to(expert_input.dtype)
         moe_out = _compiled_moe_loop_region(
             router_input,
             expert_input,
@@ -400,11 +430,25 @@ class Gemma4MoEBlock(nn.Module):
             self._stick_size,
             self._moe_rms_eps,
             router.route_identity,
-        )[..., :1]
+            dense=self._sparse_prefill,
+        )
         experts = self.experts
+        if self._sparse_prefill:
+            from hf_adapters.sparse_moe import sparse_prefill
+
+            moe_out = sparse_prefill(
+                expert_input,
+                routing_weight,
+                experts.gate_proj,
+                experts.up_proj,
+                experts.down_proj,
+                self._moe_token_ids,
+                "gelu_tanh",
+            )
+            return dense_out, moe_out.to(residual.dtype)
         moe_out = moe_prefill_all_experts(
             expert_input,
-            routing_weight,
+            routing_weight[..., :1],
             experts.gate_proj,
             experts.up_proj,
             experts.down_proj,
